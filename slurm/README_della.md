@@ -22,6 +22,14 @@ export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
 mkdir -p $BASE/{checkpoints,logs,outputs,wandb}
 ```
 
+Required Python packages for the HLT train/eval path:
+
+```bash
+python -m pip install torch wandb numpy scikit-learn scipy matplotlib
+```
+
+Current smoke/full training does not require `torchvision`.
+
 Check that the data can be read:
 
 ```bash

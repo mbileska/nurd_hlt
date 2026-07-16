@@ -37,6 +37,7 @@ echo "Scratch: $BASE"
 echo "Train data: $TRAIN_PT"
 
 python -c "import torch; print('torch', torch.__version__, 'cuda build', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO GPU')"
+python -c "import numpy, sklearn, scipy; print('core imports ok')"
 python -c "import torch; x=torch.load('$TRAIN_PT',map_location='cpu'); print('keys', x.keys()); print('pf', x['pf'].shape); print('obj', x['obj'].shape); print('label', x['label'].shape)"
 
 echo "=== Step 1: AE smoke ==="
