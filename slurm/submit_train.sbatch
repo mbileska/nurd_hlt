@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=nurd_hlt_train
-#SBATCH --partition=gpu
 #SBATCH --output=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/%x-%j.out
 #SBATCH --error=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/%x-%j.err
 #SBATCH --time=24:00:00

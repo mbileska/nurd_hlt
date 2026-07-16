@@ -1,6 +1,5 @@
 #!/bin/bash
 #SBATCH --job-name=nurd_smoke
-#SBATCH --partition=gputest
 #SBATCH --output=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/%x-%j.out
 #SBATCH --error=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/%x-%j.err
 #SBATCH --time=01:00:00
