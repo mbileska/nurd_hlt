@@ -6,6 +6,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=128G
 #SBATCH --gres=gpu:a100:1
+#SBATCH --exclude=della-i12g[1-2],della-i14g[1-20]
 
 set -eo pipefail
 
@@ -18,6 +19,7 @@ set -u
 BASE="${BASE:-/scratch/gpfs/IOJALVO/mb7126/nurd_hlt}"
 CODE_DIR="${CODE_DIR:-/home/mb7126/nurd_hlt}"
 TRAIN_PT="${TRAIN_PT:-$BASE/data/hlt_smcocktail_train.pt}"
+MIN_GPU_MEM_GB="${MIN_GPU_MEM_GB:-75}"
 
 mkdir -p "$BASE/checkpoints" "$BASE/logs" "$BASE/outputs" "$BASE/wandb"
 
@@ -61,8 +63,10 @@ echo "BATCH_SIZE=$BATCH_SIZE"
 echo "AE_CKPT=$AE_CKPT"
 echo "W&B project: nurd-ood-hlt"
 echo "W&B mode: $WANDB_MODE"
+echo "Minimum GPU memory: ${MIN_GPU_MEM_GB} GiB"
 
 python -c "import torch; print('torch', torch.__version__, 'cuda build', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO GPU')"
+python -c "import torch, sys; assert torch.cuda.is_available(), 'CUDA is not available'; props=torch.cuda.get_device_properties(0); mem_gib=props.total_memory/1024**3; print(f'GPU memory: {mem_gib:.2f} GiB'); sys.exit(0 if mem_gib >= float('$MIN_GPU_MEM_GB') else 42)"
 python -c "import numpy, sklearn, scipy, matplotlib, wandb; print('training/eval imports ok')"
 python -c "import torch; x=torch.load('$TRAIN_PT',map_location='cpu'); print('keys', x.keys()); print('pf', x['pf'].shape); print('obj', x['obj'].shape); print('label', x['label'].shape)"
 

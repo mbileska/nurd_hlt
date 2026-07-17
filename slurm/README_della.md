@@ -105,7 +105,10 @@ AE_EXP=ae_pretrain_20260717_102917 SKIP_AE=1 sbatch slurm/submit_train.sbatch
 
 The NURD stage keeps batch size 4096 and uses `--offload_critic_graph` to
 preserve the original critic-penalty second forward while saving its autograd
-tensors on CPU. If batch size 4096 still runs out of GPU memory:
+tensors on CPU. The job excludes the Della `della-i*` A100 nodes seen in
+`sinfo` and exits early unless the allocated GPU has at least 75 GiB memory.
+
+If batch size 4096 still runs out of GPU memory on an 80 GB A100:
 
 ```bash
 AE_EXP=ae_pretrain_20260717_102917 SKIP_AE=1 BATCH_SIZE=3072 sbatch slurm/submit_train.sbatch
