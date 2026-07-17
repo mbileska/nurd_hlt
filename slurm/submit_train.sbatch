@@ -47,6 +47,8 @@ ln -sfnT "$BASE/checkpoints" checkpoints
 RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 AE_EXP="${AE_EXP:-ae_pretrain_$RUN_TAG}"
 NURD_EXP="${NURD_EXP:-hlt_nurd_closure_bs4096_$RUN_TAG}"
+BATCH_SIZE="${BATCH_SIZE:-4096}"
+AE_CKPT="${AE_CKPT:-checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth}"
 
 echo "=== Full training started: $(date) ==="
 echo "Host: $(hostname)"
@@ -55,6 +57,8 @@ echo "Scratch: $BASE"
 echo "Train data: $TRAIN_PT"
 echo "AE_EXP=$AE_EXP"
 echo "NURD_EXP=$NURD_EXP"
+echo "BATCH_SIZE=$BATCH_SIZE"
+echo "AE_CKPT=$AE_CKPT"
 echo "W&B project: nurd-ood-hlt"
 echo "W&B mode: $WANDB_MODE"
 
@@ -62,26 +66,32 @@ python -c "import torch; print('torch', torch.__version__, 'cuda build', torch.v
 python -c "import numpy, sklearn, scipy, matplotlib, wandb; print('training/eval imports ok')"
 python -c "import torch; x=torch.load('$TRAIN_PT',map_location='cpu'); print('keys', x.keys()); print('pf', x['pf'].shape); print('obj', x['obj'].shape); print('label', x['label'].shape)"
 
-echo "=== Step 1: AE pretraining ==="
-python train_ae.py \
-  --data "$TRAIN_PT" \
-  --epochs 100 \
-  --batch_size 4096 \
-  --lr 1e-3 \
-  --latent_dim 16 \
-  --enc_nodes 512 256 \
-  --dec_nodes 256 512 \
-  --exp_name "$AE_EXP" \
-  --project_name hlt
-
-AE_CKPT="checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth"
+if [[ "${SKIP_AE:-0}" == "1" ]]; then
+  if [[ ! -f "$AE_CKPT" ]]; then
+    echo "ERROR: SKIP_AE=1 but AE_CKPT does not exist: $AE_CKPT"
+    exit 2
+  fi
+  echo "=== Step 1: AE pretraining skipped; using $AE_CKPT ==="
+else
+  echo "=== Step 1: AE pretraining ==="
+  python train_ae.py \
+    --data "$TRAIN_PT" \
+    --epochs 100 \
+    --batch_size "$BATCH_SIZE" \
+    --lr 1e-3 \
+    --latent_dim 16 \
+    --enc_nodes 512 256 \
+    --dec_nodes 256 512 \
+    --exp_name "$AE_EXP" \
+    --project_name hlt
+fi
 
 echo "=== Step 2: NURD closure training ==="
 python train_hlt.py \
   --data "$TRAIN_PT" \
   --ae_ckpt "$AE_CKPT" \
   --epochs 100 \
-  --batch_size 4096 \
+  --batch_size "$BATCH_SIZE" \
   --lr 1e-4 \
   --weight_decay 5e-3 \
   --n_bins 10 \
@@ -104,6 +114,7 @@ python train_hlt.py \
   --n_critic_steps_per_batch 3 \
   --_lambda 0.01 \
   --no_mi_norm \
+  --offload_critic_graph \
   --closure_weight 0.1 \
   --qcd_label 1 \
   --exp_name "$NURD_EXP" \

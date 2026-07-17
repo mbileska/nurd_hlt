@@ -97,6 +97,20 @@ The full job prints `AE_EXP=...` and `NURD_EXP=...`. The checkpoints are under:
 
 W&B project: `nurd-ood-hlt`.
 
+To reuse an existing AE checkpoint and rerun only the NURD stage:
+
+```bash
+AE_EXP=ae_pretrain_20260717_102917 SKIP_AE=1 sbatch slurm/submit_train.sbatch
+```
+
+The NURD stage keeps batch size 4096 and uses `--offload_critic_graph` to
+preserve the original critic-penalty second forward while saving its autograd
+tensors on CPU. If batch size 4096 still runs out of GPU memory:
+
+```bash
+AE_EXP=ae_pretrain_20260717_102917 SKIP_AE=1 BATCH_SIZE=3072 sbatch slurm/submit_train.sbatch
+```
+
 The full Slurm job uses W&B offline mode by default because Della compute
 nodes may not be able to initialize online W&B reliably. Metrics are still
 written under the scratch W&B directory and can be synced later.

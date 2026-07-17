@@ -18,6 +18,7 @@ python train_hlt.py \\
     [--epochs 100] [--batch_size 2048] [--lr 1e-4]
 """
 import argparse
+import contextlib
 import os
 import time
 import random
@@ -197,6 +198,10 @@ parser.add_argument("--no_mi_norm",           action="store_true",
                     help="Skip per-batch normalization of MI penalty (divide by batch mean). "
                          "Without this, lambda is effectively rescaled by ~1/raw_mi, making "
                          "different lambda values produce near-identical gradients.")
+parser.add_argument("--offload_critic_graph", action="store_true",
+                    help="Keep the original critic-penalty second forward, but save its "
+                         "autograd tensors on CPU to reduce GPU memory use. This preserves "
+                         "the loss computation and mainly trades speed for memory.")
 args, unknown = parser.parse_known_args()
 print(f"Unknown args: {unknown}")
 
@@ -483,10 +488,15 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                 # run frozen critic on current activations → per-sample losses [B]
                 # low loss = critic can predict nuisance bin = encoder is leaking nuisance info
                 # high loss = critic can't predict nuisance bin = encoder is already independent
-                _, _, info_losses = compute_critic_loss(
-                    inputs, targets, nuisances, model,
-                    joint_indep_args["critic_model"], joint_indep_args["critic_criterion"],
-                    reweight_args, joint_indep_args, "train")
+                graph_ctx = contextlib.nullcontext()
+                if lam > 0.0 and args.offload_critic_graph:
+                    graph_ctx = torch.autograd.graph.save_on_cpu(
+                        pin_memory=torch.cuda.is_available())
+                with graph_ctx:
+                    _, _, info_losses = compute_critic_loss(
+                        inputs, targets, nuisances, model,
+                        joint_indep_args["critic_model"], joint_indep_args["critic_criterion"],
+                        reweight_args, joint_indep_args, "train")
             #not doing this right now
             if joint_indep_args.get("critic_type") == "density_ratio":
                 half = len(info_losses) // 2
