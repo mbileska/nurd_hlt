@@ -202,8 +202,10 @@ print(f"Unknown args: {unknown}")
 
 if not args.local_testing:
     import wandb
+    wandb_timeout = int(os.environ.get("WANDB_INIT_TIMEOUT", "300"))
     wandb.init(name=args.exp_name,
-               project="nurd-ood-" + args.project_name, reinit=True)
+               project="nurd-ood-" + args.project_name, reinit=True,
+               settings=wandb.Settings(init_timeout=wandb_timeout))
     wandb.config.update(args, allow_val_change=True)
 
 # ── Setup ─────────────────────────────────────────────────────────────────────

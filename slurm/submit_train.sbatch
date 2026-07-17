@@ -7,11 +7,13 @@
 #SBATCH --mem=128G
 #SBATCH --gres=gpu:a100:1
 
-set -euo pipefail
+set -eo pipefail
 
 module load anaconda3/2025.12
+export PS1="${PS1:-}"
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate disco
+set -u
 
 BASE="${BASE:-/scratch/gpfs/IOJALVO/mb7126/nurd_hlt}"
 CODE_DIR="${CODE_DIR:-/home/mb7126/nurd_hlt}"
@@ -20,6 +22,7 @@ TRAIN_PT="${TRAIN_PT:-$BASE/data/hlt_smcocktail_train.pt}"
 mkdir -p "$BASE/checkpoints" "$BASE/logs" "$BASE/outputs" "$BASE/wandb"
 
 export WANDB_DIR="$BASE/wandb"
+export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 if [[ -z "${WANDB_API_KEY:-}" ]]; then

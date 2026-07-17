@@ -7,11 +7,13 @@
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:a100:1
 
-set -euo pipefail
+set -eo pipefail
 
 module load anaconda3/2025.12
+export PS1="${PS1:-}"
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate disco
+set -u
 
 BASE="${BASE:-/scratch/gpfs/IOJALVO/mb7126/nurd_hlt}"
 CODE_DIR="${CODE_DIR:-/home/mb7126/nurd_hlt}"
