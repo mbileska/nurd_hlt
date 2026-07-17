@@ -22,10 +22,11 @@ TRAIN_PT="${TRAIN_PT:-$BASE/data/hlt_smcocktail_train.pt}"
 mkdir -p "$BASE/checkpoints" "$BASE/logs" "$BASE/outputs" "$BASE/wandb"
 
 export WANDB_DIR="$BASE/wandb"
+export WANDB_MODE="${WANDB_MODE:-offline}"
 export WANDB_INIT_TIMEOUT="${WANDB_INIT_TIMEOUT:-300}"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
-if [[ -z "${WANDB_API_KEY:-}" ]]; then
+if [[ "$WANDB_MODE" != "offline" && -z "${WANDB_API_KEY:-}" ]]; then
   if [[ -f "$HOME/.secrets/wandb_api_key" ]]; then
     export WANDB_API_KEY="$(cat "$HOME/.secrets/wandb_api_key")"
   else
@@ -55,6 +56,7 @@ echo "Train data: $TRAIN_PT"
 echo "AE_EXP=$AE_EXP"
 echo "NURD_EXP=$NURD_EXP"
 echo "W&B project: nurd-ood-hlt"
+echo "W&B mode: $WANDB_MODE"
 
 python -c "import torch; print('torch', torch.__version__, 'cuda build', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO GPU')"
 python -c "import numpy, sklearn, scipy, matplotlib, wandb; print('training/eval imports ok')"

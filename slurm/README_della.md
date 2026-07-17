@@ -96,3 +96,19 @@ The full job prints `AE_EXP=...` and `NURD_EXP=...`. The checkpoints are under:
 ```
 
 W&B project: `nurd-ood-hlt`.
+
+The full Slurm job uses W&B offline mode by default because Della compute
+nodes may not be able to initialize online W&B reliably. Metrics are still
+written under the scratch W&B directory and can be synced later.
+
+After the job finishes, find offline runs:
+
+```bash
+find /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/wandb -type d -name 'offline-run-*'
+```
+
+Sync them from a session that can reach W&B:
+
+```bash
+find /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/wandb -type d -name 'offline-run-*' -print0 | xargs -0 -n1 wandb sync
+```
