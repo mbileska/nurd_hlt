@@ -70,23 +70,27 @@ def load_ae(ae_ckpt_path, ae_scaler, device):
 
 def compute_ae_scores(ae, ae_scaler, pt_path_or_dict, device, batch_size=4096):
     """Returns (ae_scores [N], labels [N])."""
-    mu  = ae_scaler["mu"].cpu().numpy()
-    std = ae_scaler["std"].cpu().numpy()
+    mu = ae_scaler["mu"].detach().cpu().float()
+    std = ae_scaler["std"].detach().cpu().float().clamp(min=1e-8)
 
     raw = torch.load(pt_path_or_dict, map_location="cpu") if isinstance(pt_path_or_dict, str) else pt_path_or_dict
-    obj = raw["obj"][:, :, :4].reshape(raw["obj"].shape[0], -1).float().numpy()
-    obj_norm = torch.from_numpy(((obj - mu) / (std + 1e-8)).astype(np.float32))
     labels = raw["label"].numpy()
-    N = obj_norm.shape[0]
+    obj = raw["obj"]
+    N = obj.shape[0]
     print(f"  AE inference on {N} events...", flush=True)
 
     scores = []
     with torch.no_grad():
         for i0 in range(0, N, batch_size):
-            xb = obj_norm[i0:i0 + batch_size].to(device)
+            obj_batch = obj[i0:i0 + batch_size, :, :4]
+            xb = obj_batch.reshape(obj_batch.shape[0], -1).float()
+            xb = (xb - mu.view(1, -1)) / std.view(1, -1)
+            xb = xb.to(device)
             recon, _ = ae(xb)
             mse = ((recon - xb) ** 2).mean(dim=1)
             scores.append(mse.cpu())
+    if isinstance(pt_path_or_dict, str):
+        del raw
     return torch.cat(scores).numpy().astype(np.float32), labels
 
 
@@ -171,7 +175,7 @@ def find_best_abcd_wp(ae_qcd, md_qcd, min_A=10, min_D=100, n_scan=48):
             if A < min_A or D < min_D:
                 continue
             A_hat = (B * C) / max(D, 1e-8)
-            nc    = (A - A_hat) / max(A_hat, 1e-8)
+            nc    = A_hat / max(A, 1e-8) - 1.0
             if np.isfinite(nc) and abs(nc) < abs(best["nonclosure"]):
                 best.update({"nonclosure": nc, "t1": t1_, "t2": t2_,
                              "p1": p1, "p2": p2, "A": A, "B": B, "C": C, "D": D})
@@ -283,6 +287,9 @@ def main():
     parser.add_argument("--eval_json",  default=None,
                         help="Path to abcd_thresholds.json from eval_abcd_nurd.py. "
                              "If provided, t1/t2/n_pca are read from this file and the scan is skipped.")
+    parser.add_argument("--allow_internal_scan", action="store_true",
+                        help="Allow this script to scan thresholds internally. Prefer --eval_json so the "
+                             "datacard uses the exact held-out thresholds from eval_abcd_nurd.py.")
     parser.add_argument("--n_pca",      type=int,   default=None,  help="PCA dims for MD (default: all, overridden by --eval_json)")
     parser.add_argument("--p1",         type=float, default=None,  help="AE-loss percentile threshold (skips scan, ignored if --eval_json set)")
     parser.add_argument("--p2",         type=float, default=None,  help="MD percentile threshold (skips scan, ignored if --eval_json set)")
@@ -319,6 +326,14 @@ def main():
         print(f"Loaded thresholds from {args.eval_json}: t1={_t1_fixed:.4g}, t2={_t2_fixed:.4g}, n_pca={args.n_pca}")
     else:
         _t1_fixed = _t2_fixed = None
+        if (args.p1 is None) != (args.p2 is None):
+            raise RuntimeError("Set both --p1 and --p2, or neither.")
+        if args.p1 is None and args.p2 is None and not args.allow_internal_scan:
+            raise RuntimeError(
+                "No --eval_json was provided. Pass "
+                "$OUTDIR/abcd_thresholds.json from eval_abcd_nurd.py, or set "
+                "--allow_internal_scan to reproduce the older internal scan behavior."
+            )
 
     # ── load models ──────────────────────────────────────────────────────────
     print("\n[1/4] Loading models...")
@@ -399,7 +414,8 @@ def main():
     bins_obs = abcd_counts(ae_scores, md_scores, t1, t2)  # all events (what you'd see in data)
 
     bkg_A_hat    = bins_bkg["B"] * bins_bkg["C"] / max(bins_bkg["D"], 1e-8)
-    nonclosure_bkg = (bins_bkg["A"] - bkg_A_hat) / max(bkg_A_hat, 1e-8)
+    nonclosure_bkg = bkg_A_hat / max(bins_bkg["A"], 1e-8) - 1.0
+    legacy_nonclosure_bkg = (bins_bkg["A"] - bkg_A_hat) / max(bkg_A_hat, 1e-8)
 
     print(f"\n{'='*55}")
     print(f"{'Region':<10} {'Signal(TT)':<14} {'Background':<14} {'Observed':<12}")
@@ -449,6 +465,7 @@ def main():
         "bins_observed": bins_obs,
         "bkg_A_predicted": float(bkg_A_hat),
         "nonclosure_bkg": float(nonclosure_bkg),
+        "legacy_nonclosure_bkg": float(legacy_nonclosure_bkg),
         "nonclosure_qcd": float(nonclosure_qcd) if nonclosure_qcd is not None else None,
         "S_over_B_in_A": float(bins_sig["A"] / max(bkg_A_hat, 1e-8)),
     }

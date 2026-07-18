@@ -29,6 +29,7 @@ CLOSURE_SPLIT_SEED="${CLOSURE_SPLIT_SEED:-42}"
 NURD_GLOB="${NURD_GLOB:-hlt_nurd_closure_bs4096_*}"
 WANDB_NAME_PREFIX="${WANDB_NAME_PREFIX:-optimized}"
 SYNC_WANDB="${SYNC_WANDB:-0}"
+PREFER_CLOSURE_CKPT="${PREFER_CLOSURE_CKPT:-0}"
 
 mkdir -p "$BASE/logs" "$BASE/wandb" "$BASE/matplotlib" "$BASE/outputs"
 
@@ -46,11 +47,17 @@ fi
 ln -sfnT "$BASE/checkpoints" checkpoints
 
 if [[ -z "${CKPT:-}" ]]; then
-  CKPT="$(find "$BASE/checkpoints/hlt/hlt" -path "*/$NURD_GLOB/checkpoint_main_*.pth.tar" \
-    -printf '%T@ %p\n' | sort -nr | awk 'NR==1 {print $2}')"
+  if [[ "$PREFER_CLOSURE_CKPT" == "1" ]]; then
+    CKPT="$(find "$BASE/checkpoints/hlt/hlt" -path "*/$NURD_GLOB/checkpoint_closure.pth.tar" \
+      -printf '%T@ %p\n' | sort -nr | awk 'NR==1 {print $2}')"
+  fi
+  if [[ -z "${CKPT:-}" ]]; then
+    CKPT="$(find "$BASE/checkpoints/hlt/hlt" -path "*/$NURD_GLOB/checkpoint_main_*.pth.tar" \
+      -printf '%T@ %p\n' | sort -nr | awk 'NR==1 {print $2}')"
+  fi
 fi
 if [[ -z "${CKPT:-}" || ! -f "$CKPT" ]]; then
-  echo "ERROR: no checkpoint_main_*.pth.tar found under $BASE/checkpoints/hlt/hlt matching $NURD_GLOB"
+  echo "ERROR: no NURD checkpoint found under $BASE/checkpoints/hlt/hlt matching $NURD_GLOB"
   exit 2
 fi
 
@@ -133,6 +140,7 @@ echo "DCOR_SAMPLE_SIZE: $DCOR_SAMPLE_SIZE"
 echo "CLOSURE_HOLDOUT_FRAC: $CLOSURE_HOLDOUT_FRAC"
 echo "CLOSURE_SPLIT_SEED: $CLOSURE_SPLIT_SEED"
 echo "NURD_GLOB: $NURD_GLOB"
+echo "PREFER_CLOSURE_CKPT: $PREFER_CLOSURE_CKPT"
 echo "WANDB_RUN_NAME: $WANDB_RUN_NAME"
 echo "WANDB_RUN_ID: $WANDB_RUN_ID"
 echo "SYNC_WANDB: $SYNC_WANDB"

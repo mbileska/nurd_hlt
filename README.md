@@ -26,11 +26,13 @@ contrastive score for the background population used by the ABCD estimate. In
 this branch the Slurm training default is `CRITIC_SCOPE=qcd`, so the adversarial
 critic targets QCD, which is the class used for closure.
 
-The critic is a small network that tries to predict the binned AE reconstruction
-loss from the contrastive latent representation. If the critic can predict the
-AE-loss bin, the latent representation still contains nuisance information. The
-encoder is penalized for allowing that, so the two ABCD axes become less
-correlated.
+The default critic is the NURD density-ratio critic: a small network sees
+`(latent, class label, AE-loss bin)` and tries to classify real triples from
+triples with the AE-loss bin shuffled. If it can tell real from shuffled, the
+latent representation still contains nuisance information. The encoder is
+penalized for that density-ratio signal, so the two ABCD axes become less
+correlated. The older direct bin-prediction critic is still available with
+`CRITIC_TYPE=bin_pred`.
 
 Closure means the ABCD estimate agrees with the true QCD yield in region A:
 
@@ -161,6 +163,9 @@ unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP RUN_TAG WANDB_RUN_NAME WANDB_RUN_ID
 RUN_TAG=qcdcritic_$(date +%Y%m%d_%H%M%S) sbatch slurm/submit_train.sbatch
 ```
 
+The training job requests 7 hours, 64 GB CPU memory, and one A100. It exits
+early if the allocated GPU has less than 75 GiB memory.
+
 Monitor:
 
 ```bash
@@ -176,6 +181,8 @@ AE_EXP=...
 NURD_EXP=...
 BATCH_SIZE=4096
 CRITIC_SCOPE=qcd
+CRITIC_TYPE=density_ratio
+CLOSURE_LOSS_TYPE=corr
 ```
 
 Checkpoints are written to:
@@ -183,7 +190,12 @@ Checkpoints are written to:
 ```text
 $BASE/checkpoints/hlt/hlt/<AE_EXP>/checkpoint_ae.pth
 $BASE/checkpoints/hlt/hlt/<NURD_EXP>/checkpoint_main_*.pth.tar
+$BASE/checkpoints/hlt/hlt/<NURD_EXP>/checkpoint_closure.pth.tar
 ```
+
+`checkpoint_main_*.pth.tar` is selected by validation classification loss.
+`checkpoint_closure.pth.tar` is selected by the smallest validation QCD
+AE-vs-proxy-MD correlation while keeping validation loss close to the best loss.
 
 To reuse an existing AE checkpoint and train only NURD:
 
@@ -197,13 +209,16 @@ Useful training toggles:
 ```bash
 CRITIC_SCOPE=qcd sbatch slurm/submit_train.sbatch      # default, QCD-only critic
 CRITIC_SCOPE=all sbatch slurm/submit_train.sbatch      # older all-class critic
+CRITIC_TYPE=density_ratio sbatch slurm/submit_train.sbatch
+CRITIC_TYPE=bin_pred sbatch slurm/submit_train.sbatch   # older direct-bin critic
+CLOSURE_LOSS_TYPE=corr sbatch slurm/submit_train.sbatch # default, cheaper and closer to eval axes
+CLOSURE_LOSS_TYPE=abcd sbatch slurm/submit_train.sbatch # older random-cut batch proxy
 CLOSURE_WEIGHT=0.3 sbatch slurm/submit_train.sbatch    # stronger closure proxy
 BATCH_SIZE=3072 sbatch slurm/submit_train.sbatch       # lower GPU memory
 AE_EPOCHS=100 NURD_EPOCHS=100 sbatch slurm/submit_train.sbatch
 ```
 
-The full training job requests one A100 and exits early unless the allocated GPU
-has at least 75 GiB memory. W&B runs offline by default.
+W&B runs offline by default.
 
 ## Find A Checkpoint
 
@@ -229,6 +244,14 @@ CKPT=$(ls -t $BASE/checkpoints/hlt/hlt/$NURD_EXP/checkpoint_main_*.pth.tar | hea
 echo "$CKPT"
 ```
 
+Select the closure-selected checkpoint in one experiment:
+
+```bash
+NURD_EXP=<nurd_exp_from_log>
+CKPT=$BASE/checkpoints/hlt/hlt/$NURD_EXP/checkpoint_closure.pth.tar
+echo "$CKPT"
+```
+
 ## Evaluation
 
 Use `slurm/submit_eval_latest.sbatch` for normal evaluations. It prints the
@@ -245,6 +268,15 @@ Evaluate the newest real checkpoint:
 ```bash
 unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP WANDB_RUN_NAME WANDB_RUN_ID
 WANDB_NAME_PREFIX=heldout_eval sbatch slurm/submit_eval_latest.sbatch
+```
+
+Evaluate the newest closure-selected checkpoint instead of the normal
+validation-loss checkpoint:
+
+```bash
+unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP WANDB_RUN_NAME WANDB_RUN_ID
+PREFER_CLOSURE_CKPT=1 WANDB_NAME_PREFIX=heldout_eval_closure_ckpt \
+  sbatch slurm/submit_eval_latest.sbatch
 ```
 
 Evaluate a specific checkpoint:
@@ -332,7 +364,10 @@ ls -lh <old_OUTDIR>/plots
 Key metrics:
 
 - `ABCD/nonclosure`: main held-out closure number when
-  `CLOSURE_HOLDOUT_FRAC > 0`.
+  `CLOSURE_HOLDOUT_FRAC > 0`. It is `predicted_A / true_A - 1`.
+- `ABCD/legacy_nonclosure`: old convention, `(true_A - predicted_A) /
+  predicted_A`, saved only for comparing to older outputs.
+- `ABCD/ratio_pred_over_true`: the direct closure ratio.
 - `ABCD/tune_nonclosure`: threshold-tuning split result.
 - `ABCD/report_best_nonclosure`: best possible held-out point, for reference.
 - `ABCD/grid_median_abs_nonclosure` and `ABCD/grid_p90_abs_nonclosure`: closure
@@ -390,7 +425,8 @@ python train_hlt.py \
   --data "$BASE/data/hlt_smcocktail_train.pt" \
   --ae_ckpt checkpoints/hlt/hlt/smoke_ae/checkpoint_ae.pth \
   --epochs 1 --batch_size 64 --max_events 2000 --local_testing 1 \
-  --critic_scope qcd --critic_schedule warmup \
+  --critic_scope qcd --critic_schedule warmup --critic_type density_ratio \
+  --closure_weight 0.1 --closure_loss_type corr \
   --reweight 1 --joint_indep 1 \
   --exp_name smoke_nurd --project_name hlt
 ```

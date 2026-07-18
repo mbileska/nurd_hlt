@@ -5,9 +5,9 @@ The nuisance variable z is the **binned AE reconstruction loss**.
 NURD exact weights w(y,z) = p(y)*p(z)/p(y,z) are pre-computed on load
 so that train_exact.py can look them up with dataset.weights[(y,z)].
 
-Dataset returns (pf_features, label, nuisance_bin) per event.
+Dataset returns (pf_features, label, nuisance_bin, ae_reco, nurd_weight)
+per event.
 """
-import math
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -73,30 +73,51 @@ class HLTSmCocktailDataset(Dataset):
         split:      "train" | "val"
     """
     def __init__(self, pf_data, labels, nuisances_all, ae_reco_all, idx,
-                 split="train", bin_edges=None):
+                 split="train", bin_edges=None, max_weight_ratio=10.0):
         super().__init__()
         self.bin_edges = bin_edges
 
-        self.features  = pf_data[idx]
-        self.labels    = labels[idx].float()
-        self.nuisances = nuisances_all[idx].float()
-        self.ae_reco   = ae_reco_all[idx].float()
-        self.split     = split
+        self.features = pf_data
+        self.labels_all = labels
+        self.nuisances_all = nuisances_all
+        self.ae_reco_all = ae_reco_all
+        self.idx = idx.long()
+        self.split = split
+        self.num_tokens = pf_data.size(1)
+
+        self.labels = labels[self.idx].float()
+        self.nuisances = nuisances_all[self.idx].float()
+        self.ae_reco = ae_reco_all[self.idx].float()
 
         # ── NURD exact weights ────────────────────────────────────────────────
-        self.weights = _make_nurd_weights(labels[idx], nuisances_all[idx])
+        labels_split = labels[self.idx]
+        nuisances_split = nuisances_all[self.idx]
+        self.weights = _make_nurd_weights(
+            labels_split, nuisances_split, max_weight_ratio=max_weight_ratio)
+        self.sample_weights = torch.tensor(
+            [self.weights[(int(y.item()), int(z.item()))]
+             for y, z in zip(labels_split, nuisances_split)],
+            dtype=torch.float32,
+        )
         _w = list(self.weights.values())
         import statistics
         _w_mean = sum(_w) / len(_w)
-        _w_std  = statistics.stdev(_w)
+        _w_std = statistics.stdev(_w) if len(_w) > 1 else 0.0
         print(f"[{split}] NURD weight groups={len(_w)}  mean={_w_mean:.3f}  "
               f"std={_w_std:.3f}  min={min(_w):.3f}  max={max(_w):.3f}")
 
     def __len__(self):
-        return len(self.features)
+        return len(self.idx)
 
     def __getitem__(self, idx):
-        return self.features[idx], self.labels[idx], self.nuisances[idx], self.ae_reco[idx]
+        event_idx = self.idx[idx]
+        return (
+            self.features[event_idx],
+            self.labels[idx],
+            self.nuisances[idx],
+            self.ae_reco[idx],
+            self.sample_weights[idx],
+        )
 
     def get_label_prior(self):
         total = len(self.labels)
@@ -116,7 +137,8 @@ class HLTSmCocktailDataset(Dataset):
 
 
 def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42,
-                       max_events=-1, ae_scaler=None, ae_batch_size=4096):
+                       max_events=-1, ae_scaler=None, ae_batch_size=4096,
+                       max_weight_ratio=10.0):
     """
     Load the HLT .pt file, pre-normalise obj features, and return
     (train_dataset, val_dataset).  Call once; pass the same bin_edges
@@ -164,8 +186,10 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42,
 
     ds_train = HLTSmCocktailDataset(
         pf, labels, nuisances_all, ae_reco_all, idx_tr,
-        split="train", bin_edges=bin_edges)
+        split="train", bin_edges=bin_edges,
+        max_weight_ratio=max_weight_ratio)
     ds_val = HLTSmCocktailDataset(
         pf, labels, nuisances_all, ae_reco_all, idx_val,
-        split="val", bin_edges=bin_edges)
+        split="val", bin_edges=bin_edges,
+        max_weight_ratio=max_weight_ratio)
     return ds_train, ds_val, obj_scaler

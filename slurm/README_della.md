@@ -122,6 +122,8 @@ AE_EXP=...
 NURD_EXP=...
 BATCH_SIZE=4096
 CRITIC_SCOPE=qcd
+CRITIC_TYPE=density_ratio
+CLOSURE_LOSS_TYPE=corr
 ```
 
 Save those values. The checkpoints will be under:
@@ -130,6 +132,12 @@ Save those values. The checkpoints will be under:
 $BASE/checkpoints/hlt/hlt/<AE_EXP>/
 $BASE/checkpoints/hlt/hlt/<NURD_EXP>/
 ```
+
+The normal model checkpoint is `checkpoint_main_*.pth.tar`, selected by
+validation classification loss. Training also writes
+`checkpoint_closure.pth.tar`, selected by the smallest validation QCD
+AE-vs-proxy-MD correlation while the validation loss stays close to the best
+loss.
 
 Reuse an existing AE and train only NURD:
 
@@ -143,13 +151,18 @@ Useful training toggles:
 ```bash
 CRITIC_SCOPE=qcd sbatch slurm/submit_train.sbatch      # default, targets QCD closure
 CRITIC_SCOPE=all sbatch slurm/submit_train.sbatch      # old all-class critic
+CRITIC_TYPE=density_ratio sbatch slurm/submit_train.sbatch
+CRITIC_TYPE=bin_pred sbatch slurm/submit_train.sbatch   # old direct-bin critic
+CLOSURE_LOSS_TYPE=corr sbatch slurm/submit_train.sbatch # default, cheaper and closer to eval axes
+CLOSURE_LOSS_TYPE=abcd sbatch slurm/submit_train.sbatch # old random-cut batch proxy
 CLOSURE_WEIGHT=0.3 sbatch slurm/submit_train.sbatch    # stronger closure loss
 BATCH_SIZE=3072 sbatch slurm/submit_train.sbatch       # lower memory
 AE_EPOCHS=100 NURD_EPOCHS=100 sbatch slurm/submit_train.sbatch
 ```
 
-The training job requests an A100 and exits early unless the GPU has at least
-75 GiB memory. It runs W&B in offline mode by default.
+The training job requests 7 hours, 64 GB CPU memory, and one A100. It exits
+early unless the GPU has at least 75 GiB memory. It runs W&B in offline mode by
+default.
 
 ## 3. Find The Checkpoint You Want
 
@@ -175,6 +188,14 @@ CKPT=$(ls -t $BASE/checkpoints/hlt/hlt/$NURD_EXP/checkpoint_main_*.pth.tar | hea
 echo "$CKPT"
 ```
 
+Get the closure-selected checkpoint from that NURD experiment:
+
+```bash
+NURD_EXP=<nurd_exp_from_log>
+CKPT=$BASE/checkpoints/hlt/hlt/$NURD_EXP/checkpoint_closure.pth.tar
+echo "$CKPT"
+```
+
 ## 4. Evaluation: New Correct Held-Out Method
 
 This is the default and the method to quote. It chooses ABCD thresholds on one
@@ -185,6 +206,14 @@ Evaluate the newest real checkpoint automatically:
 ```bash
 unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP WANDB_RUN_NAME WANDB_RUN_ID
 WANDB_NAME_PREFIX=heldout_eval sbatch slurm/submit_eval_latest.sbatch
+```
+
+Evaluate the newest closure-selected checkpoint instead:
+
+```bash
+unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP WANDB_RUN_NAME WANDB_RUN_ID
+PREFER_CLOSURE_CKPT=1 WANDB_NAME_PREFIX=heldout_eval_closure_ckpt \
+  sbatch slurm/submit_eval_latest.sbatch
 ```
 
 Evaluate a specific checkpoint explicitly:
@@ -319,6 +348,8 @@ login node.
 ## 8. Quick Interpretation
 
 - Use held-out `ABCD/nonclosure` as the main closure number.
+- In current outputs, `ABCD/nonclosure` means `predicted_A / true_A - 1`.
+  `ABCD/legacy_nonclosure` is saved only for comparison with older outputs.
 - Use old same-sample eval only to understand how much the previous method was
   over-optimizing.
 - A good red point means the selected ABCD working point generalizes.

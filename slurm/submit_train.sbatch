@@ -2,9 +2,9 @@
 #SBATCH --job-name=nurd_hlt_train
 #SBATCH --output=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/%x-%j.out
 #SBATCH --error=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/%x-%j.err
-#SBATCH --time=24:00:00
+#SBATCH --time=07:00:00
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=128G
+#SBATCH --mem=64G
 #SBATCH --gres=gpu:a100:1
 #SBATCH --exclude=della-i12g[1-2],della-i14g[1-20]
 
@@ -53,7 +53,12 @@ BATCH_SIZE="${BATCH_SIZE:-4096}"
 AE_EPOCHS="${AE_EPOCHS:-100}"
 NURD_EPOCHS="${NURD_EPOCHS:-100}"
 CLOSURE_WEIGHT="${CLOSURE_WEIGHT:-0.1}"
+CLOSURE_LOSS_TYPE="${CLOSURE_LOSS_TYPE:-corr}"
 CRITIC_SCOPE="${CRITIC_SCOPE:-qcd}"
+CRITIC_TYPE="${CRITIC_TYPE:-density_ratio}"
+N_CRITIC_STEPS="${N_CRITIC_STEPS:-2}"
+CONTRAST_WEIGHT="${CONTRAST_WEIGHT:-0.2}"
+MAX_WEIGHT_RATIO="${MAX_WEIGHT_RATIO:-10.0}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 AE_CKPT="${AE_CKPT:-checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth}"
 
@@ -69,7 +74,12 @@ echo "AE_EPOCHS=$AE_EPOCHS"
 echo "NURD_EPOCHS=$NURD_EPOCHS"
 echo "AE_CKPT=$AE_CKPT"
 echo "CRITIC_SCOPE=$CRITIC_SCOPE"
+echo "CRITIC_TYPE=$CRITIC_TYPE"
+echo "N_CRITIC_STEPS=$N_CRITIC_STEPS"
+echo "CONTRAST_WEIGHT=$CONTRAST_WEIGHT"
 echo "CLOSURE_WEIGHT=$CLOSURE_WEIGHT"
+echo "CLOSURE_LOSS_TYPE=$CLOSURE_LOSS_TYPE"
+echo "MAX_WEIGHT_RATIO=$MAX_WEIGHT_RATIO"
 echo "W&B project: nurd-ood-hlt"
 echo "W&B mode: $WANDB_MODE"
 echo "Minimum GPU memory: ${MIN_GPU_MEM_GB} GiB"
@@ -111,7 +121,8 @@ python train_hlt.py \
   --n_bins 10 \
   --reweight 1 \
   --joint_indep 1 \
-  --contrast_weight 0.2 \
+  --max_weight_ratio "$MAX_WEIGHT_RATIO" \
+  --contrast_weight "$CONTRAST_WEIGHT" \
   --contrast_temp 0.05 \
   --embed_size 128 \
   --latent_dim 6 \
@@ -121,16 +132,17 @@ python train_hlt.py \
   --dim_ff 512 \
   --linear_dim 16 \
   --critic_schedule warmup \
+  --critic_type "$CRITIC_TYPE" \
   --critic_warmup_epochs 7 \
   --critic_ramp_epochs 10 \
   --critic_train_frac 0.2 \
   --critic_lr_multiplier 10.0 \
-  --n_critic_steps_per_batch 3 \
+  --n_critic_steps_per_batch "$N_CRITIC_STEPS" \
   --critic_scope "$CRITIC_SCOPE" \
   --_lambda 0.01 \
   --no_mi_norm \
-  --offload_critic_graph \
   --closure_weight "$CLOSURE_WEIGHT" \
+  --closure_loss_type "$CLOSURE_LOSS_TYPE" \
   --qcd_label 1 \
   --exp_name "$NURD_EXP" \
   --project_name hlt \

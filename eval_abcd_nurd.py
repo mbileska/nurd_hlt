@@ -51,17 +51,35 @@ def abcd_counts_at_thresholds(loss_1, loss_2, thresh_1, thresh_2):
     return A, B, C, D
 
 
-def nonclosure_A(A, B, C, D, eps=1e-8):
+def closure_metrics(A, B, C, D, eps=1e-8):
     A_hat = (B * C) / max(D, eps)
-    if A_hat <= 0:
-        return np.inf, A_hat
-    return (A - A_hat) / A_hat, A_hat
+    if A <= 0 or A_hat <= 0:
+        return {
+            "A_hat": float(A_hat),
+            "ratio": np.inf,
+            "nonclosure": np.inf,
+            "legacy_nonclosure": np.inf,
+            "log_nonclosure": np.inf,
+        }
+    ratio = A_hat / max(A, eps)
+    return {
+        "A_hat": float(A_hat),
+        "ratio": float(ratio),
+        "nonclosure": float(ratio - 1.0),
+        "legacy_nonclosure": float((A - A_hat) / max(A_hat, eps)),
+        "log_nonclosure": float(np.log(max(ratio, eps))),
+    }
+
+
+def nonclosure_A(A, B, C, D, eps=1e-8):
+    metrics = closure_metrics(A, B, C, D, eps=eps)
+    return metrics["nonclosure"], metrics["A_hat"]
 
 
 def abcd_record_at_thresholds(loss_1, loss_2, thresh_1, thresh_2):
     A, B, C, D = abcd_counts_at_thresholds(loss_1, loss_2, thresh_1, thresh_2)
-    nc, A_hat = nonclosure_A(A, B, C, D)
-    ratio = A_hat / max(A, 1e-8)
+    metrics = closure_metrics(A, B, C, D)
+    ratio = metrics["ratio"]
     invA = 0.0 if A == 0 else 1.0 / A
     invB = 0.0 if B == 0 else 1.0 / B
     invC = 0.0 if C == 0 else 1.0 / C
@@ -75,8 +93,10 @@ def abcd_record_at_thresholds(loss_1, loss_2, thresh_1, thresh_2):
         "B": int(B),
         "C": int(C),
         "D": int(D),
-        "A_hat": float(A_hat),
-        "nonclosure": float(nc),
+        "A_hat": metrics["A_hat"],
+        "nonclosure": metrics["nonclosure"],
+        "legacy_nonclosure": metrics["legacy_nonclosure"],
+        "log_nonclosure": metrics["log_nonclosure"],
         "ratio": float(ratio),
         "ratio_unc": float(ratio_unc),
     }
@@ -93,34 +113,72 @@ def _grid_summary(abs_nonclosure):
 
 
 def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500):
-    best = {"nonclosure": np.inf}
+    best = {"log_nonclosure": np.inf, "nonclosure": np.inf}
     scan_abs_nonclosure = []
     for p1 in percent:
         for p2 in percent:
             t1, t2, A, B, C, D = abcd_counts(loss_1, loss_2, p1, p2)
             if A < min_A or D < min_D:
                 continue
-            nc, A_hat = nonclosure_A(A, B, C, D)
+            metrics = closure_metrics(A, B, C, D)
+            nc = metrics["nonclosure"]
+            score = abs(metrics["log_nonclosure"])
             if np.isfinite(nc):
                 scan_abs_nonclosure.append(abs(nc))
-            if np.isfinite(nc) and abs(nc) < abs(best["nonclosure"]):
+            if np.isfinite(score) and score < abs(best["log_nonclosure"]):
                 best.update(dict(p1=float(p1), p2=float(p2), t1=float(t1), t2=float(t2),
                                  A=int(A), B=int(B), C=int(C), D=int(D),
-                                 A_hat=float(A_hat), nonclosure=float(nc)))
+                                 A_hat=metrics["A_hat"],
+                                 nonclosure=float(nc),
+                                 legacy_nonclosure=metrics["legacy_nonclosure"],
+                                 log_nonclosure=metrics["log_nonclosure"],
+                                 ratio=metrics["ratio"]))
     return best, _grid_summary(scan_abs_nonclosure)
 
 
-def split_for_threshold_report(n_events, holdout_frac=0.5, seed=42):
+def split_for_threshold_report(n_events, holdout_frac=0.5, seed=42,
+                               axis1=None, axis2=None, n_strata=8):
     idx = np.arange(n_events)
     if holdout_frac <= 0.0 or holdout_frac >= 1.0 or n_events < 4:
         return idx, idx, "same_sample"
     rng = np.random.default_rng(seed)
-    perm = rng.permutation(idx)
-    n_report = int(round(holdout_frac * n_events))
-    n_report = min(max(n_report, 1), n_events - 1)
-    report_idx = perm[:n_report]
-    tune_idx = perm[n_report:]
-    return tune_idx, report_idx, "holdout"
+    if axis1 is None or axis2 is None:
+        perm = rng.permutation(idx)
+        n_report = int(round(holdout_frac * n_events))
+        n_report = min(max(n_report, 1), n_events - 1)
+        report_idx = perm[:n_report]
+        tune_idx = perm[n_report:]
+        return tune_idx, report_idx, "holdout_random"
+
+    axis1 = np.asarray(axis1)
+    axis2 = np.asarray(axis2)
+    valid = np.isfinite(axis1) & np.isfinite(axis2)
+    if valid.sum() != n_events:
+        return split_for_threshold_report(n_events, holdout_frac, seed)
+
+    q1 = np.quantile(axis1, np.linspace(0.0, 1.0, n_strata + 1))
+    q2 = np.quantile(axis2, np.linspace(0.0, 1.0, n_strata + 1))
+    b1 = np.searchsorted(q1[1:-1], axis1, side="right")
+    b2 = np.searchsorted(q2[1:-1], axis2, side="right")
+    strata = b1 * n_strata + b2
+
+    tune_parts, report_parts = [], []
+    for s in np.unique(strata):
+        members = idx[strata == s]
+        members = rng.permutation(members)
+        if members.size < 2:
+            tune_parts.append(members)
+            continue
+        n_report = int(round(holdout_frac * members.size))
+        n_report = min(max(n_report, 1), members.size - 1)
+        report_parts.append(members[:n_report])
+        tune_parts.append(members[n_report:])
+
+    tune_idx = np.concatenate(tune_parts) if tune_parts else np.array([], dtype=int)
+    report_idx = np.concatenate(report_parts) if report_parts else np.array([], dtype=int)
+    if tune_idx.size == 0 or report_idx.size == 0:
+        return split_for_threshold_report(n_events, holdout_frac, seed)
+    return rng.permutation(tune_idx), rng.permutation(report_idx), "holdout_stratified"
 
 
 def profile_plot(ax, x, y, nbins=30, logx=False, min_per_bin=20, label="mean ± SE"):
@@ -246,22 +304,25 @@ def load_ae(ae_ckpt_path, ae_scaler, device):
 
 def compute_ae_scores(ae, ae_scaler, pt_path, device, batch_size=4096):
     """AE reco loss (MSE) per event using obj features from pt_path."""
-    mu  = ae_scaler["mu"].cpu().numpy()
-    std = ae_scaler["std"].cpu().numpy()
+    mu = ae_scaler["mu"].detach().cpu().float()
+    std = ae_scaler["std"].detach().cpu().float().clamp(min=1e-8)
 
     raw = torch.load(pt_path, map_location="cpu")
-    obj = raw["obj"][:, :, :4].reshape(raw["obj"].shape[0], -1).float().numpy()
-    obj_norm = torch.from_numpy(((obj - mu) / (std + 1e-8)).astype(np.float32))
-    N = obj_norm.shape[0]
+    obj = raw["obj"]
+    N = obj.shape[0]
     print(f"  AE inference on {N} events...", flush=True)
 
     scores = []
     with torch.no_grad():
         for i0 in range(0, N, batch_size):
-            xb = obj_norm[i0:i0 + batch_size].to(device)
+            obj_batch = obj[i0:i0 + batch_size, :, :4]
+            xb = obj_batch.reshape(obj_batch.shape[0], -1).float()
+            xb = (xb - mu.view(1, -1)) / std.view(1, -1)
+            xb = xb.to(device)
             recon, _ = ae(xb)
             mse = ((recon - xb) ** 2).mean(dim=1)
             scores.append(mse.cpu())
+    del raw
     return torch.cat(scores).numpy().astype(np.float32)
 
 
@@ -486,7 +547,8 @@ def ABCD(config):
     holdout_frac = float(config.get("closure_holdout_frac", 0.5))
     split_seed = int(config.get("closure_split_seed", 42))
     tune_idx, report_idx, closure_mode = split_for_threshold_report(
-        len(axis1_qcd), holdout_frac=holdout_frac, seed=split_seed)
+        len(axis1_qcd), holdout_frac=holdout_frac, seed=split_seed,
+        axis1=axis1_qcd, axis2=axis2_qcd)
     axis1_tune, axis2_tune = axis1_qcd[tune_idx], axis2_qcd[tune_idx]
     axis1_report, axis2_report = axis1_qcd[report_idx], axis2_qcd[report_idx]
     print(
@@ -507,6 +569,7 @@ def ABCD(config):
         "p1": float(best_tune["p1"]),
         "p2": float(best_tune["p2"]),
         "selection_nonclosure": float(best_tune["nonclosure"]),
+        "selection_log_nonclosure": float(best_tune["log_nonclosure"]),
     })
     best_report_scan, grid_summary = scan_abcd_grid(
         axis1_report, axis2_report, percent, min_A=min_A, min_D=min_D)
@@ -514,7 +577,11 @@ def ABCD(config):
     print(f"Optimized on tune split: p1={best_tune['p1']:.3f}, p2={best_tune['p2']:.3f}", flush=True)
     print(f"Thresholds: t1={t1_opt:.4g}, t2={t2_opt:.4g}", flush=True)
     print(f"Tune nonclosure: {100.0*best_tune['nonclosure']:.2f}%", flush=True)
-    print(f"Reported nonclosure: {100.0*report_at_selected['nonclosure']:.2f}%", flush=True)
+    print(
+        f"Reported nonclosure: {100.0*report_at_selected['nonclosure']:.2f}% "
+        f"(ABCD/true ratio={report_at_selected['ratio']:.4f})",
+        flush=True,
+    )
 
     diagnostics["abcd_selection"] = {
         "mode": closure_mode,
@@ -543,8 +610,13 @@ def ABCD(config):
         "ABCD/opt_t1":     float(t1_opt),
         "ABCD/opt_t2":     float(t2_opt),
         "ABCD/nonclosure": float(report_at_selected["nonclosure"]),
+        "ABCD/legacy_nonclosure": float(report_at_selected["legacy_nonclosure"]),
+        "ABCD/log_nonclosure": float(report_at_selected["log_nonclosure"]),
+        "ABCD/ratio_pred_over_true": float(report_at_selected["ratio"]),
         "ABCD/tune_nonclosure": float(best_tune["nonclosure"]),
+        "ABCD/tune_log_nonclosure": float(best_tune["log_nonclosure"]),
         "ABCD/report_best_nonclosure": float(best_report_scan.get("nonclosure", np.nan)),
+        "ABCD/report_best_log_nonclosure": float(best_report_scan.get("log_nonclosure", np.nan)),
         "ABCD/closure_mode_holdout": int(closure_mode == "holdout"),
         "ABCD/grid_mean_abs_nonclosure": grid_summary["mean_abs_nonclosure"],
         "ABCD/grid_median_abs_nonclosure": grid_summary["median_abs_nonclosure"],
@@ -892,8 +964,13 @@ def ABCD(config):
             "p2":    float(report_at_selected["p2"]),
             "n_pca": config.get("n_pca", None),
             "nonclosure": float(report_at_selected["nonclosure"]),
+            "legacy_nonclosure": float(report_at_selected["legacy_nonclosure"]),
+            "log_nonclosure": float(report_at_selected["log_nonclosure"]),
+            "ratio": float(report_at_selected["ratio"]),
             "tune_nonclosure": float(best_tune["nonclosure"]),
+            "tune_log_nonclosure": float(best_tune["log_nonclosure"]),
             "report_best_nonclosure": float(best_report_scan.get("nonclosure", np.nan)),
+            "report_best_log_nonclosure": float(best_report_scan.get("log_nonclosure", np.nan)),
             "closure_mode": closure_mode,
             "report_A": int(report_at_selected["A"]),
             "report_B": int(report_at_selected["B"]),
