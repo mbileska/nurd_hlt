@@ -24,6 +24,8 @@ AE_BATCH_SIZE="${AE_BATCH_SIZE:-4096}"
 N_PCA="${N_PCA:-6}"
 CORR_SAMPLE_SIZE="${CORR_SAMPLE_SIZE:-50000}"
 DCOR_SAMPLE_SIZE="${DCOR_SAMPLE_SIZE:-2000}"
+CLOSURE_HOLDOUT_FRAC="${CLOSURE_HOLDOUT_FRAC:-0.5}"
+CLOSURE_SPLIT_SEED="${CLOSURE_SPLIT_SEED:-42}"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 
 mkdir -p "$BASE/logs" "$BASE/wandb" "$BASE/matplotlib" "$BASE/outputs"
@@ -102,6 +104,8 @@ echo "AE_BATCH_SIZE: $AE_BATCH_SIZE"
 echo "N_PCA: $N_PCA"
 echo "CORR_SAMPLE_SIZE: $CORR_SAMPLE_SIZE"
 echo "DCOR_SAMPLE_SIZE: $DCOR_SAMPLE_SIZE"
+echo "CLOSURE_HOLDOUT_FRAC: $CLOSURE_HOLDOUT_FRAC"
+echo "CLOSURE_SPLIT_SEED: $CLOSURE_SPLIT_SEED"
 echo "WANDB_RUN_NAME: $WANDB_RUN_NAME"
 echo "WANDB_RUN_ID: ${WANDB_RUN_ID:-}"
 echo "W&B mode: $WANDB_MODE"
@@ -127,6 +131,8 @@ python eval_abcd_nurd.py \
   --ae_batch_size "$AE_BATCH_SIZE" \
   --corr_sample_size "$CORR_SAMPLE_SIZE" \
   --dcor_sample_size "$DCOR_SAMPLE_SIZE" \
+  --closure_holdout_frac "$CLOSURE_HOLDOUT_FRAC" \
+  --closure_split_seed "$CLOSURE_SPLIT_SEED" \
   "${RESUME_ARGS[@]}" \
   "${EXTRA_ARGS[@]}"
 

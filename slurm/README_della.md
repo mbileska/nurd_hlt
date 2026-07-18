@@ -185,6 +185,16 @@ For decorrelation, inspect `diagnostics.json` and W&B keys
 do not look only at the optimized `ABCD/nonclosure`; also check
 `ABCD/grid_median_abs_nonclosure` and `ABCD/grid_p90_abs_nonclosure`.
 
+By default, eval now chooses ABCD thresholds on one deterministic half of QCD
+and reports `ABCD/nonclosure` on the held-out half. The tuned-sample number is
+kept separately as `ABCD/tune_nonclosure`.
+
+To reproduce the old same-sample behavior for debugging only:
+
+```bash
+CLOSURE_HOLDOUT_FRAC=0 NURD_EXP=<NURD_EXP> sbatch slurm/submit_eval_abcd.sbatch
+```
+
 ## Latest Checkpoint Eval
 
 To automatically evaluate the newest `checkpoint_main_*.pth.tar` under
@@ -197,7 +207,8 @@ sbatch slurm/submit_eval_latest.sbatch
 
 The wrapper prints the exact `CKPT`, `AE_CKPT`, result directory, W&B run name,
 and W&B sync command into the Slurm `.out` log. By default the W&B run name
-starts with `optimized_`.
+starts with `optimized_`, and the checkpoint search ignores smoke-test
+directories by looking only under `hlt_nurd_closure_bs4096_*`.
 
 To sync that eval run automatically at the end of the Slurm job:
 

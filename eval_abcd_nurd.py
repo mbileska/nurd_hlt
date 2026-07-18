@@ -39,11 +39,16 @@ from models.hlt_autoencoder import HLTAutoencoder
 def abcd_counts(loss_1, loss_2, percent_1, percent_2):
     thresh_1 = np.quantile(loss_1, percent_1)
     thresh_2 = np.quantile(loss_2, percent_2)
+    A, B, C, D = abcd_counts_at_thresholds(loss_1, loss_2, thresh_1, thresh_2)
+    return thresh_1, thresh_2, A, B, C, D
+
+
+def abcd_counts_at_thresholds(loss_1, loss_2, thresh_1, thresh_2):
     A = int(((loss_1 > thresh_1) & (loss_2 > thresh_2)).sum())
     B = int(((loss_1 > thresh_1) & (loss_2 <= thresh_2)).sum())
     C = int(((loss_1 <= thresh_1) & (loss_2 > thresh_2)).sum())
     D = int(((loss_1 <= thresh_1) & (loss_2 <= thresh_2)).sum())
-    return thresh_1, thresh_2, A, B, C, D
+    return A, B, C, D
 
 
 def nonclosure_A(A, B, C, D, eps=1e-8):
@@ -51,6 +56,71 @@ def nonclosure_A(A, B, C, D, eps=1e-8):
     if A_hat <= 0:
         return np.inf, A_hat
     return (A - A_hat) / A_hat, A_hat
+
+
+def abcd_record_at_thresholds(loss_1, loss_2, thresh_1, thresh_2):
+    A, B, C, D = abcd_counts_at_thresholds(loss_1, loss_2, thresh_1, thresh_2)
+    nc, A_hat = nonclosure_A(A, B, C, D)
+    ratio = A_hat / max(A, 1e-8)
+    invA = 0.0 if A == 0 else 1.0 / A
+    invB = 0.0 if B == 0 else 1.0 / B
+    invC = 0.0 if C == 0 else 1.0 / C
+    invD = 0.0 if D == 0 else 1.0 / D
+    rel_var = invA + invB + invC + invD
+    ratio_unc = abs(ratio) * np.sqrt(rel_var) if rel_var > 0 else 0.0
+    return {
+        "t1": float(thresh_1),
+        "t2": float(thresh_2),
+        "A": int(A),
+        "B": int(B),
+        "C": int(C),
+        "D": int(D),
+        "A_hat": float(A_hat),
+        "nonclosure": float(nc),
+        "ratio": float(ratio),
+        "ratio_unc": float(ratio_unc),
+    }
+
+
+def _grid_summary(abs_nonclosure):
+    values = np.asarray(abs_nonclosure, dtype=np.float64)
+    return {
+        "n_points": int(values.size),
+        "mean_abs_nonclosure": float(np.mean(values)) if values.size else np.nan,
+        "median_abs_nonclosure": float(np.median(values)) if values.size else np.nan,
+        "p90_abs_nonclosure": float(np.quantile(values, 0.90)) if values.size else np.nan,
+    }
+
+
+def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500):
+    best = {"nonclosure": np.inf}
+    scan_abs_nonclosure = []
+    for p1 in percent:
+        for p2 in percent:
+            t1, t2, A, B, C, D = abcd_counts(loss_1, loss_2, p1, p2)
+            if A < min_A or D < min_D:
+                continue
+            nc, A_hat = nonclosure_A(A, B, C, D)
+            if np.isfinite(nc):
+                scan_abs_nonclosure.append(abs(nc))
+            if np.isfinite(nc) and abs(nc) < abs(best["nonclosure"]):
+                best.update(dict(p1=float(p1), p2=float(p2), t1=float(t1), t2=float(t2),
+                                 A=int(A), B=int(B), C=int(C), D=int(D),
+                                 A_hat=float(A_hat), nonclosure=float(nc)))
+    return best, _grid_summary(scan_abs_nonclosure)
+
+
+def split_for_threshold_report(n_events, holdout_frac=0.5, seed=42):
+    idx = np.arange(n_events)
+    if holdout_frac <= 0.0 or holdout_frac >= 1.0 or n_events < 4:
+        return idx, idx, "same_sample"
+    rng = np.random.default_rng(seed)
+    perm = rng.permutation(idx)
+    n_report = int(round(holdout_frac * n_events))
+    n_report = min(max(n_report, 1), n_events - 1)
+    report_idx = perm[:n_report]
+    tune_idx = perm[n_report:]
+    return tune_idx, report_idx, "holdout"
 
 
 def profile_plot(ax, x, y, nbins=30, logx=False, min_per_bin=20, label="mean ± SE"):
@@ -411,41 +481,55 @@ def ABCD(config):
 
     # ── ABCD scan ─────────────────────────────────────────────────────────────
     percent = np.linspace(0.50, 0.98, 48)
-    best    = {"nonclosure": np.inf}
     min_A   = int(config.get("min_A", 50))
     min_D   = int(config.get("min_D", 500))
-    scan_abs_nonclosure = []
+    holdout_frac = float(config.get("closure_holdout_frac", 0.5))
+    split_seed = int(config.get("closure_split_seed", 42))
+    tune_idx, report_idx, closure_mode = split_for_threshold_report(
+        len(axis1_qcd), holdout_frac=holdout_frac, seed=split_seed)
+    axis1_tune, axis2_tune = axis1_qcd[tune_idx], axis2_qcd[tune_idx]
+    axis1_report, axis2_report = axis1_qcd[report_idx], axis2_qcd[report_idx]
+    print(
+        f"ABCD threshold mode: {closure_mode}; "
+        f"tune={len(axis1_tune)} report={len(axis1_report)}",
+        flush=True,
+    )
 
-    for p1 in percent:
-        for p2 in percent:
-            t1, t2, A, B, C, D = abcd_counts(axis1_qcd, axis2_qcd, p1, p2)
-            if A < min_A or D < min_D:
-                continue
-            nc, A_hat = nonclosure_A(A, B, C, D)
-            if np.isfinite(nc):
-                scan_abs_nonclosure.append(abs(nc))
-            if np.isfinite(nc) and abs(nc) < abs(best["nonclosure"]):
-                best.update(dict(p1=p1, p2=p2, t1=t1, t2=t2,
-                                 A=A, B=B, C=C, D=D, A_hat=A_hat, nonclosure=nc))
+    best_tune, tune_grid_summary = scan_abcd_grid(
+        axis1_tune, axis2_tune, percent, min_A=min_A, min_D=min_D)
+    if "t1" not in best_tune:
+        raise RuntimeError("No ABCD working point found on threshold-tuning split. "
+                           "Try lowering min_A/min_D or closure_holdout_frac.")
 
-    if "t1" not in best:
-        raise RuntimeError("No ABCD working point found. Try lowering min_A/min_D.")
+    t1_opt, t2_opt = best_tune["t1"], best_tune["t2"]
+    report_at_selected = abcd_record_at_thresholds(axis1_report, axis2_report, t1_opt, t2_opt)
+    report_at_selected.update({
+        "p1": float(best_tune["p1"]),
+        "p2": float(best_tune["p2"]),
+        "selection_nonclosure": float(best_tune["nonclosure"]),
+    })
+    best_report_scan, grid_summary = scan_abcd_grid(
+        axis1_report, axis2_report, percent, min_A=min_A, min_D=min_D)
 
-    t1_opt, t2_opt = best["t1"], best["t2"]
-    print(f"Optimized: p1={best['p1']:.3f}, p2={best['p2']:.3f}", flush=True)
+    print(f"Optimized on tune split: p1={best_tune['p1']:.3f}, p2={best_tune['p2']:.3f}", flush=True)
     print(f"Thresholds: t1={t1_opt:.4g}, t2={t2_opt:.4g}", flush=True)
-    print(f"Nonclosure: {100.0*best['nonclosure']:.2f}%", flush=True)
+    print(f"Tune nonclosure: {100.0*best_tune['nonclosure']:.2f}%", flush=True)
+    print(f"Reported nonclosure: {100.0*report_at_selected['nonclosure']:.2f}%", flush=True)
 
-    scan_abs_nonclosure = np.asarray(scan_abs_nonclosure, dtype=np.float64)
-    grid_summary = {
-        "n_points": int(scan_abs_nonclosure.size),
-        "mean_abs_nonclosure": float(np.mean(scan_abs_nonclosure)) if scan_abs_nonclosure.size else np.nan,
-        "median_abs_nonclosure": float(np.median(scan_abs_nonclosure)) if scan_abs_nonclosure.size else np.nan,
-        "p90_abs_nonclosure": float(np.quantile(scan_abs_nonclosure, 0.90)) if scan_abs_nonclosure.size else np.nan,
+    diagnostics["abcd_selection"] = {
+        "mode": closure_mode,
+        "holdout_frac": holdout_frac,
+        "split_seed": split_seed,
+        "tune_n": int(len(axis1_tune)),
+        "report_n": int(len(axis1_report)),
+        "tune_best": best_tune,
+        "report_at_selected": report_at_selected,
+        "report_best_for_reference": best_report_scan,
     }
     diagnostics["abcd_grid"] = grid_summary
+    diagnostics["abcd_tune_grid"] = tune_grid_summary
     print(
-        "ABCD grid: "
+        "ABCD report grid: "
         f"mean |nonclosure|={grid_summary['mean_abs_nonclosure']:.4f}, "
         f"median={grid_summary['median_abs_nonclosure']:.4f}, "
         f"p90={grid_summary['p90_abs_nonclosure']:.4f}, "
@@ -454,17 +538,20 @@ def ABCD(config):
     )
 
     wandb.log({
-        "ABCD/opt_p1":     best["p1"],
-        "ABCD/opt_p2":     best["p2"],
+        "ABCD/opt_p1":     report_at_selected["p1"],
+        "ABCD/opt_p2":     report_at_selected["p2"],
         "ABCD/opt_t1":     float(t1_opt),
         "ABCD/opt_t2":     float(t2_opt),
-        "ABCD/nonclosure": float(best["nonclosure"]),
+        "ABCD/nonclosure": float(report_at_selected["nonclosure"]),
+        "ABCD/tune_nonclosure": float(best_tune["nonclosure"]),
+        "ABCD/report_best_nonclosure": float(best_report_scan.get("nonclosure", np.nan)),
+        "ABCD/closure_mode_holdout": int(closure_mode == "holdout"),
         "ABCD/grid_mean_abs_nonclosure": grid_summary["mean_abs_nonclosure"],
         "ABCD/grid_median_abs_nonclosure": grid_summary["median_abs_nonclosure"],
         "ABCD/grid_p90_abs_nonclosure": grid_summary["p90_abs_nonclosure"],
         "ABCD/grid_points": grid_summary["n_points"],
-        "ABCD/A": int(best["A"]), "ABCD/B": int(best["B"]),
-        "ABCD/C": int(best["C"]), "ABCD/D": int(best["D"]),
+        "ABCD/A": int(report_at_selected["A"]), "ABCD/B": int(report_at_selected["B"]),
+        "ABCD/C": int(report_at_selected["C"]), "ABCD/D": int(report_at_selected["D"]),
     })
 
     # ── Plots ─────────────────────────────────────────────────────────────────
@@ -722,10 +809,12 @@ def ABCD(config):
 
     # 1D closure scan
     effs, closure_ratio, closure_unc = [], [], []
-    Ntot_bkg = float(len(axis1_qcd))
+    curve_axis1 = axis1_report
+    curve_axis2 = axis2_report
+    Ntot_bkg = float(len(curve_axis1))
 
     for p in percent:
-        t1, t2, A, B, C, D = abcd_counts(axis1_qcd, axis2_qcd, p, p)
+        t1, t2, A, B, C, D = abcd_counts(curve_axis1, curve_axis2, p, p)
         A_hat  = (B * C) / max(D, 1e-8)
         ratio  = A_hat / max(A, 1e-8)
         invA   = 0.0 if A == 0 else 1.0 / A
@@ -746,17 +835,43 @@ def ABCD(config):
     closure_ratio = closure_ratio[order]
     closure_unc   = closure_unc[order]
 
-    eff_opt   = best["A"] / max(Ntot_bkg, 1.0)
-    ratio_opt = best["A_hat"] / max(best["A"], 1e-8)
+    eff_opt   = report_at_selected["A"] / max(Ntot_bkg, 1.0)
+    ratio_opt = report_at_selected["ratio"]
+    curve_abs = np.abs(closure_ratio - 1.0)
+    curve_summary = {
+        "median_abs_ratio_minus1": float(np.median(curve_abs)) if curve_abs.size else np.nan,
+        "p90_abs_ratio_minus1": float(np.quantile(curve_abs, 0.90)) if curve_abs.size else np.nan,
+        "min_ratio": float(np.min(closure_ratio)) if closure_ratio.size else np.nan,
+        "max_ratio": float(np.max(closure_ratio)) if closure_ratio.size else np.nan,
+    }
+    tail = effs <= 0.02
+    if tail.any():
+        curve_summary["tail_le_2pct_mean_ratio"] = float(np.mean(closure_ratio[tail]))
+        curve_summary["tail_le_2pct_median_abs_ratio_minus1"] = float(np.median(curve_abs[tail]))
+    else:
+        curve_summary["tail_le_2pct_mean_ratio"] = np.nan
+        curve_summary["tail_le_2pct_median_abs_ratio_minus1"] = np.nan
+    diagnostics["closure_curve"] = curve_summary
+    wandb.log({
+        "Closure/median_abs_ratio_minus1": curve_summary["median_abs_ratio_minus1"],
+        "Closure/p90_abs_ratio_minus1": curve_summary["p90_abs_ratio_minus1"],
+        "Closure/min_ratio": curve_summary["min_ratio"],
+        "Closure/max_ratio": curve_summary["max_ratio"],
+        "Closure/tail_le_2pct_mean_ratio": curve_summary["tail_le_2pct_mean_ratio"],
+        "Closure/tail_le_2pct_median_abs_ratio_minus1": curve_summary["tail_le_2pct_median_abs_ratio_minus1"],
+    })
 
     fig, ax = plt.subplots(figsize=fig_size)
-    ax.plot(effs, closure_ratio, c="g", label="AE + NURD Contrastive (MD)")
+    curve_label = "AE + NURD Contrastive (MD)"
+    if closure_mode == "holdout":
+        curve_label += " held-out"
+    ax.plot(effs, closure_ratio, c="g", label=curve_label)
     ax.fill_between(effs, closure_ratio - closure_unc, closure_ratio + closure_unc,
                     facecolor="g", alpha=0.5, interpolate=True)
     ax.plot(effs, np.ones_like(effs),       linestyle="-",  color="black")
     ax.plot(effs, np.full_like(effs, 0.95), linestyle="--", color="black")
     ax.plot(effs, np.full_like(effs, 1.05), linestyle="--", color="black")
-    ax.plot([eff_opt], [ratio_opt], marker="o", c="red", label="Optimized")
+    ax.plot([eff_opt], [ratio_opt], marker="o", c="red", label="Selected threshold")
     ax.set_xlabel("Selection Efficiency (bkg A/Ntot)", fontsize=fs)
     ax.set_ylabel("Predicted Bkg. / True Bkg.",        fontsize=fs)
     ax.set_ylim([0.0, 1.5]); ax.set_xscale("log")
@@ -773,10 +888,17 @@ def ABCD(config):
         json.dump({
             "t1":    float(t1_opt),
             "t2":    float(t2_opt),
-            "p1":    float(best["p1"]),
-            "p2":    float(best["p2"]),
+            "p1":    float(report_at_selected["p1"]),
+            "p2":    float(report_at_selected["p2"]),
             "n_pca": config.get("n_pca", None),
-            "nonclosure": float(best["nonclosure"]),
+            "nonclosure": float(report_at_selected["nonclosure"]),
+            "tune_nonclosure": float(best_tune["nonclosure"]),
+            "report_best_nonclosure": float(best_report_scan.get("nonclosure", np.nan)),
+            "closure_mode": closure_mode,
+            "report_A": int(report_at_selected["A"]),
+            "report_B": int(report_at_selected["B"]),
+            "report_C": int(report_at_selected["C"]),
+            "report_D": int(report_at_selected["D"]),
         }, f, indent=2)
     print(f"Thresholds saved to: {thresholds_path}", flush=True)
 
@@ -811,6 +933,11 @@ if __name__ == "__main__":
                         help="Max events sampled for Pearson/Spearman correlation diagnostics")
     parser.add_argument("--dcor_sample_size", type=int, default=2_000,
                         help="Max events sampled for distance-correlation diagnostics; 0 disables it")
+    parser.add_argument("--closure_holdout_frac", type=float, default=0.5,
+                        help="Fraction of QCD held out for reporting selected ABCD closure. "
+                             "Use 0 to reproduce same-sample threshold tuning/reporting.")
+    parser.add_argument("--closure_split_seed", type=int, default=42,
+                        help="Random seed for QCD tune/report split")
     parser.add_argument("--wandb_run_name", default=None)
     parser.add_argument("--wandb_project",  default="AE vs. Contrastive ABCD",
                         help="W&B project to log to")

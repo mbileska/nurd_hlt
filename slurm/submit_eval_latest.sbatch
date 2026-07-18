@@ -24,6 +24,9 @@ AE_BATCH_SIZE="${AE_BATCH_SIZE:-4096}"
 N_PCA="${N_PCA:-6}"
 CORR_SAMPLE_SIZE="${CORR_SAMPLE_SIZE:-50000}"
 DCOR_SAMPLE_SIZE="${DCOR_SAMPLE_SIZE:-2000}"
+CLOSURE_HOLDOUT_FRAC="${CLOSURE_HOLDOUT_FRAC:-0.5}"
+CLOSURE_SPLIT_SEED="${CLOSURE_SPLIT_SEED:-42}"
+NURD_GLOB="${NURD_GLOB:-hlt_nurd_closure_bs4096_*}"
 WANDB_NAME_PREFIX="${WANDB_NAME_PREFIX:-optimized}"
 SYNC_WANDB="${SYNC_WANDB:-0}"
 
@@ -43,11 +46,11 @@ fi
 ln -sfnT "$BASE/checkpoints" checkpoints
 
 if [[ -z "${CKPT:-}" ]]; then
-  CKPT="$(find "$BASE/checkpoints/hlt/hlt" -path '*/checkpoint_main_*.pth.tar' \
+  CKPT="$(find "$BASE/checkpoints/hlt/hlt" -path "*/$NURD_GLOB/checkpoint_main_*.pth.tar" \
     -printf '%T@ %p\n' | sort -nr | awk 'NR==1 {print $2}')"
 fi
 if [[ -z "${CKPT:-}" || ! -f "$CKPT" ]]; then
-  echo "ERROR: no checkpoint_main_*.pth.tar found under $BASE/checkpoints/hlt/hlt"
+  echo "ERROR: no checkpoint_main_*.pth.tar found under $BASE/checkpoints/hlt/hlt matching $NURD_GLOB"
   exit 2
 fi
 
@@ -127,6 +130,9 @@ echo "AE_BATCH_SIZE: $AE_BATCH_SIZE"
 echo "N_PCA: $N_PCA"
 echo "CORR_SAMPLE_SIZE: $CORR_SAMPLE_SIZE"
 echo "DCOR_SAMPLE_SIZE: $DCOR_SAMPLE_SIZE"
+echo "CLOSURE_HOLDOUT_FRAC: $CLOSURE_HOLDOUT_FRAC"
+echo "CLOSURE_SPLIT_SEED: $CLOSURE_SPLIT_SEED"
+echo "NURD_GLOB: $NURD_GLOB"
 echo "WANDB_RUN_NAME: $WANDB_RUN_NAME"
 echo "WANDB_RUN_ID: $WANDB_RUN_ID"
 echo "SYNC_WANDB: $SYNC_WANDB"
@@ -149,6 +155,8 @@ python eval_abcd_nurd.py \
   --ae_batch_size "$AE_BATCH_SIZE" \
   --corr_sample_size "$CORR_SAMPLE_SIZE" \
   --dcor_sample_size "$DCOR_SAMPLE_SIZE" \
+  --closure_holdout_frac "$CLOSURE_HOLDOUT_FRAC" \
+  --closure_split_seed "$CLOSURE_SPLIT_SEED" \
   "${EXTRA_ARGS[@]}"
 
 RUN_DIR="$(find "$WANDB_DIR/wandb" -maxdepth 1 -type d -name "offline-run-*-$WANDB_RUN_ID" | sort | tail -1)"
