@@ -1,221 +1,328 @@
-# Della Slurm Jobs
+# Della HLT Runbook
 
-These jobs assume:
+Use this as the standard workflow on Della for this branch. It keeps code in
+`/home/mb7126/nurd_hlt` and all large files, checkpoints, logs, W&B files, and
+plots in scratch.
+
+## 0. One-Time Assumptions
 
 - Repo: `/home/mb7126/nurd_hlt`
 - Scratch base: `/scratch/gpfs/IOJALVO/mb7126/nurd_hlt`
+- Conda env: `disco`
 - Data:
   - `/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/data/hlt_smcocktail_train.pt`
   - `/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/data/hlt_smcocktail_test.pt`
   - `/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/data/hlt_signal_TpTp.pt`
-- Conda env: `disco`
-- W&B API key for full training: `~/.secrets/wandb_api_key`
+- Optional W&B key: `~/.secrets/wandb_api_key`
 
-## Before Submitting
+Load the environment and update code:
 
 ```bash
 module load anaconda3/2025.12
 conda activate disco
 cd /home/mb7126/nurd_hlt
 
-export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
-mkdir -p $BASE/{checkpoints,logs,outputs,wandb}
+git switch wip-mila-test
+git pull --ff-only
 ```
 
-Required Python packages for the HLT train/eval path:
+Create scratch directories:
 
 ```bash
-python -m pip install torch wandb numpy scikit-learn scipy matplotlib
+export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
+mkdir -p $BASE/{checkpoints,logs,outputs,wandb,matplotlib}
 ```
 
-Current smoke/full training does not require `torchvision`.
+Check Python dependencies:
 
-Check that the data can be read:
+```bash
+python -c "import torch, wandb, numpy, sklearn, scipy, matplotlib; print('imports ok'); print(torch.__version__, torch.version.cuda)"
+```
+
+Do not blindly install the old top-level `requirements.txt` on Della. If a
+non-Torch package is missing, install only the missing HLT dependency. If
+`torch` is missing, install a Della-supported CUDA PyTorch package; CPU-only
+Torch is not useful for full training.
+
+Check the data files:
 
 ```bash
 python -c "import torch; x=torch.load('$BASE/data/hlt_smcocktail_train.pt',map_location='cpu'); print(x.keys()); print(x['pf'].shape, x['obj'].shape, x['label'].shape); print(torch.unique(x['label'], return_counts=True))"
+python -c "import torch; x=torch.load('$BASE/data/hlt_smcocktail_test.pt',map_location='cpu'); print(x.keys()); print(x['pf'].shape, x['obj'].shape, x['label'].shape)"
+python -c "import torch; x=torch.load('$BASE/data/hlt_signal_TpTp.pt',map_location='cpu'); print(x.keys()); print(x['pf'].shape, x['obj'].shape, x['label'].shape)"
 ```
 
-## Smoke Test
-
-Submit:
+Before every submission, clear old environment variables. Slurm exports your
+current shell environment, so stale values can make jobs reuse old checkpoints
+or old output directories.
 
 ```bash
+unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP RUN_TAG WANDB_RUN_NAME WANDB_RUN_ID
+```
+
+## 1. Smoke Test
+
+Run this after pulling code changes or changing the environment:
+
+```bash
+unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP RUN_TAG WANDB_RUN_NAME WANDB_RUN_ID
 sbatch slurm/submit_smoke.sbatch
 ```
 
-Inspect:
+Monitor:
 
 ```bash
 squeue -u $USER
-tail -f /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/nurd_smoke-<JOBID>.out
-tail -f /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/nurd_smoke-<JOBID>.err
+tail -f $BASE/logs/nurd_smoke-<JOBID>.out
+tail -f $BASE/logs/nurd_smoke-<JOBID>.err
 ```
 
-Expected log signs:
+Expected signs:
 
 ```text
 CUDA available: True
 NVIDIA A100...
-Epoch 1/1
-[train] NURD weight groups=...
+Using AE normalization scaler saved in the AE checkpoint.
+Critic scope: qcd
 Saving checkpoint
 SMOKE DONE
 ```
 
-Expected files:
+Smoke outputs:
 
 ```bash
-ls -lh checkpoints/hlt/hlt/smoke_ae/
-ls -lh checkpoints/hlt/hlt/smoke_nurd/
+ls -lh $BASE/checkpoints/hlt/hlt/smoke_ae/
+ls -lh $BASE/checkpoints/hlt/hlt/smoke_nurd/
 ```
 
-You should see `checkpoint_ae.pth` and at least one `checkpoint_main_*.pth.tar`.
+## 2. Full Training
 
-## Full Training
+Always use a fresh `RUN_TAG`. This prevents mixing yesterday's checkpoints with
+today's training.
 
-Submit only after the smoke test passes:
+Train AE and NURD from scratch:
 
 ```bash
-sbatch slurm/submit_train.sbatch
+unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP RUN_TAG WANDB_RUN_NAME WANDB_RUN_ID
+RUN_TAG=qcdcritic_$(date +%Y%m%d_%H%M%S) sbatch slurm/submit_train.sbatch
 ```
 
-Inspect:
+Monitor:
 
 ```bash
 squeue -u $USER
-tail -f /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/nurd_hlt_train-<JOBID>.out
-tail -f /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/nurd_hlt_train-<JOBID>.err
+tail -f $BASE/logs/nurd_hlt_train-<JOBID>.out
+tail -f $BASE/logs/nurd_hlt_train-<JOBID>.err
 ```
 
-The full job prints `AE_EXP=...` and `NURD_EXP=...`. The checkpoints are under:
+The `.out` log prints the exact experiment names:
 
 ```text
-/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/checkpoints/hlt/hlt/<AE_EXP>/
-/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/checkpoints/hlt/hlt/<NURD_EXP>/
+AE_EXP=...
+NURD_EXP=...
+BATCH_SIZE=4096
+CRITIC_SCOPE=qcd
 ```
 
-W&B project: `nurd-ood-hlt`.
+Save those values. The checkpoints will be under:
 
-To reuse an existing AE checkpoint and rerun only the NURD stage:
-
-```bash
-AE_EXP=ae_pretrain_20260717_102917 SKIP_AE=1 sbatch slurm/submit_train.sbatch
+```text
+$BASE/checkpoints/hlt/hlt/<AE_EXP>/
+$BASE/checkpoints/hlt/hlt/<NURD_EXP>/
 ```
 
-The NURD stage keeps batch size 4096 and uses `--offload_critic_graph` to
-preserve the original critic-penalty second forward while saving its autograd
-tensors on CPU. The job excludes the Della `della-i*` A100 nodes seen in
-`sinfo` and exits early unless the allocated GPU has at least 75 GiB memory.
-
-On this test branch the Slurm job defaults to `CRITIC_SCOPE=qcd`, so the
-critic targets the QCD background used by ABCD closure. To reproduce the older
-all-class critic behavior:
+Reuse an existing AE and train only NURD:
 
 ```bash
-CRITIC_SCOPE=all sbatch slurm/submit_train.sbatch
+unset CKPT OUTDIR AE_CKPT NURD_EXP RUN_TAG WANDB_RUN_NAME WANDB_RUN_ID
+AE_EXP=<existing_ae_exp> SKIP_AE=1 RUN_TAG=qcdcritic_$(date +%Y%m%d_%H%M%S) sbatch slurm/submit_train.sbatch
 ```
 
-Useful knobs that do not require editing the script:
+Useful training toggles:
 
 ```bash
-SKIP_AE=1 AE_EXP=<existing_ae_exp> sbatch slurm/submit_train.sbatch
+CRITIC_SCOPE=qcd sbatch slurm/submit_train.sbatch      # default, targets QCD closure
+CRITIC_SCOPE=all sbatch slurm/submit_train.sbatch      # old all-class critic
+CLOSURE_WEIGHT=0.3 sbatch slurm/submit_train.sbatch    # stronger closure loss
+BATCH_SIZE=3072 sbatch slurm/submit_train.sbatch       # lower memory
 AE_EPOCHS=100 NURD_EPOCHS=100 sbatch slurm/submit_train.sbatch
-CLOSURE_WEIGHT=0.2 sbatch slurm/submit_train.sbatch
 ```
 
-If batch size 4096 still runs out of GPU memory on an 80 GB A100:
+The training job requests an A100 and exits early unless the GPU has at least
+75 GiB memory. It runs W&B in offline mode by default.
+
+## 3. Find The Checkpoint You Want
+
+Newest real NURD checkpoint:
 
 ```bash
-AE_EXP=ae_pretrain_20260717_102917 SKIP_AE=1 BATCH_SIZE=3072 sbatch slurm/submit_train.sbatch
+find $BASE/checkpoints/hlt/hlt -path '*/hlt_nurd_closure_bs4096_*/checkpoint_main_*.pth.tar' \
+  -printf '%TY-%Tm-%Td %TH:%TM %p\n' | sort -r | head -10
 ```
 
-The full Slurm job uses W&B offline mode by default because Della compute
-nodes may not be able to initialize online W&B reliably. Metrics are still
-written under the scratch W&B directory and can be synced later.
-
-After the job finishes, find offline runs:
+Get `AE_EXP` and `NURD_EXP` from a training job:
 
 ```bash
-find /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/wandb -type d -name 'offline-run-*'
+JOB=<training_job_id>
+grep -E '^AE_EXP=|^NURD_EXP=|^BATCH_SIZE=|^CRITIC_SCOPE=' $BASE/logs/nurd_hlt_train-$JOB.out
 ```
 
-Sync them from a session that can reach W&B:
+Get newest checkpoint from that NURD experiment:
 
 ```bash
-find /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/wandb -type d -name 'offline-run-*' -print0 | xargs -0 -n1 wandb sync
+NURD_EXP=<nurd_exp_from_log>
+CKPT=$(ls -t $BASE/checkpoints/hlt/hlt/$NURD_EXP/checkpoint_main_*.pth.tar | head -1)
+echo "$CKPT"
 ```
 
-## ABCD / Closure Evaluation
+## 4. Evaluation: New Correct Held-Out Method
 
-Run eval through Slurm; interactive login-node eval can be killed by the
-cluster. Results are written under scratch:
-`/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/outputs/abcd_<NURD_EXP>/`.
+This is the default and the method to quote. It chooses ABCD thresholds on one
+deterministic half of QCD and reports closure on the held-out half.
+
+Evaluate the newest real checkpoint automatically:
 
 ```bash
-NURD_EXP=hlt_nurd_closure_bs4096_20260717_190314 sbatch slurm/submit_eval_abcd.sbatch
+unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP WANDB_RUN_NAME WANDB_RUN_ID
+WANDB_NAME_PREFIX=heldout_eval sbatch slurm/submit_eval_latest.sbatch
 ```
 
-If `NURD_EXP` is omitted, the script uses the newest
-`hlt_nurd_closure_bs4096_*` checkpoint directory.
-
-Inspect:
+Evaluate a specific checkpoint explicitly:
 
 ```bash
-tail -f /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/nurd_eval-<JOBID>.out
-tail -f /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/nurd_eval-<JOBID>.err
+unset OUTDIR WANDB_RUN_NAME WANDB_RUN_ID
+CKPT=/path/to/checkpoint_main_YYYYMMDD_HHMMSS.pth.tar
+AE_CKPT=/path/to/checkpoint_ae.pth
+OUTDIR=$BASE/outputs/abcd_manual_heldout_$(date +%Y%m%d_%H%M%S)
+
+CKPT="$CKPT" AE_CKPT="$AE_CKPT" OUTDIR="$OUTDIR" WANDB_NAME_PREFIX=heldout_eval \
+  sbatch slurm/submit_eval_latest.sbatch
 ```
 
-Key outputs:
+Monitor:
 
 ```bash
-ls -lh /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/outputs/abcd_<NURD_EXP>/
-ls -lh /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/outputs/abcd_<NURD_EXP>/plots/
+squeue -u $USER
+tail -f $BASE/logs/nurd_eval_latest-<JOBID>.out
+tail -f $BASE/logs/nurd_eval_latest-<JOBID>.err
 ```
 
-The most important non-plot files are:
+When done, the `.out` log prints:
 
 ```text
-abcd_thresholds.json
-diagnostics.json
+Results: <OUTDIR>
+CKPT: <exact checkpoint>
+AE_CKPT: <exact AE checkpoint>
+W&B sync command: wandb sync ...
 ```
 
-For decorrelation, inspect `diagnostics.json` and W&B keys
-`Corr/qcd_pearson`, `Corr/qcd_spearman`, `Corr/qcd_distance`. For closure,
-do not look only at the optimized `ABCD/nonclosure`; also check
-`ABCD/grid_median_abs_nonclosure` and `ABCD/grid_p90_abs_nonclosure`.
-
-By default, eval now chooses ABCD thresholds on one deterministic half of QCD
-and reports `ABCD/nonclosure` on the held-out half. The tuned-sample number is
-kept separately as `ABCD/tune_nonclosure`.
-
-To reproduce the old same-sample behavior for debugging only:
+Inspect outputs:
 
 ```bash
-CLOSURE_HOLDOUT_FRAC=0 NURD_EXP=<NURD_EXP> sbatch slurm/submit_eval_abcd.sbatch
+OUT=<the Results path from the eval .out log>
+ls -lh $OUT
+ls -lh $OUT/plots
+cat $OUT/diagnostics.json
+cat $OUT/abcd_thresholds.json
 ```
 
-## Latest Checkpoint Eval
+Important held-out eval numbers:
 
-To automatically evaluate the newest `checkpoint_main_*.pth.tar` under
-scratch, use:
+- `ABCD/nonclosure`: selected thresholds reported on held-out QCD. This is the
+  main closure number.
+- `ABCD/tune_nonclosure`: selected thresholds measured on the tuning split.
+  This is useful for debugging but optimistic.
+- `ABCD/report_best_nonclosure`: best possible point on the held-out split.
+  This is a reference only, not a final number.
+- `Closure/tail_le_2pct_mean_ratio`: tight-tail average of
+  `Predicted Bkg / True Bkg`.
+- `Corr/qcd_pearson`, `Corr/qcd_spearman`, `Corr/qcd_distance`: QCD
+  decorrelation diagnostics.
+
+## 5. Evaluation: Old Same-Sample Method
+
+The old method optimizes thresholds and reports closure on the same QCD events.
+It can make the optimized red point look too good. Use it only as a comparison.
+
+Evaluate the newest checkpoint with the old method:
 
 ```bash
 unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP WANDB_RUN_NAME WANDB_RUN_ID
-sbatch slurm/submit_eval_latest.sbatch
+CLOSURE_HOLDOUT_FRAC=0 WANDB_NAME_PREFIX=old_same_sample_eval \
+  sbatch slurm/submit_eval_latest.sbatch
 ```
 
-The wrapper prints the exact `CKPT`, `AE_CKPT`, result directory, W&B run name,
-and W&B sync command into the Slurm `.out` log. By default the W&B run name
-starts with `optimized_`, and the checkpoint search ignores smoke-test
-directories by looking only under `hlt_nurd_closure_bs4096_*`.
+Evaluate the same explicit checkpoint with the old method:
 
-To sync that eval run automatically at the end of the Slurm job:
+```bash
+CKPT=/path/to/checkpoint_main_YYYYMMDD_HHMMSS.pth.tar
+AE_CKPT=/path/to/checkpoint_ae.pth
+OUTDIR=$BASE/outputs/abcd_manual_old_$(date +%Y%m%d_%H%M%S)
+
+CKPT="$CKPT" AE_CKPT="$AE_CKPT" OUTDIR="$OUTDIR" CLOSURE_HOLDOUT_FRAC=0 \
+  WANDB_NAME_PREFIX=old_same_sample_eval sbatch slurm/submit_eval_latest.sbatch
+```
+
+## 6. Run Both Eval Methods On The Same Checkpoint
+
+This is the cleanest way to compare old vs new.
+
+```bash
+unset OUTDIR AE_CKPT AE_EXP NURD_EXP WANDB_RUN_NAME WANDB_RUN_ID
+
+CKPT=$(find $BASE/checkpoints/hlt/hlt -path '*/hlt_nurd_closure_bs4096_*/checkpoint_main_*.pth.tar' \
+  -printf '%T@ %p\n' | sort -nr | awk 'NR==1 {print $2}')
+
+echo "Using CKPT=$CKPT"
+
+CKPT="$CKPT" WANDB_NAME_PREFIX=heldout_eval \
+  OUTDIR=$BASE/outputs/abcd_compare_heldout_$(date +%Y%m%d_%H%M%S) \
+  sbatch slurm/submit_eval_latest.sbatch
+
+CKPT="$CKPT" CLOSURE_HOLDOUT_FRAC=0 WANDB_NAME_PREFIX=old_same_sample_eval \
+  OUTDIR=$BASE/outputs/abcd_compare_old_$(date +%Y%m%d_%H%M%S) \
+  sbatch slurm/submit_eval_latest.sbatch
+```
+
+Compare the two `diagnostics.json` files and the two
+`plots/cut_and_count_bkg_check.png` plots.
+
+## 7. W&B Sync
+
+Training and eval run with `WANDB_MODE=offline` by default. Nothing is uploaded
+unless you sync.
+
+Sync the exact eval run from its `.out` log:
+
+```bash
+export WANDB_API_KEY=$(cat ~/.secrets/wandb_api_key)
+wandb sync <offline-run-dir-printed-in-the-eval-log>
+```
+
+Sync every offline run under scratch:
+
+```bash
+export WANDB_API_KEY=$(cat ~/.secrets/wandb_api_key)
+find $BASE/wandb -type d -name 'offline-run-*' -print0 | xargs -0 -n1 wandb sync
+```
+
+Try automatic sync at the end of an eval job:
 
 ```bash
 unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP WANDB_RUN_NAME WANDB_RUN_ID
-SYNC_WANDB=1 sbatch slurm/submit_eval_latest.sbatch
+SYNC_WANDB=1 WANDB_NAME_PREFIX=heldout_eval sbatch slurm/submit_eval_latest.sbatch
 ```
 
-If compute-node W&B sync fails, use the printed `W&B sync command` from the
-`.out` log on a login node.
+If compute-node sync fails, rerun the printed `wandb sync ...` command from a
+login node.
+
+## 8. Quick Interpretation
+
+- Use held-out `ABCD/nonclosure` as the main closure number.
+- Use old same-sample eval only to understand how much the previous method was
+  over-optimizing.
+- A good red point means the selected ABCD working point generalizes.
+- A low tight-tail ratio in the closure curve means the model still
+  underpredicts QCD in the high-AE/high-MD tail.
+- Do not quote only the optimized red point without the held-out and grid
+  diagnostics.
