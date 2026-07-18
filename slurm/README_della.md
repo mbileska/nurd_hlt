@@ -184,3 +184,27 @@ For decorrelation, inspect `diagnostics.json` and W&B keys
 `Corr/qcd_pearson`, `Corr/qcd_spearman`, `Corr/qcd_distance`. For closure,
 do not look only at the optimized `ABCD/nonclosure`; also check
 `ABCD/grid_median_abs_nonclosure` and `ABCD/grid_p90_abs_nonclosure`.
+
+## Latest Checkpoint Eval
+
+To automatically evaluate the newest `checkpoint_main_*.pth.tar` under
+scratch, use:
+
+```bash
+unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP WANDB_RUN_NAME WANDB_RUN_ID
+sbatch slurm/submit_eval_latest.sbatch
+```
+
+The wrapper prints the exact `CKPT`, `AE_CKPT`, result directory, W&B run name,
+and W&B sync command into the Slurm `.out` log. By default the W&B run name
+starts with `optimized_`.
+
+To sync that eval run automatically at the end of the Slurm job:
+
+```bash
+unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP WANDB_RUN_NAME WANDB_RUN_ID
+SYNC_WANDB=1 sbatch slurm/submit_eval_latest.sbatch
+```
+
+If compute-node W&B sync fails, use the printed `W&B sync command` from the
+`.out` log on a login node.

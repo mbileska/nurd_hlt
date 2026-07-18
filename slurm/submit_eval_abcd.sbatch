@@ -24,6 +24,7 @@ AE_BATCH_SIZE="${AE_BATCH_SIZE:-4096}"
 N_PCA="${N_PCA:-6}"
 CORR_SAMPLE_SIZE="${CORR_SAMPLE_SIZE:-50000}"
 DCOR_SAMPLE_SIZE="${DCOR_SAMPLE_SIZE:-2000}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 
 mkdir -p "$BASE/logs" "$BASE/wandb" "$BASE/matplotlib" "$BASE/outputs"
 
@@ -57,6 +58,7 @@ if [[ -z "${NURD_EXP:-}" ]]; then
 fi
 
 OUTDIR="${OUTDIR:-$BASE/outputs/abcd_${NURD_EXP}}"
+WANDB_RUN_NAME="${WANDB_RUN_NAME:-${NURD_EXP}_abcd}"
 
 if [[ ! -f "$AE_CKPT" ]]; then
   echo "ERROR: AE checkpoint not found: $AE_CKPT"
@@ -100,10 +102,17 @@ echo "AE_BATCH_SIZE: $AE_BATCH_SIZE"
 echo "N_PCA: $N_PCA"
 echo "CORR_SAMPLE_SIZE: $CORR_SAMPLE_SIZE"
 echo "DCOR_SAMPLE_SIZE: $DCOR_SAMPLE_SIZE"
+echo "WANDB_RUN_NAME: $WANDB_RUN_NAME"
+echo "WANDB_RUN_ID: ${WANDB_RUN_ID:-}"
 echo "W&B mode: $WANDB_MODE"
 
 python -c "import torch; print('torch', torch.__version__, 'cuda build', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO GPU')"
 python -c "import numpy, sklearn, scipy, matplotlib, wandb; print('eval imports ok')"
+
+RESUME_ARGS=()
+if [[ -n "${WANDB_RUN_ID:-}" ]]; then
+  RESUME_ARGS+=(--resume_run_id "$WANDB_RUN_ID")
+fi
 
 python eval_abcd_nurd.py \
   --ckpt "$CKPT" \
@@ -112,12 +121,13 @@ python eval_abcd_nurd.py \
   "${SIGNAL_ARGS[@]}" \
   --outdir "$OUTDIR" \
   --wandb_project nurd-ood-hlt \
-  --wandb_run_name "${NURD_EXP}_abcd" \
+  --wandb_run_name "$WANDB_RUN_NAME" \
   --n_pca "$N_PCA" \
   --batch_size "$EVAL_BATCH_SIZE" \
   --ae_batch_size "$AE_BATCH_SIZE" \
   --corr_sample_size "$CORR_SAMPLE_SIZE" \
   --dcor_sample_size "$DCOR_SAMPLE_SIZE" \
+  "${RESUME_ARGS[@]}" \
   "${EXTRA_ARGS[@]}"
 
 echo "=== ABCD outputs ==="
