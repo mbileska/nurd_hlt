@@ -26,7 +26,7 @@ import wandb
 from sklearn.metrics import roc_auc_score
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
-from scipy.stats import binned_statistic, gaussian_kde
+from scipy.stats import binned_statistic, gaussian_kde, pearsonr, spearmanr
 from sklearn.decomposition import PCA
 from matplotlib.lines import Line2D
 
@@ -78,6 +78,42 @@ def profile_plot(ax, x, y, nbins=30, logx=False, min_per_bin=20, label="mean ± 
                 fmt="o", ms=3, lw=1, capsize=2, label=label)
     ax.grid(alpha=0.3)
     return {"x": xplot, "mean": mean[good], "sem": sem[good], "count": cnt[good]}
+
+
+def _sample_pair(x, y, max_points, seed=42):
+    x = np.asarray(x)
+    y = np.asarray(y)
+    m = np.isfinite(x) & np.isfinite(y)
+    x, y = x[m], y[m]
+    if max_points and max_points > 0 and x.shape[0] > max_points:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(x.shape[0], max_points, replace=False)
+        x, y = x[idx], y[idx]
+    return x.astype(np.float64), y.astype(np.float64)
+
+
+def _safe_correlations(x, y, max_points=50_000, dcor_points=2_000, seed=42):
+    x_s, y_s = _sample_pair(x, y, max_points, seed=seed)
+    out = {"n": int(x_s.shape[0]), "pearson": np.nan, "spearman": np.nan,
+           "distance_corr": np.nan}
+    if x_s.shape[0] < 3 or np.std(x_s) == 0 or np.std(y_s) == 0:
+        return out
+    out["pearson"] = float(pearsonr(x_s, y_s).statistic)
+    out["spearman"] = float(spearmanr(x_s, y_s).statistic)
+    if dcor_points and dcor_points > 0:
+        x_d, y_d = _sample_pair(x, y, dcor_points, seed=seed + 1)
+        if x_d.shape[0] >= 3 and np.std(x_d) > 0 and np.std(y_d) > 0:
+            ax = np.abs(x_d[:, None] - x_d[None, :])
+            ay = np.abs(y_d[:, None] - y_d[None, :])
+            ax = ax - ax.mean(axis=0, keepdims=True) - ax.mean(axis=1, keepdims=True) + ax.mean()
+            ay = ay - ay.mean(axis=0, keepdims=True) - ay.mean(axis=1, keepdims=True) + ay.mean()
+            dcov2 = np.mean(ax * ay)
+            dvarx = np.mean(ax * ax)
+            dvary = np.mean(ay * ay)
+            denom = np.sqrt(max(dvarx * dvary, 0.0))
+            if denom > 0:
+                out["distance_corr"] = float(np.sqrt(max(dcov2, 0.0) / denom))
+    return out
 
 
 # ── Model loading ─────────────────────────────────────────────────────────────
@@ -307,6 +343,41 @@ def ABCD(config):
     axis2_qcd = axis2_pca[qcd_only]
     print(f"QCD events for ABCD: {qcd_only.sum()}", flush=True)
 
+    corr_sample_size = int(config.get("corr_sample_size", 50_000))
+    dcor_sample_size = int(config.get("dcor_sample_size", 2_000))
+    diagnostics = {
+        "counts": {
+            "all_background": int(axis1_bkg.shape[0]),
+            "qcd": int(qcd_only.sum()),
+        },
+        "correlations": {
+            "all_background": _safe_correlations(
+                axis1_bkg, axis2_bkg,
+                max_points=corr_sample_size,
+                dcor_points=dcor_sample_size),
+            "qcd": _safe_correlations(
+                axis1_qcd, axis2_qcd,
+                max_points=corr_sample_size,
+                dcor_points=dcor_sample_size),
+        },
+    }
+    print("Correlation diagnostics:", flush=True)
+    for scope, vals in diagnostics["correlations"].items():
+        print(
+            f"  {scope}: pearson={vals['pearson']:.4f} "
+            f"spearman={vals['spearman']:.4f} "
+            f"distance_corr={vals['distance_corr']:.4f} n={vals['n']}",
+            flush=True,
+        )
+    wandb.log({
+        "Corr/all_pearson": diagnostics["correlations"]["all_background"]["pearson"],
+        "Corr/all_spearman": diagnostics["correlations"]["all_background"]["spearman"],
+        "Corr/all_distance": diagnostics["correlations"]["all_background"]["distance_corr"],
+        "Corr/qcd_pearson": diagnostics["correlations"]["qcd"]["pearson"],
+        "Corr/qcd_spearman": diagnostics["correlations"]["qcd"]["spearman"],
+        "Corr/qcd_distance": diagnostics["correlations"]["qcd"]["distance_corr"],
+    })
+
     # ── signal (optional) ─────────────────────────────────────────────────────
     sig_axis1 = sig_axis2 = sig_axis2_pca = None
     sig_latents_masked = sig_emb_pca = None
@@ -343,6 +414,7 @@ def ABCD(config):
     best    = {"nonclosure": np.inf}
     min_A   = int(config.get("min_A", 50))
     min_D   = int(config.get("min_D", 500))
+    scan_abs_nonclosure = []
 
     for p1 in percent:
         for p2 in percent:
@@ -350,6 +422,8 @@ def ABCD(config):
             if A < min_A or D < min_D:
                 continue
             nc, A_hat = nonclosure_A(A, B, C, D)
+            if np.isfinite(nc):
+                scan_abs_nonclosure.append(abs(nc))
             if np.isfinite(nc) and abs(nc) < abs(best["nonclosure"]):
                 best.update(dict(p1=p1, p2=p2, t1=t1, t2=t2,
                                  A=A, B=B, C=C, D=D, A_hat=A_hat, nonclosure=nc))
@@ -362,12 +436,33 @@ def ABCD(config):
     print(f"Thresholds: t1={t1_opt:.4g}, t2={t2_opt:.4g}", flush=True)
     print(f"Nonclosure: {100.0*best['nonclosure']:.2f}%", flush=True)
 
+    scan_abs_nonclosure = np.asarray(scan_abs_nonclosure, dtype=np.float64)
+    grid_summary = {
+        "n_points": int(scan_abs_nonclosure.size),
+        "mean_abs_nonclosure": float(np.mean(scan_abs_nonclosure)) if scan_abs_nonclosure.size else np.nan,
+        "median_abs_nonclosure": float(np.median(scan_abs_nonclosure)) if scan_abs_nonclosure.size else np.nan,
+        "p90_abs_nonclosure": float(np.quantile(scan_abs_nonclosure, 0.90)) if scan_abs_nonclosure.size else np.nan,
+    }
+    diagnostics["abcd_grid"] = grid_summary
+    print(
+        "ABCD grid: "
+        f"mean |nonclosure|={grid_summary['mean_abs_nonclosure']:.4f}, "
+        f"median={grid_summary['median_abs_nonclosure']:.4f}, "
+        f"p90={grid_summary['p90_abs_nonclosure']:.4f}, "
+        f"points={grid_summary['n_points']}",
+        flush=True,
+    )
+
     wandb.log({
         "ABCD/opt_p1":     best["p1"],
         "ABCD/opt_p2":     best["p2"],
         "ABCD/opt_t1":     float(t1_opt),
         "ABCD/opt_t2":     float(t2_opt),
         "ABCD/nonclosure": float(best["nonclosure"]),
+        "ABCD/grid_mean_abs_nonclosure": grid_summary["mean_abs_nonclosure"],
+        "ABCD/grid_median_abs_nonclosure": grid_summary["median_abs_nonclosure"],
+        "ABCD/grid_p90_abs_nonclosure": grid_summary["p90_abs_nonclosure"],
+        "ABCD/grid_points": grid_summary["n_points"],
         "ABCD/A": int(best["A"]), "ABCD/B": int(best["B"]),
         "ABCD/C": int(best["C"]), "ABCD/D": int(best["D"]),
     })
@@ -685,6 +780,11 @@ def ABCD(config):
         }, f, indent=2)
     print(f"Thresholds saved to: {thresholds_path}", flush=True)
 
+    diagnostics_path = os.path.join(outdir, "diagnostics.json")
+    with open(diagnostics_path, "w") as f:
+        json.dump(diagnostics, f, indent=2)
+    print(f"Diagnostics saved to: {diagnostics_path}", flush=True)
+
     wandb.finish()
 
 
@@ -707,6 +807,10 @@ if __name__ == "__main__":
                         help="Batch size for NURD encoder inference")
     parser.add_argument("--ae_batch_size", type=int, default=4096,
                         help="Batch size for AE inference")
+    parser.add_argument("--corr_sample_size", type=int, default=50_000,
+                        help="Max events sampled for Pearson/Spearman correlation diagnostics")
+    parser.add_argument("--dcor_sample_size", type=int, default=2_000,
+                        help="Max events sampled for distance-correlation diagnostics; 0 disables it")
     parser.add_argument("--wandb_run_name", default=None)
     parser.add_argument("--wandb_project",  default="AE vs. Contrastive ABCD",
                         help="W&B project to log to")

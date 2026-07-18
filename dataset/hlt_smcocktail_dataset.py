@@ -42,53 +42,42 @@ def _make_nurd_weights(labels, nuisances, max_weight_ratio=10.0):
     return {k: min(v, cap) for k, v in weights_norm.items()}
 
 
+def _as_float_tensor(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu().float()
+    return torch.as_tensor(value, dtype=torch.float32)
+
+
+def _compute_ae_reco(obj_data, ae_model, batch_size=4096):
+    """Compute AE reconstruction loss once for all events."""
+    ae_model.eval()
+    device = next(ae_model.parameters()).device
+    mse = torch.nn.MSELoss(reduction='none')
+    ae_reco_all = []
+    with torch.no_grad():
+        for i in range(0, obj_data.shape[0], batch_size):
+            batch = obj_data[i:i + batch_size].to(device)
+            recon, _ = ae_model(batch)
+            ae_reco_all.append(mse(recon, batch).mean(dim=1).cpu())
+    return torch.cat(ae_reco_all).float()
+
+
 class HLTSmCocktailDataset(Dataset):
     """
     Args:
-        pf_data:    [N, max_cands, n_feats]  PF candidate features
-        obj_data:   [N, obj_feat_dim]        pre-normalised object-level AE inputs
-        labels:     [N] long
-        ae_model:   frozen pre-trained Autoencoder (eval mode)
-        n_bins:     number of quantile bins for the AE reco nuisance
+        pf_data:       [N, max_cands, n_feats]  PF candidate features
+        labels:        [N] long
+        nuisances_all: [N] binned AE reconstruction-loss nuisance
+        ae_reco_all:   [N] continuous AE reconstruction loss
+        idx:           selected event indices for this split
         split:      "train" | "val"
-        val_split:  fraction held out for validation
-        seed:       random seed for the train/val split
     """
-    def __init__(self, pf_data, obj_data, labels, ae_model, n_bins=10,
-                 split="train", val_split=0.1, seed=42, bin_edges=None):
+    def __init__(self, pf_data, labels, nuisances_all, ae_reco_all, idx,
+                 split="train", bin_edges=None):
         super().__init__()
-
-        # ── compute AE reco loss per event ────────────────────────────────────
-        ae_model.eval()
-        device = next(ae_model.parameters()).device
-        mse = torch.nn.MSELoss(reduction='none')
-        ae_reco_all = []
-        bs = 4096
-        with torch.no_grad():
-            for i in range(0, obj_data.shape[0], bs):
-                batch = obj_data[i:i+bs].to(device)
-                recon, _ = ae_model(batch)
-                ae_reco_all.append(mse(recon, batch).mean(dim=1).cpu())
-        ae_reco_all = torch.cat(ae_reco_all)
-
-        # ── quantile binning of the nuisance ─────────────────────────────────
-        if bin_edges is None:
-            quantiles = torch.linspace(0, 1, n_bins + 1)
-            bin_edges = torch.quantile(ae_reco_all, quantiles)
         self.bin_edges = bin_edges
-        nuisances_all = torch.bucketize(ae_reco_all, bin_edges[1:-1]).long()
-
-        # ── train / val split ─────────────────────────────────────────────────
-        idx_all = np.arange(len(labels))
-        idx_tr, idx_val = train_test_split(
-            idx_all, test_size=val_split, random_state=seed,
-            stratify=labels.cpu().numpy()
-        )
-        idx = idx_tr if split == "train" else idx_val
-        idx = torch.tensor(idx, dtype=torch.long)
 
         self.features  = pf_data[idx]
-        self.obj       = obj_data[idx]
         self.labels    = labels[idx].float()
         self.nuisances = nuisances_all[idx].float()
         self.ae_reco   = ae_reco_all[idx].float()
@@ -114,13 +103,20 @@ class HLTSmCocktailDataset(Dataset):
         counts = Counter(int(y) for y in self.labels.tolist())
         return {k: v / total for k, v in counts.items()}
 
-    def get_nuisance_prior(self):
-        total = len(self.nuisances)
-        counts = Counter(int(z) for z in self.nuisances.tolist())
+    def get_nuisance_prior(self, label=None):
+        nuisances = self.nuisances
+        if label is not None:
+            label_mask = self.labels.long() == int(label)
+            nuisances = nuisances[label_mask]
+        total = len(nuisances)
+        if total == 0:
+            return {}
+        counts = Counter(int(z) for z in nuisances.tolist())
         return {k: v / total for k, v in counts.items()}
 
 
-def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42, max_events=-1):
+def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42,
+                       max_events=-1, ae_scaler=None, ae_batch_size=4096):
     """
     Load the HLT .pt file, pre-normalise obj features, and return
     (train_dataset, val_dataset).  Call once; pass the same bin_edges
@@ -135,19 +131,41 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42, max
     pf = torch.nan_to_num(pf, nan=0.0, posinf=0.0, neginf=0.0)
 
     # flatten + z-score normalise obj features (first 4 features per cand)
-    obj_flat = obj[:, :, :4].reshape(obj.shape[0], -1).float().numpy()
-    mu  = obj_flat.mean(axis=0).astype(np.float32)
-    std = obj_flat.std(axis=0).astype(np.float32)
-    std = np.where(std < 1e-8, 1.0, std)
-    obj_norm = torch.from_numpy((obj_flat - mu) / std)
-    obj_scaler = {"mu": torch.from_numpy(mu), "std": torch.from_numpy(std)}
+    obj_flat = obj[:, :, :4].reshape(obj.shape[0], -1).float()
+    if ae_scaler is None:
+        mu = obj_flat.mean(dim=0)
+        std = obj_flat.std(dim=0, unbiased=False)
+        std = torch.where(std < 1e-8, torch.ones_like(std), std)
+    else:
+        mu = _as_float_tensor(ae_scaler["mu"])
+        std = _as_float_tensor(ae_scaler["std"])
+        if mu.numel() != obj_flat.shape[1] or std.numel() != obj_flat.shape[1]:
+            raise ValueError(
+                f"AE scaler has {mu.numel()} features but obj input has {obj_flat.shape[1]}"
+            )
+    obj_norm = (obj_flat - mu.view(1, -1)) / std.view(1, -1)
+    obj_scaler = {"mu": mu.cpu(), "std": std.cpu()}
+    del obj, obj_flat
 
-    # build train split first to get bin_edges from training data
-    ds_train = HLTSmCocktailDataset(pf, obj_norm, labels, ae_model,
-                                    n_bins=n_bins, split="train",
-                                    val_split=val_split, seed=seed)
-    ds_val   = HLTSmCocktailDataset(pf, obj_norm, labels, ae_model,
-                                    n_bins=n_bins, split="val",
-                                    val_split=val_split, seed=seed,
-                                    bin_edges=ds_train.bin_edges)
+    # AE reco is the nuisance definition. Compute it once, then split.
+    ae_reco_all = _compute_ae_reco(obj_norm, ae_model, batch_size=ae_batch_size)
+    quantiles = torch.linspace(0, 1, n_bins + 1)
+    bin_edges = torch.quantile(ae_reco_all, quantiles)
+    nuisances_all = torch.bucketize(ae_reco_all, bin_edges[1:-1]).long()
+    del obj_norm
+
+    idx_all = np.arange(len(labels))
+    idx_tr, idx_val = train_test_split(
+        idx_all, test_size=val_split, random_state=seed,
+        stratify=labels.cpu().numpy()
+    )
+    idx_tr = torch.tensor(idx_tr, dtype=torch.long)
+    idx_val = torch.tensor(idx_val, dtype=torch.long)
+
+    ds_train = HLTSmCocktailDataset(
+        pf, labels, nuisances_all, ae_reco_all, idx_tr,
+        split="train", bin_edges=bin_edges)
+    ds_val = HLTSmCocktailDataset(
+        pf, labels, nuisances_all, ae_reco_all, idx_val,
+        split="val", bin_edges=bin_edges)
     return ds_train, ds_val, obj_scaler

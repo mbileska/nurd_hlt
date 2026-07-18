@@ -178,7 +178,7 @@ class HLTContrastiveModel(nn.Module):
         cls = torch.zeros(x.size(0), 1, device=x.device, dtype=torch.bool)
         return torch.cat([cls, pad], dim=1)                              # [B, N+1]
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, return_embedding: bool = False):
         """
         x: [B, N, 7]  raw PF candidates
         Returns: (latent [B, latent_dim], logits [B, num_classes])
@@ -193,8 +193,10 @@ class HLTContrastiveModel(nn.Module):
             x = layer(x, mask)
 
         latent  = self.bottleneck(self.norm_cls(x[:, 0, :]))             # [B, latent_dim]
-        emb     = F.normalize(self.projector(latent), dim=1)             # [B, proj_dim]
         logits  = self.classifier(latent)                                # [B, num_classes]
+        if return_embedding:
+            emb = F.normalize(self.projector(latent), dim=1)             # [B, proj_dim]
+            return latent, logits, emb
         return latent, logits
 
     def get_embeddings(self, latent: torch.Tensor) -> torch.Tensor:

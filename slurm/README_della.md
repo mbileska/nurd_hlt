@@ -108,6 +108,22 @@ preserve the original critic-penalty second forward while saving its autograd
 tensors on CPU. The job excludes the Della `della-i*` A100 nodes seen in
 `sinfo` and exits early unless the allocated GPU has at least 75 GiB memory.
 
+On this test branch the Slurm job defaults to `CRITIC_SCOPE=qcd`, so the
+critic targets the QCD background used by ABCD closure. To reproduce the older
+all-class critic behavior:
+
+```bash
+CRITIC_SCOPE=all sbatch slurm/submit_train.sbatch
+```
+
+Useful knobs that do not require editing the script:
+
+```bash
+SKIP_AE=1 AE_EXP=<existing_ae_exp> sbatch slurm/submit_train.sbatch
+AE_EPOCHS=100 NURD_EPOCHS=100 sbatch slurm/submit_train.sbatch
+CLOSURE_WEIGHT=0.2 sbatch slurm/submit_train.sbatch
+```
+
 If batch size 4096 still runs out of GPU memory on an 80 GB A100:
 
 ```bash
@@ -133,7 +149,8 @@ find /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/wandb -type d -name 'offline-run-*' -
 ## ABCD / Closure Evaluation
 
 Run eval through Slurm; interactive login-node eval can be killed by the
-cluster. Results are written under `/home/mb7126/nurd_hlt/results`.
+cluster. Results are written under scratch:
+`/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/outputs/abcd_<NURD_EXP>/`.
 
 ```bash
 NURD_EXP=hlt_nurd_closure_bs4096_20260717_190314 sbatch slurm/submit_eval_abcd.sbatch
@@ -152,6 +169,18 @@ tail -f /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/nurd_eval-<JOBID>.err
 Key outputs:
 
 ```bash
-ls -lh /home/mb7126/nurd_hlt/results/abcd_<NURD_EXP>/
-ls -lh /home/mb7126/nurd_hlt/results/abcd_<NURD_EXP>/plots/
+ls -lh /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/outputs/abcd_<NURD_EXP>/
+ls -lh /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/outputs/abcd_<NURD_EXP>/plots/
 ```
+
+The most important non-plot files are:
+
+```text
+abcd_thresholds.json
+diagnostics.json
+```
+
+For decorrelation, inspect `diagnostics.json` and W&B keys
+`Corr/qcd_pearson`, `Corr/qcd_spearman`, `Corr/qcd_distance`. For closure,
+do not look only at the optimized `ABCD/nonclosure`; also check
+`ABCD/grid_median_abs_nonclosure` and `ABCD/grid_p90_abs_nonclosure`.

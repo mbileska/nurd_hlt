@@ -61,8 +61,10 @@ python train_hlt.py \
   --max_events 2000 \
   --local_testing 1 \
   --critic_schedule warmup \
+  --critic_scope qcd \
   --reweight 1 \
   --joint_indep 1 \
+  --closure_weight 0.1 \
   --exp_name smoke_nurd \
   --project_name hlt \
   --manualSeed 42

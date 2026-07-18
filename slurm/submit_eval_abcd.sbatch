@@ -22,8 +22,10 @@ SIGNAL_PT="${SIGNAL_PT:-$BASE/data/hlt_signal_TpTp.pt}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-256}"
 AE_BATCH_SIZE="${AE_BATCH_SIZE:-4096}"
 N_PCA="${N_PCA:-6}"
+CORR_SAMPLE_SIZE="${CORR_SAMPLE_SIZE:-50000}"
+DCOR_SAMPLE_SIZE="${DCOR_SAMPLE_SIZE:-2000}"
 
-mkdir -p "$BASE/logs" "$BASE/wandb" "$BASE/matplotlib" "$CODE_DIR/results"
+mkdir -p "$BASE/logs" "$BASE/wandb" "$BASE/matplotlib" "$BASE/outputs"
 
 export WANDB_DIR="$BASE/wandb"
 export WANDB_MODE="${WANDB_MODE:-offline}"
@@ -54,7 +56,7 @@ if [[ -z "${NURD_EXP:-}" ]]; then
   NURD_EXP="$(basename "$(dirname "$CKPT")")"
 fi
 
-OUTDIR="${OUTDIR:-$CODE_DIR/results/abcd_${NURD_EXP}}"
+OUTDIR="${OUTDIR:-$BASE/outputs/abcd_${NURD_EXP}}"
 
 if [[ ! -f "$AE_CKPT" ]]; then
   echo "ERROR: AE checkpoint not found: $AE_CKPT"
@@ -96,6 +98,8 @@ echo "SIGNAL_PT: ${SIGNAL_PT:-}"
 echo "EVAL_BATCH_SIZE: $EVAL_BATCH_SIZE"
 echo "AE_BATCH_SIZE: $AE_BATCH_SIZE"
 echo "N_PCA: $N_PCA"
+echo "CORR_SAMPLE_SIZE: $CORR_SAMPLE_SIZE"
+echo "DCOR_SAMPLE_SIZE: $DCOR_SAMPLE_SIZE"
 echo "W&B mode: $WANDB_MODE"
 
 python -c "import torch; print('torch', torch.__version__, 'cuda build', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO GPU')"
@@ -112,6 +116,8 @@ python eval_abcd_nurd.py \
   --n_pca "$N_PCA" \
   --batch_size "$EVAL_BATCH_SIZE" \
   --ae_batch_size "$AE_BATCH_SIZE" \
+  --corr_sample_size "$CORR_SAMPLE_SIZE" \
+  --dcor_sample_size "$DCOR_SAMPLE_SIZE" \
   "${EXTRA_ARGS[@]}"
 
 echo "=== ABCD outputs ==="

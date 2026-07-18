@@ -50,6 +50,11 @@ RUN_TAG="${RUN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 AE_EXP="${AE_EXP:-ae_pretrain_$RUN_TAG}"
 NURD_EXP="${NURD_EXP:-hlt_nurd_closure_bs4096_$RUN_TAG}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
+AE_EPOCHS="${AE_EPOCHS:-100}"
+NURD_EPOCHS="${NURD_EPOCHS:-100}"
+CLOSURE_WEIGHT="${CLOSURE_WEIGHT:-0.1}"
+CRITIC_SCOPE="${CRITIC_SCOPE:-qcd}"
+NUM_WORKERS="${NUM_WORKERS:-0}"
 AE_CKPT="${AE_CKPT:-checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth}"
 
 echo "=== Full training started: $(date) ==="
@@ -60,7 +65,11 @@ echo "Train data: $TRAIN_PT"
 echo "AE_EXP=$AE_EXP"
 echo "NURD_EXP=$NURD_EXP"
 echo "BATCH_SIZE=$BATCH_SIZE"
+echo "AE_EPOCHS=$AE_EPOCHS"
+echo "NURD_EPOCHS=$NURD_EPOCHS"
 echo "AE_CKPT=$AE_CKPT"
+echo "CRITIC_SCOPE=$CRITIC_SCOPE"
+echo "CLOSURE_WEIGHT=$CLOSURE_WEIGHT"
 echo "W&B project: nurd-ood-hlt"
 echo "W&B mode: $WANDB_MODE"
 echo "Minimum GPU memory: ${MIN_GPU_MEM_GB} GiB"
@@ -80,7 +89,7 @@ else
   echo "=== Step 1: AE pretraining ==="
   python train_ae.py \
     --data "$TRAIN_PT" \
-    --epochs 100 \
+    --epochs "$AE_EPOCHS" \
     --batch_size "$BATCH_SIZE" \
     --lr 1e-3 \
     --latent_dim 16 \
@@ -94,8 +103,9 @@ echo "=== Step 2: NURD closure training ==="
 python train_hlt.py \
   --data "$TRAIN_PT" \
   --ae_ckpt "$AE_CKPT" \
-  --epochs 100 \
+  --epochs "$NURD_EPOCHS" \
   --batch_size "$BATCH_SIZE" \
+  --num_workers "$NUM_WORKERS" \
   --lr 1e-4 \
   --weight_decay 5e-3 \
   --n_bins 10 \
@@ -116,10 +126,11 @@ python train_hlt.py \
   --critic_train_frac 0.2 \
   --critic_lr_multiplier 10.0 \
   --n_critic_steps_per_batch 3 \
+  --critic_scope "$CRITIC_SCOPE" \
   --_lambda 0.01 \
   --no_mi_norm \
   --offload_critic_graph \
-  --closure_weight 0.1 \
+  --closure_weight "$CLOSURE_WEIGHT" \
   --qcd_label 1 \
   --exp_name "$NURD_EXP" \
   --project_name hlt \
