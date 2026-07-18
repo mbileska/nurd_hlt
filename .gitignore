@@ -4,6 +4,7 @@ __pycache__/
 *.pyd
 .Python
 checkpoints/
+results/
 condor_logs/*.out
 condor_logs/*.err
 condor_logs/*.log

@@ -265,7 +265,9 @@ def ABCD(config):
 
     # ── AE scores ─────────────────────────────────────────────────────────────
     print("Computing AE scores (bkg)...", flush=True)
-    ae_bkg = compute_ae_scores(ae, ae_scaler, config["test_pt"], device)
+    ae_bkg = compute_ae_scores(
+        ae, ae_scaler, config["test_pt"], device,
+        batch_size=config.get("ae_batch_size", 4096))
 
     # free AE GPU memory before running encoder
     del ae
@@ -280,6 +282,7 @@ def ABCD(config):
     print("Computing contrastive MD scores (bkg)...", flush=True)
     con_bkg, labels, md_mu, md_W, latents_all, class_transforms = compute_md_scores(
         model, config["test_pt"], device,
+        batch_size=config.get("batch_size", 512),
         n_pca=config.get("n_pca"),
         bkg_labels=bkg_labels,
     )
@@ -312,7 +315,9 @@ def ABCD(config):
         if device == "cuda":
             torch.cuda.empty_cache()
         print("Running signal inference...", flush=True)
-        sig_latents, _ = embed_pf(model, config["signal_pt"], device)
+        sig_latents, _ = embed_pf(
+            model, config["signal_pt"], device,
+            batch_size=config.get("batch_size", 512))
         sig_mds = []
         for cls, mu_c, W_c in class_transforms:
             z_c = (sig_latents - mu_c) @ W_c
@@ -320,7 +325,9 @@ def ABCD(config):
         sig_con = np.stack(sig_mds, axis=0).min(axis=0).astype(np.float32)
 
         ae_sig = load_ae(config["ae_ckpt"], ae_scaler, device)
-        sig_ae = compute_ae_scores(ae_sig, ae_scaler, config["signal_pt"], device)
+        sig_ae = compute_ae_scores(
+            ae_sig, ae_scaler, config["signal_pt"], device,
+            batch_size=config.get("ae_batch_size", 4096))
         del ae_sig
 
         sig_mask = np.isfinite(sig_ae) & np.isfinite(sig_con) & (sig_ae > 0)
@@ -696,6 +703,10 @@ if __name__ == "__main__":
     parser.add_argument("--min_D",        type=int, default=500)
     parser.add_argument("--n_pca",        type=int, default=None,
                         help="Number of PCA components for MD (default: keep all latent dims)")
+    parser.add_argument("--batch_size",   type=int, default=512,
+                        help="Batch size for NURD encoder inference")
+    parser.add_argument("--ae_batch_size", type=int, default=4096,
+                        help="Batch size for AE inference")
     parser.add_argument("--wandb_run_name", default=None)
     parser.add_argument("--wandb_project",  default="AE vs. Contrastive ABCD",
                         help="W&B project to log to")

@@ -129,3 +129,29 @@ Sync them from a session that can reach W&B:
 ```bash
 find /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/wandb -type d -name 'offline-run-*' -print0 | xargs -0 -n1 wandb sync
 ```
+
+## ABCD / Closure Evaluation
+
+Run eval through Slurm; interactive login-node eval can be killed by the
+cluster. Results are written under `/home/mb7126/nurd_hlt/results`.
+
+```bash
+NURD_EXP=hlt_nurd_closure_bs4096_20260717_190314 sbatch slurm/submit_eval_abcd.sbatch
+```
+
+If `NURD_EXP` is omitted, the script uses the newest
+`hlt_nurd_closure_bs4096_*` checkpoint directory.
+
+Inspect:
+
+```bash
+tail -f /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/nurd_eval-<JOBID>.out
+tail -f /scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/nurd_eval-<JOBID>.err
+```
+
+Key outputs:
+
+```bash
+ls -lh /home/mb7126/nurd_hlt/results/abcd_<NURD_EXP>/
+ls -lh /home/mb7126/nurd_hlt/results/abcd_<NURD_EXP>/plots/
+```
