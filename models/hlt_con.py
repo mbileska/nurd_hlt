@@ -209,7 +209,7 @@ class HLTContrastiveModel(nn.Module):
 class HLTCritic(nn.Module):
     """
     Two modes:
-      bin_pred    (default): predicts nuisance bin from (latent, y) — [B, n_bins]
+      bin_pred             : predicts nuisance bin from (latent, y) — [B, n_bins]
       density_ratio         : classifies real vs shuffled-z from (latent, y, z) — [B, 2]
                               matches gabhijith's original density-ratio trick
     """

@@ -138,7 +138,8 @@ class HLTSmCocktailDataset(Dataset):
 
 def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42,
                        max_events=-1, ae_scaler=None, ae_batch_size=4096,
-                       max_weight_ratio=10.0):
+                       max_weight_ratio=10.0, nuisance_bin_scope="all",
+                       qcd_label=1):
     """
     Load the HLT .pt file, pre-normalise obj features, and return
     (train_dataset, val_dataset).  Call once; pass the same bin_edges
@@ -172,7 +173,17 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42,
     # AE reco is the nuisance definition. Compute it once, then split.
     ae_reco_all = _compute_ae_reco(obj_norm, ae_model, batch_size=ae_batch_size)
     quantiles = torch.linspace(0, 1, n_bins + 1)
-    bin_edges = torch.quantile(ae_reco_all, quantiles)
+    if nuisance_bin_scope == "qcd":
+        bin_source = ae_reco_all[labels == int(qcd_label)]
+        if bin_source.numel() == 0:
+            raise ValueError(
+                f"Cannot build QCD-scoped nuisance bins: no label={qcd_label} events found."
+            )
+    elif nuisance_bin_scope == "all":
+        bin_source = ae_reco_all
+    else:
+        raise ValueError(f"Unsupported nuisance_bin_scope={nuisance_bin_scope!r}")
+    bin_edges = torch.quantile(bin_source, quantiles)
     nuisances_all = torch.bucketize(ae_reco_all, bin_edges[1:-1]).long()
     del obj_norm
 

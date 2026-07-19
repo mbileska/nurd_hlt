@@ -6,11 +6,13 @@ parameters:
   # data
   n_bins:
     values: [10]
+  nuisance_bin_scope:
+    values: [qcd]
   val_split:
     values: [0.1]
   # training
   epochs:
-    values: [100]
+    values: [85]
   critic_epochs:
     values: [2]
   batch_size:
@@ -34,6 +36,8 @@ parameters:
     values: [warmup]
   critic_type:
     values: [density_ratio]
+  critic_penalty_type:
+    values: [confusion]
   critic_scope:
     values: [qcd]
   n_critic_steps_per_batch:
@@ -41,12 +45,36 @@ parameters:
   max_weight_ratio:
     values: [10.0]
   closure_loss_type:
-    values: [corr]
+    values: [dcorr_profile]
   closure_weight:
-    values: [0.1]
+    values: [0.5]
+  closure_weight_start:
+    values: [0.0]
+  closure_ramp_epochs:
+    values: [15]
+  closure_corr_weight:
+    values: [0.25]
+  closure_dcorr_weight:
+    values: [1.0]
+  closure_profile_weight:
+    values: [0.5]
+  closure_profile_bins:
+    values: [8]
+  closure_profile_tail_weight:
+    values: [2.0]
+  closure_dcorr_max_samples:
+    values: [512]
+  md_proxy_type:
+    values: [ema]
+  md_ema_momentum:
+    values: [0.05]
   # contrastive
   contrast_weight:
-    values: [0.2]
+    values: [0.05]
+  contrast_weight_start:
+    values: [0.15]
+  contrast_ramp_epochs:
+    values: [40]
   contrast_temp:
     values: [0.05]
   # model architecture

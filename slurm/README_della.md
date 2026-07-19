@@ -121,9 +121,13 @@ The `.out` log prints the exact experiment names:
 AE_EXP=...
 NURD_EXP=...
 BATCH_SIZE=4096
+NURD_EPOCHS=85
 CRITIC_SCOPE=qcd
 CRITIC_TYPE=density_ratio
-CLOSURE_LOSS_TYPE=corr
+CRITIC_PENALTY_TYPE=confusion
+NUISANCE_BIN_SCOPE=qcd
+CLOSURE_LOSS_TYPE=dcorr_profile
+MD_PROXY_TYPE=ema
 ```
 
 Save those values. The checkpoints will be under:
@@ -153,9 +157,12 @@ CRITIC_SCOPE=qcd sbatch slurm/submit_train.sbatch      # default, targets QCD cl
 CRITIC_SCOPE=all sbatch slurm/submit_train.sbatch      # old all-class critic
 CRITIC_TYPE=density_ratio sbatch slurm/submit_train.sbatch
 CRITIC_TYPE=bin_pred sbatch slurm/submit_train.sbatch   # old direct-bin critic
-CLOSURE_LOSS_TYPE=corr sbatch slurm/submit_train.sbatch # default, cheaper and closer to eval axes
+CLOSURE_LOSS_TYPE=dcorr_profile sbatch slurm/submit_train.sbatch # default direct closure loss
+CLOSURE_LOSS_TYPE=corr sbatch slurm/submit_train.sbatch # cheaper Pearson-only closure loss
 CLOSURE_LOSS_TYPE=abcd sbatch slurm/submit_train.sbatch # old random-cut batch proxy
-CLOSURE_WEIGHT=0.3 sbatch slurm/submit_train.sbatch    # stronger closure loss
+CRITIC_PENALTY_TYPE=logit_ratio sbatch slurm/submit_train.sbatch # previous HLT critic penalty
+NUISANCE_BIN_SCOPE=all sbatch slurm/submit_train.sbatch # older all-class AE nuisance bins
+CLOSURE_WEIGHT=0.3 sbatch slurm/submit_train.sbatch    # weaker closure loss than current default
 BATCH_SIZE=3072 sbatch slurm/submit_train.sbatch       # lower memory
 AE_EPOCHS=100 NURD_EPOCHS=100 sbatch slurm/submit_train.sbatch
 ```

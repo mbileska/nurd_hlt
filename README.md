@@ -30,9 +30,13 @@ The default critic is the NURD density-ratio critic: a small network sees
 `(latent, class label, AE-loss bin)` and tries to classify real triples from
 triples with the AE-loss bin shuffled. If it can tell real from shuffled, the
 latent representation still contains nuisance information. The encoder is
-penalized for that density-ratio signal, so the two ABCD axes become less
-correlated. The older direct bin-prediction critic is still available with
+penalized with a bounded confusion objective, so real and shuffled triples become
+indistinguishable. The older direct bin-prediction critic is still available with
 `CRITIC_TYPE=bin_pred`.
+
+The current training default also defines AE nuisance bins from QCD quantiles,
+uses an EMA QCD whitening proxy for the Mahalanobis-distance axis, and adds a
+direct QCD closure loss with distance-correlation and profile-flatness terms.
 
 Closure means the ABCD estimate agrees with the true QCD yield in region A:
 
@@ -180,9 +184,13 @@ The `.out` log prints:
 AE_EXP=...
 NURD_EXP=...
 BATCH_SIZE=4096
+NURD_EPOCHS=85
 CRITIC_SCOPE=qcd
 CRITIC_TYPE=density_ratio
-CLOSURE_LOSS_TYPE=corr
+CRITIC_PENALTY_TYPE=confusion
+NUISANCE_BIN_SCOPE=qcd
+CLOSURE_LOSS_TYPE=dcorr_profile
+MD_PROXY_TYPE=ema
 ```
 
 Checkpoints are written to:
@@ -211,9 +219,12 @@ CRITIC_SCOPE=qcd sbatch slurm/submit_train.sbatch      # default, QCD-only criti
 CRITIC_SCOPE=all sbatch slurm/submit_train.sbatch      # older all-class critic
 CRITIC_TYPE=density_ratio sbatch slurm/submit_train.sbatch
 CRITIC_TYPE=bin_pred sbatch slurm/submit_train.sbatch   # older direct-bin critic
-CLOSURE_LOSS_TYPE=corr sbatch slurm/submit_train.sbatch # default, cheaper and closer to eval axes
+CLOSURE_LOSS_TYPE=dcorr_profile sbatch slurm/submit_train.sbatch # default direct closure loss
+CLOSURE_LOSS_TYPE=corr sbatch slurm/submit_train.sbatch # cheaper Pearson-only closure loss
 CLOSURE_LOSS_TYPE=abcd sbatch slurm/submit_train.sbatch # older random-cut batch proxy
-CLOSURE_WEIGHT=0.3 sbatch slurm/submit_train.sbatch    # stronger closure proxy
+CRITIC_PENALTY_TYPE=logit_ratio sbatch slurm/submit_train.sbatch # previous HLT critic penalty
+NUISANCE_BIN_SCOPE=all sbatch slurm/submit_train.sbatch # older all-class AE nuisance bins
+CLOSURE_WEIGHT=0.3 sbatch slurm/submit_train.sbatch    # weaker closure proxy than current default
 BATCH_SIZE=3072 sbatch slurm/submit_train.sbatch       # lower GPU memory
 AE_EPOCHS=100 NURD_EPOCHS=100 sbatch slurm/submit_train.sbatch
 ```
@@ -426,7 +437,8 @@ python train_hlt.py \
   --ae_ckpt checkpoints/hlt/hlt/smoke_ae/checkpoint_ae.pth \
   --epochs 1 --batch_size 64 --max_events 2000 --local_testing 1 \
   --critic_scope qcd --critic_schedule warmup --critic_type density_ratio \
-  --closure_weight 0.1 --closure_loss_type corr \
+  --critic_penalty_type confusion --nuisance_bin_scope qcd \
+  --closure_weight 0.1 --closure_loss_type dcorr_profile --md_proxy_type ema \
   --reweight 1 --joint_indep 1 \
   --exp_name smoke_nurd --project_name hlt
 ```
