@@ -12,7 +12,7 @@ parameters:
     values: [0.1]
   # training
   epochs:
-    values: [85]
+    values: [150]
   critic_epochs:
     values: [2]
   batch_size:
@@ -45,18 +45,20 @@ parameters:
   max_weight_ratio:
     values: [10.0]
   closure_loss_type:
-    values: [dcorr_profile]
+    values: [hybrid]
   closure_weight:
-    values: [0.5]
+    values: [1.0]
   closure_weight_start:
     values: [0.0]
   closure_ramp_epochs:
-    values: [15]
+    values: [20]
   closure_corr_weight:
     values: [0.25]
   closure_dcorr_weight:
     values: [1.0]
   closure_profile_weight:
+    values: [0.5]
+  closure_reverse_profile_weight:
     values: [0.5]
   closure_profile_bins:
     values: [8]
@@ -64,17 +66,33 @@ parameters:
     values: [2.0]
   closure_dcorr_max_samples:
     values: [512]
+  closure_tail_abcd_weight:
+    values: [1.0]
+  closure_tail_quantiles:
+    values: ["0.50,0.65,0.80,0.90"]
+  closure_tail_scale:
+    values: [12.0]
+  closure_tail_min_events:
+    values: [5]
+  closure_tail_focus_weight:
+    values: [2.0]
+  abcd_ckpt_loss_tol:
+    values: [1.10]
+  val_abcd_quantiles:
+    values: ["0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90,0.92"]
+  val_abcd_min_events:
+    values: [20]
   md_proxy_type:
     values: [ema]
   md_ema_momentum:
     values: [0.05]
   # contrastive
   contrast_weight:
-    values: [0.05]
+    values: [0.02]
   contrast_weight_start:
     values: [0.15]
   contrast_ramp_epochs:
-    values: [40]
+    values: [50]
   contrast_temp:
     values: [0.05]
   # model architecture

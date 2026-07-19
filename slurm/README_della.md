@@ -97,14 +97,14 @@ ls -lh $BASE/checkpoints/hlt/hlt/smoke_nurd/
 
 ## 2. Full Training
 
-Always use a fresh `RUN_TAG`. This prevents mixing yesterday's checkpoints with
-today's training.
+The default `RUN_TAG` includes `closure_v3` plus a timestamp. Use a fresh tag
+when overriding it so yesterday's checkpoints cannot mix with today's training.
 
 Train AE and NURD from scratch:
 
 ```bash
 unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP RUN_TAG WANDB_RUN_NAME WANDB_RUN_ID
-RUN_TAG=qcdcritic_$(date +%Y%m%d_%H%M%S) sbatch slurm/submit_train.sbatch
+sbatch slurm/submit_train.sbatch
 ```
 
 Monitor:
@@ -121,12 +121,15 @@ The `.out` log prints the exact experiment names:
 AE_EXP=...
 NURD_EXP=...
 BATCH_SIZE=4096
-NURD_EPOCHS=85
+AE_EPOCHS=150
+NURD_EPOCHS=150
 CRITIC_SCOPE=qcd
 CRITIC_TYPE=density_ratio
 CRITIC_PENALTY_TYPE=confusion
 NUISANCE_BIN_SCOPE=qcd
-CLOSURE_LOSS_TYPE=dcorr_profile
+CLOSURE_LOSS_TYPE=hybrid
+CLOSURE_WEIGHT=1.0
+CONTRAST_WEIGHT=0.02
 MD_PROXY_TYPE=ema
 ```
 
@@ -138,16 +141,16 @@ $BASE/checkpoints/hlt/hlt/<NURD_EXP>/
 ```
 
 The normal model checkpoint is `checkpoint_main_*.pth.tar`, selected by
-validation classification loss. Training also writes
-`checkpoint_closure.pth.tar`, selected by the smallest validation QCD
-AE-vs-proxy-MD correlation while the validation loss stays close to the best
-loss.
+validation classification loss. Training also writes `checkpoint_abcd.pth.tar`,
+selected by a validation QCD proxy-ABCD grid score while the validation loss
+stays close to the best loss. `checkpoint_closure.pth.tar` is kept as an alias
+of the ABCD-selected checkpoint for older scripts.
 
 Reuse an existing AE and train only NURD:
 
 ```bash
 unset CKPT OUTDIR AE_CKPT NURD_EXP RUN_TAG WANDB_RUN_NAME WANDB_RUN_ID
-AE_EXP=<existing_ae_exp> SKIP_AE=1 RUN_TAG=qcdcritic_$(date +%Y%m%d_%H%M%S) sbatch slurm/submit_train.sbatch
+AE_EXP=<existing_ae_exp> SKIP_AE=1 sbatch slurm/submit_train.sbatch
 ```
 
 Useful training toggles:
@@ -157,17 +160,18 @@ CRITIC_SCOPE=qcd sbatch slurm/submit_train.sbatch      # default, targets QCD cl
 CRITIC_SCOPE=all sbatch slurm/submit_train.sbatch      # old all-class critic
 CRITIC_TYPE=density_ratio sbatch slurm/submit_train.sbatch
 CRITIC_TYPE=bin_pred sbatch slurm/submit_train.sbatch   # old direct-bin critic
-CLOSURE_LOSS_TYPE=dcorr_profile sbatch slurm/submit_train.sbatch # default direct closure loss
+CLOSURE_LOSS_TYPE=hybrid sbatch slurm/submit_train.sbatch # default: dcorr + profiles + soft tail ABCD
+CLOSURE_LOSS_TYPE=dcorr_profile sbatch slurm/submit_train.sbatch # no soft tail ABCD term
 CLOSURE_LOSS_TYPE=corr sbatch slurm/submit_train.sbatch # cheaper Pearson-only closure loss
 CLOSURE_LOSS_TYPE=abcd sbatch slurm/submit_train.sbatch # old random-cut batch proxy
 CRITIC_PENALTY_TYPE=logit_ratio sbatch slurm/submit_train.sbatch # previous HLT critic penalty
 NUISANCE_BIN_SCOPE=all sbatch slurm/submit_train.sbatch # older all-class AE nuisance bins
-CLOSURE_WEIGHT=0.3 sbatch slurm/submit_train.sbatch    # weaker closure loss than current default
+CLOSURE_WEIGHT=0.5 sbatch slurm/submit_train.sbatch    # weaker closure loss than current default
 BATCH_SIZE=3072 sbatch slurm/submit_train.sbatch       # lower memory
 AE_EPOCHS=100 NURD_EPOCHS=100 sbatch slurm/submit_train.sbatch
 ```
 
-The training job requests 7 hours, 64 GB CPU memory, and one A100. It exits
+The training job requests 10 hours, 64 GB CPU memory, and one A100. It exits
 early unless the GPU has at least 75 GiB memory. It runs W&B in offline mode by
 default.
 
@@ -199,7 +203,7 @@ Get the closure-selected checkpoint from that NURD experiment:
 
 ```bash
 NURD_EXP=<nurd_exp_from_log>
-CKPT=$BASE/checkpoints/hlt/hlt/$NURD_EXP/checkpoint_closure.pth.tar
+CKPT=$BASE/checkpoints/hlt/hlt/$NURD_EXP/checkpoint_abcd.pth.tar
 echo "$CKPT"
 ```
 
@@ -215,11 +219,11 @@ unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP WANDB_RUN_NAME WANDB_RUN_ID
 WANDB_NAME_PREFIX=heldout_eval sbatch slurm/submit_eval_latest.sbatch
 ```
 
-Evaluate the newest closure-selected checkpoint instead:
+Evaluate the newest ABCD-selected checkpoint instead:
 
 ```bash
 unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP WANDB_RUN_NAME WANDB_RUN_ID
-PREFER_CLOSURE_CKPT=1 WANDB_NAME_PREFIX=heldout_eval_closure_ckpt \
+PREFER_ABCD_CKPT=1 WANDB_NAME_PREFIX=heldout_eval_abcd_ckpt \
   sbatch slurm/submit_eval_latest.sbatch
 ```
 

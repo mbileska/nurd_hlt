@@ -29,6 +29,7 @@ CLOSURE_SPLIT_SEED="${CLOSURE_SPLIT_SEED:-42}"
 NURD_GLOB="${NURD_GLOB:-hlt_nurd_closure_bs4096_*}"
 WANDB_NAME_PREFIX="${WANDB_NAME_PREFIX:-optimized}"
 SYNC_WANDB="${SYNC_WANDB:-0}"
+PREFER_ABCD_CKPT="${PREFER_ABCD_CKPT:-0}"
 PREFER_CLOSURE_CKPT="${PREFER_CLOSURE_CKPT:-0}"
 
 mkdir -p "$BASE/logs" "$BASE/wandb" "$BASE/matplotlib" "$BASE/outputs"
@@ -47,7 +48,11 @@ fi
 ln -sfnT "$BASE/checkpoints" checkpoints
 
 if [[ -z "${CKPT:-}" ]]; then
-  if [[ "$PREFER_CLOSURE_CKPT" == "1" ]]; then
+  if [[ "$PREFER_ABCD_CKPT" == "1" ]]; then
+    CKPT="$(find "$BASE/checkpoints/hlt/hlt" -path "*/$NURD_GLOB/checkpoint_abcd.pth.tar" \
+      -printf '%T@ %p\n' | sort -nr | awk 'NR==1 {print $2}')"
+  fi
+  if [[ -z "${CKPT:-}" && "$PREFER_CLOSURE_CKPT" == "1" ]]; then
     CKPT="$(find "$BASE/checkpoints/hlt/hlt" -path "*/$NURD_GLOB/checkpoint_closure.pth.tar" \
       -printf '%T@ %p\n' | sort -nr | awk 'NR==1 {print $2}')"
   fi
@@ -140,6 +145,7 @@ echo "DCOR_SAMPLE_SIZE: $DCOR_SAMPLE_SIZE"
 echo "CLOSURE_HOLDOUT_FRAC: $CLOSURE_HOLDOUT_FRAC"
 echo "CLOSURE_SPLIT_SEED: $CLOSURE_SPLIT_SEED"
 echo "NURD_GLOB: $NURD_GLOB"
+echo "PREFER_ABCD_CKPT: $PREFER_ABCD_CKPT"
 echo "PREFER_CLOSURE_CKPT: $PREFER_CLOSURE_CKPT"
 echo "WANDB_RUN_NAME: $WANDB_RUN_NAME"
 echo "WANDB_RUN_ID: $WANDB_RUN_ID"
