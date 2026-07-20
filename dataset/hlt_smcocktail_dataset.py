@@ -42,6 +42,13 @@ def _make_nurd_weights(labels, nuisances, max_weight_ratio=10.0):
     return {k: min(v, cap) for k, v in weights_norm.items()}
 
 
+def _label_mask(labels, label_values):
+    mask = torch.zeros_like(labels, dtype=torch.bool)
+    for label in label_values:
+        mask |= labels == int(label)
+    return mask
+
+
 def _as_float_tensor(value):
     if torch.is_tensor(value):
         return value.detach().cpu().float()
@@ -127,7 +134,10 @@ class HLTSmCocktailDataset(Dataset):
     def get_nuisance_prior(self, label=None):
         nuisances = self.nuisances
         if label is not None:
-            label_mask = self.labels.long() == int(label)
+            if isinstance(label, (list, tuple, set)):
+                label_mask = _label_mask(self.labels.long(), label)
+            else:
+                label_mask = self.labels.long() == int(label)
             nuisances = nuisances[label_mask]
         total = len(nuisances)
         if total == 0:
@@ -139,7 +149,7 @@ class HLTSmCocktailDataset(Dataset):
 def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42,
                        max_events=-1, ae_scaler=None, ae_batch_size=4096,
                        max_weight_ratio=10.0, nuisance_bin_scope="all",
-                       qcd_label=1):
+                       qcd_label=1, baseline_labels=None):
     """
     Load the HLT .pt file, pre-normalise obj features, and return
     (train_dataset, val_dataset).  Call once; pass the same bin_edges
@@ -173,18 +183,43 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42,
     # AE reco is the nuisance definition. Compute it once, then split.
     ae_reco_all = _compute_ae_reco(obj_norm, ae_model, batch_size=ae_batch_size)
     quantiles = torch.linspace(0, 1, n_bins + 1)
+    if baseline_labels is None:
+        baseline_labels = sorted(int(v) for v in torch.unique(labels).tolist())
+
     if nuisance_bin_scope == "qcd":
         bin_source = ae_reco_all[labels == int(qcd_label)]
         if bin_source.numel() == 0:
             raise ValueError(
                 f"Cannot build QCD-scoped nuisance bins: no label={qcd_label} events found."
             )
+        bin_edges = torch.quantile(bin_source, quantiles)
+        nuisances_all = torch.bucketize(ae_reco_all, bin_edges[1:-1]).long()
     elif nuisance_bin_scope == "all":
         bin_source = ae_reco_all
+        bin_edges = torch.quantile(bin_source, quantiles)
+        nuisances_all = torch.bucketize(ae_reco_all, bin_edges[1:-1]).long()
+    elif nuisance_bin_scope in {"per_class", "per_label", "baseline_per_class"}:
+        nuisances_all = torch.zeros_like(labels, dtype=torch.long)
+        bin_edges = {}
+        assigned = torch.zeros_like(labels, dtype=torch.bool)
+        for label in baseline_labels:
+            label = int(label)
+            mask = labels == label
+            if mask.sum() == 0:
+                continue
+            edges = torch.quantile(ae_reco_all[mask], quantiles)
+            nuisances_all[mask] = torch.bucketize(ae_reco_all[mask], edges[1:-1]).long()
+            bin_edges[label] = edges
+            assigned |= mask
+        if not assigned.all():
+            remaining = ~assigned
+            for label in sorted(int(v) for v in torch.unique(labels[remaining]).tolist()):
+                mask = labels == label
+                edges = torch.quantile(ae_reco_all[mask], quantiles)
+                nuisances_all[mask] = torch.bucketize(ae_reco_all[mask], edges[1:-1]).long()
+                bin_edges[label] = edges
     else:
         raise ValueError(f"Unsupported nuisance_bin_scope={nuisance_bin_scope!r}")
-    bin_edges = torch.quantile(bin_source, quantiles)
-    nuisances_all = torch.bucketize(ae_reco_all, bin_edges[1:-1]).long()
     del obj_norm
 
     idx_all = np.arange(len(labels))

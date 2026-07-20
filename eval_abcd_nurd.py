@@ -33,6 +33,24 @@ from matplotlib.lines import Line2D
 from models.hlt_con import HLTContrastiveModel
 from models.hlt_autoencoder import HLTAutoencoder
 
+CLASS_NAMES = {0: "DY", 1: "QCD", 2: "TT", 3: "WJets"}
+CLASS_COLORS = {0: "tab:blue", 1: "tab:orange", 2: "tab:green", 3: "tab:red"}
+
+
+def parse_int_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [int(v) for v in value]
+    return [int(v) for v in str(value).replace(",", " ").split() if str(v).strip()]
+
+
+def label_membership_mask(labels, label_values):
+    labels = np.asarray(labels)
+    if not label_values:
+        return np.ones(labels.shape, dtype=bool)
+    return np.isin(labels, np.asarray([int(v) for v in label_values]))
+
 
 # ── ABCD helpers (identical to eval_abcd.py) ─────────────────────────────────
 
@@ -112,32 +130,40 @@ def _grid_summary(abs_nonclosure):
     }
 
 
-def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500):
-    best = {"log_nonclosure": np.inf, "nonclosure": np.inf}
+def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500,
+                   min_A_frac=0.0, selection_stat_weight=0.0):
+    best = {"selection_score": np.inf, "log_nonclosure": np.inf, "nonclosure": np.inf}
     scan_abs_nonclosure = []
+    min_A_effective = max(int(min_A), int(np.ceil(float(min_A_frac) * len(loss_1))))
     for p1 in percent:
         for p2 in percent:
             t1, t2, A, B, C, D = abcd_counts(loss_1, loss_2, p1, p2)
-            if A < min_A or D < min_D:
+            if A < min_A_effective or D < min_D:
                 continue
             metrics = closure_metrics(A, B, C, D)
             nc = metrics["nonclosure"]
             score = abs(metrics["log_nonclosure"])
+            record = abcd_record_at_thresholds(loss_1, loss_2, t1, t2)
+            selection_score = score + float(selection_stat_weight) * record["ratio_unc"]
             if np.isfinite(nc):
                 scan_abs_nonclosure.append(abs(nc))
-            if np.isfinite(score) and score < abs(best["log_nonclosure"]):
+            if np.isfinite(selection_score) and selection_score < best["selection_score"]:
                 best.update(dict(p1=float(p1), p2=float(p2), t1=float(t1), t2=float(t2),
                                  A=int(A), B=int(B), C=int(C), D=int(D),
                                  A_hat=metrics["A_hat"],
                                  nonclosure=float(nc),
                                  legacy_nonclosure=metrics["legacy_nonclosure"],
                                  log_nonclosure=metrics["log_nonclosure"],
-                                 ratio=metrics["ratio"]))
+                                 ratio=metrics["ratio"],
+                                 ratio_unc=record["ratio_unc"],
+                                 selection_score=float(selection_score),
+                                 min_A_effective=int(min_A_effective)))
     return best, _grid_summary(scan_abs_nonclosure)
 
 
 def split_for_threshold_report(n_events, holdout_frac=0.5, seed=42,
-                               axis1=None, axis2=None, n_strata=8):
+                               axis1=None, axis2=None, n_strata=8,
+                               strata_labels=None):
     idx = np.arange(n_events)
     if holdout_frac <= 0.0 or holdout_frac >= 1.0 or n_events < 4:
         return idx, idx, "same_sample"
@@ -161,6 +187,11 @@ def split_for_threshold_report(n_events, holdout_frac=0.5, seed=42,
     b1 = np.searchsorted(q1[1:-1], axis1, side="right")
     b2 = np.searchsorted(q2[1:-1], axis2, side="right")
     strata = b1 * n_strata + b2
+    if strata_labels is not None:
+        strata_labels = np.asarray(strata_labels)
+        if strata_labels.shape[0] == n_events:
+            _, label_codes = np.unique(strata_labels, return_inverse=True)
+            strata = label_codes * (n_strata * n_strata) + strata
 
     tune_parts, report_parts = [], []
     for s in np.unique(strata):
@@ -241,6 +272,29 @@ def _safe_correlations(x, y, max_points=50_000, dcor_points=2_000, seed=42):
             denom = np.sqrt(max(dvarx * dvary, 0.0))
             if denom > 0:
                 out["distance_corr"] = float(np.sqrt(max(dcov2, 0.0) / denom))
+    return out
+
+
+def per_class_correlations(axis1, axis2, labels, class_labels,
+                           corr_sample_size=50_000, dcor_sample_size=2_000):
+    out = {}
+    for cls in class_labels:
+        mask = labels == int(cls)
+        out[str(int(cls))] = _safe_correlations(
+            axis1[mask], axis2[mask],
+            max_points=corr_sample_size,
+            dcor_points=dcor_sample_size,
+            seed=42 + int(cls))
+    return out
+
+
+def per_class_abcd_at_thresholds(axis1, axis2, labels, class_labels, t1, t2):
+    out = {}
+    for cls in class_labels:
+        mask = labels == int(cls)
+        if mask.sum() == 0:
+            continue
+        out[str(int(cls))] = abcd_record_at_thresholds(axis1[mask], axis2[mask], t1, t2)
     return out
 
 
@@ -366,12 +420,11 @@ def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None, bkg_la
 
     bkg_labels: list of class labels to use as reference.
       [1]       (default) → QCD-only MD.
-      [0, 1, 3] → min-MD across DY, QCD, WJets (element-wise minimum).
+      [0, 1, 2, 3] → min-MD across DY, QCD, TT, WJets (element-wise minimum).
 
     Returns (md [N], labels [N], mu_qcd, W_qcd, latents [N,D], class_transforms).
     class_transforms is a list of (label, mu, W) — reuse for signal inference.
     """
-    _CLASS_NAMES = {0: "DY", 1: "QCD", 2: "TT", 3: "WJets"}
     if bkg_labels is None:
         bkg_labels = [1]
 
@@ -383,7 +436,7 @@ def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None, bkg_la
         if mask.sum() < 10:
             print(f"  WARNING: class {cls} has only {mask.sum()} events — skipping", flush=True)
             continue
-        mu, W = _fit_class_transform(latents, mask, n_pca, _CLASS_NAMES.get(cls, str(cls)))
+        mu, W = _fit_class_transform(latents, mask, n_pca, CLASS_NAMES.get(cls, str(cls)))
         class_transforms.append((cls, mu, W))
 
     if not class_transforms:
@@ -424,6 +477,11 @@ def ABCD(config):
     os.makedirs(plot_dir, exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    baseline_labels = parse_int_list(config.get("baseline_labels", "0,1,2,3"))
+    qcd_label = int(config.get("qcd_label", 1))
+    abcd_scope = config.get("abcd_scope", "qcd")
+    if not baseline_labels:
+        raise ValueError("baseline_labels must contain at least one label")
 
     # ── load models ───────────────────────────────────────────────────────────
     model, main_ckpt = load_nurd_model(config["ckpt"], device)
@@ -443,9 +501,11 @@ def ABCD(config):
         torch.cuda.empty_cache()
 
     # ── contrastive MD scores ─────────────────────────────────────────────────
-    bkg_labels = [0, 1, 3] if config.get("min_md") else [1]
-    if config.get("min_md"):
-        print("Min-MD mode: axis 2 = min(MD_DY, MD_QCD, MD_WJets)", flush=True)
+    use_min_md = bool(config.get("min_md")) or abcd_scope in {"all_baselines", "baselines"}
+    bkg_labels = baseline_labels if use_min_md else [qcd_label]
+    if use_min_md:
+        names = [CLASS_NAMES.get(int(c), str(c)) for c in bkg_labels]
+        print(f"Min-MD mode: axis 2 = min MD across {names}", flush=True)
     print("Computing contrastive MD scores (bkg)...", flush=True)
     con_bkg, labels, md_mu, md_W, latents_all, class_transforms = compute_md_scores(
         model, config["test_pt"], device,
@@ -469,10 +529,15 @@ def ABCD(config):
     n_pca    = emb_pca.shape[1]
     axis2_pca = axis2_bkg
 
-    qcd_only  = labels_masked == 1
+    qcd_only  = labels_masked == qcd_label
+    baseline_only = label_membership_mask(labels_masked, baseline_labels)
     axis1_qcd = axis1_bkg[qcd_only]
     axis2_qcd = axis2_pca[qcd_only]
+    axis1_baselines = axis1_bkg[baseline_only]
+    axis2_baselines = axis2_pca[baseline_only]
+    labels_baselines = labels_masked[baseline_only]
     print(f"QCD events for ABCD: {qcd_only.sum()}", flush=True)
+    print(f"Baseline events for ABCD: {baseline_only.sum()} labels={baseline_labels}", flush=True)
 
     corr_sample_size = int(config.get("corr_sample_size", 50_000))
     dcor_sample_size = int(config.get("dcor_sample_size", 2_000))
@@ -480,10 +545,19 @@ def ABCD(config):
         "counts": {
             "all_background": int(axis1_bkg.shape[0]),
             "qcd": int(qcd_only.sum()),
+            "all_baselines": int(baseline_only.sum()),
+            "per_class": {
+                str(int(cls)): int(np.count_nonzero(labels_masked == int(cls)))
+                for cls in baseline_labels
+            },
         },
         "correlations": {
             "all_background": _safe_correlations(
                 axis1_bkg, axis2_bkg,
+                max_points=corr_sample_size,
+                dcor_points=dcor_sample_size),
+            "all_baselines": _safe_correlations(
+                axis1_baselines, axis2_baselines,
                 max_points=corr_sample_size,
                 dcor_points=dcor_sample_size),
             "qcd": _safe_correlations(
@@ -491,6 +565,10 @@ def ABCD(config):
                 max_points=corr_sample_size,
                 dcor_points=dcor_sample_size),
         },
+        "per_class_correlations": per_class_correlations(
+            axis1_bkg, axis2_bkg, labels_masked, baseline_labels,
+            corr_sample_size=corr_sample_size,
+            dcor_sample_size=dcor_sample_size),
     }
     print("Correlation diagnostics:", flush=True)
     for scope, vals in diagnostics["correlations"].items():
@@ -504,6 +582,9 @@ def ABCD(config):
         "Corr/all_pearson": diagnostics["correlations"]["all_background"]["pearson"],
         "Corr/all_spearman": diagnostics["correlations"]["all_background"]["spearman"],
         "Corr/all_distance": diagnostics["correlations"]["all_background"]["distance_corr"],
+        "Corr/all_baselines_pearson": diagnostics["correlations"]["all_baselines"]["pearson"],
+        "Corr/all_baselines_spearman": diagnostics["correlations"]["all_baselines"]["spearman"],
+        "Corr/all_baselines_distance": diagnostics["correlations"]["all_baselines"]["distance_corr"],
         "Corr/qcd_pearson": diagnostics["correlations"]["qcd"]["pearson"],
         "Corr/qcd_spearman": diagnostics["correlations"]["qcd"]["spearman"],
         "Corr/qcd_distance": diagnostics["correlations"]["qcd"]["distance_corr"],
@@ -541,24 +622,45 @@ def ABCD(config):
         print(f"Signal events after masking: {sig_mask.sum()}", flush=True)
 
     # ── ABCD scan ─────────────────────────────────────────────────────────────
-    percent = np.linspace(0.50, 0.98, 48)
+    percent = np.linspace(
+        float(config.get("scan_percent_min", 0.50)),
+        float(config.get("scan_percent_max", 0.98)),
+        int(config.get("scan_percent_steps", 48)))
     min_A   = int(config.get("min_A", 50))
     min_D   = int(config.get("min_D", 500))
+    min_A_frac = float(config.get("min_A_frac", 0.0))
+    selection_stat_weight = float(config.get("selection_stat_weight", 0.0))
     holdout_frac = float(config.get("closure_holdout_frac", 0.5))
     split_seed = int(config.get("closure_split_seed", 42))
+    if abcd_scope in {"all_baselines", "baselines"}:
+        axis1_scan = axis1_baselines
+        axis2_scan = axis2_baselines
+        labels_scan = labels_baselines
+        scope_name = "all_baselines"
+    elif abcd_scope == "qcd":
+        axis1_scan = axis1_qcd
+        axis2_scan = axis2_qcd
+        labels_scan = labels_masked[qcd_only]
+        scope_name = "qcd"
+    else:
+        raise ValueError(f"Unsupported abcd_scope={abcd_scope!r}")
+
     tune_idx, report_idx, closure_mode = split_for_threshold_report(
-        len(axis1_qcd), holdout_frac=holdout_frac, seed=split_seed,
-        axis1=axis1_qcd, axis2=axis2_qcd)
-    axis1_tune, axis2_tune = axis1_qcd[tune_idx], axis2_qcd[tune_idx]
-    axis1_report, axis2_report = axis1_qcd[report_idx], axis2_qcd[report_idx]
+        len(axis1_scan), holdout_frac=holdout_frac, seed=split_seed,
+        axis1=axis1_scan, axis2=axis2_scan,
+        strata_labels=labels_scan if scope_name == "all_baselines" else None)
+    axis1_tune, axis2_tune = axis1_scan[tune_idx], axis2_scan[tune_idx]
+    axis1_report, axis2_report = axis1_scan[report_idx], axis2_scan[report_idx]
+    labels_report = labels_scan[report_idx]
     print(
-        f"ABCD threshold mode: {closure_mode}; "
+        f"ABCD threshold scope: {scope_name}; mode: {closure_mode}; "
         f"tune={len(axis1_tune)} report={len(axis1_report)}",
         flush=True,
     )
 
     best_tune, tune_grid_summary = scan_abcd_grid(
-        axis1_tune, axis2_tune, percent, min_A=min_A, min_D=min_D)
+        axis1_tune, axis2_tune, percent, min_A=min_A, min_D=min_D,
+        min_A_frac=min_A_frac, selection_stat_weight=selection_stat_weight)
     if "t1" not in best_tune:
         raise RuntimeError("No ABCD working point found on threshold-tuning split. "
                            "Try lowering min_A/min_D or closure_holdout_frac.")
@@ -570,9 +672,13 @@ def ABCD(config):
         "p2": float(best_tune["p2"]),
         "selection_nonclosure": float(best_tune["nonclosure"]),
         "selection_log_nonclosure": float(best_tune["log_nonclosure"]),
+        "selection_score": float(best_tune.get("selection_score", np.nan)),
     })
     best_report_scan, grid_summary = scan_abcd_grid(
-        axis1_report, axis2_report, percent, min_A=min_A, min_D=min_D)
+        axis1_report, axis2_report, percent, min_A=min_A, min_D=min_D,
+        min_A_frac=min_A_frac, selection_stat_weight=selection_stat_weight)
+    selected_per_class = per_class_abcd_at_thresholds(
+        axis1_report, axis2_report, labels_report, baseline_labels, t1_opt, t2_opt)
 
     print(f"Optimized on tune split: p1={best_tune['p1']:.3f}, p2={best_tune['p2']:.3f}", flush=True)
     print(f"Thresholds: t1={t1_opt:.4g}, t2={t2_opt:.4g}", flush=True)
@@ -584,13 +690,19 @@ def ABCD(config):
     )
 
     diagnostics["abcd_selection"] = {
+        "scope": scope_name,
         "mode": closure_mode,
         "holdout_frac": holdout_frac,
         "split_seed": split_seed,
+        "min_A": min_A,
+        "min_A_frac": min_A_frac,
+        "min_D": min_D,
+        "selection_stat_weight": selection_stat_weight,
         "tune_n": int(len(axis1_tune)),
         "report_n": int(len(axis1_report)),
         "tune_best": best_tune,
         "report_at_selected": report_at_selected,
+        "report_at_selected_per_class": selected_per_class,
         "report_best_for_reference": best_report_scan,
     }
     diagnostics["abcd_grid"] = grid_summary
@@ -613,11 +725,13 @@ def ABCD(config):
         "ABCD/legacy_nonclosure": float(report_at_selected["legacy_nonclosure"]),
         "ABCD/log_nonclosure": float(report_at_selected["log_nonclosure"]),
         "ABCD/ratio_pred_over_true": float(report_at_selected["ratio"]),
+        "ABCD/selection_score": float(report_at_selected["selection_score"]),
         "ABCD/tune_nonclosure": float(best_tune["nonclosure"]),
         "ABCD/tune_log_nonclosure": float(best_tune["log_nonclosure"]),
         "ABCD/report_best_nonclosure": float(best_report_scan.get("nonclosure", np.nan)),
         "ABCD/report_best_log_nonclosure": float(best_report_scan.get("log_nonclosure", np.nan)),
-        "ABCD/closure_mode_holdout": int(closure_mode == "holdout"),
+        "ABCD/scope_all_baselines": int(scope_name == "all_baselines"),
+        "ABCD/closure_mode_holdout": int(closure_mode.startswith("holdout")),
         "ABCD/grid_mean_abs_nonclosure": grid_summary["mean_abs_nonclosure"],
         "ABCD/grid_median_abs_nonclosure": grid_summary["median_abs_nonclosure"],
         "ABCD/grid_p90_abs_nonclosure": grid_summary["p90_abs_nonclosure"],
@@ -626,12 +740,39 @@ def ABCD(config):
         "ABCD/C": int(report_at_selected["C"]), "ABCD/D": int(report_at_selected["D"]),
     })
 
+    if sig_axis1 is not None and sig_axis2 is not None:
+        sig_A, sig_B, sig_C, sig_D = abcd_counts_at_thresholds(sig_axis1, sig_axis2, t1_opt, t2_opt)
+        sig_total = max(len(sig_axis1), 1)
+        signal_metrics = {
+            "N": int(len(sig_axis1)),
+            "A": int(sig_A),
+            "B": int(sig_B),
+            "C": int(sig_C),
+            "D": int(sig_D),
+            "eff_A": float(sig_A / sig_total),
+            "eff_B": float(sig_B / sig_total),
+            "eff_C": float(sig_C / sig_total),
+            "eff_D": float(sig_D / sig_total),
+            "s_over_sqrt_Ahat": float(sig_A / np.sqrt(max(report_at_selected["A_hat"], 1e-8))),
+            "s_over_sqrt_A": float(sig_A / np.sqrt(max(report_at_selected["A"], 1e-8))),
+        }
+        diagnostics["signal_at_selected"] = signal_metrics
+        wandb.log({
+            "Signal/A": signal_metrics["A"],
+            "Signal/eff_A": signal_metrics["eff_A"],
+            "Signal/eff_B": signal_metrics["eff_B"],
+            "Signal/eff_C": signal_metrics["eff_C"],
+            "Signal/eff_D": signal_metrics["eff_D"],
+            "Signal/S_over_sqrt_Ahat": signal_metrics["s_over_sqrt_Ahat"],
+            "Signal/S_over_sqrt_A": signal_metrics["s_over_sqrt_A"],
+        })
+
     # ── Plots ─────────────────────────────────────────────────────────────────
     fs, fs_leg, fs_legend = 28, 24, 16
     fig_size = (8, 6)
 
-    class_names  = {0: "DY", 1: "QCD", 2: "TT", 3: "WJets"}
-    class_colors = {0: "tab:blue", 1: "tab:orange", 2: "tab:green", 3: "tab:red"}
+    class_names  = CLASS_NAMES
+    class_colors = CLASS_COLORS
 
     # 2D histogram (all bkg)
     fig = plt.figure(figsize=(6, 5))
@@ -677,6 +818,7 @@ def ABCD(config):
         plt.hist2d(sig_axis1, sig_axis2, bins=[xbins_s, ybins_s], norm=LogNorm(vmin=1), cmin=1)
         plt.xscale("log"); plt.yscale("log")
         plt.axvline(t1_opt, color="black", linestyle="--", linewidth=1.0)
+        plt.axhline(t2_opt, color="black", linestyle="--", linewidth=1.0)
         plt.xlabel("AE reco loss", fontsize=fs)
         plt.ylabel("NURD Contrastive score (MD)", fontsize=fs)
         plt.title("AE vs NURD Contrastive — TpTp (signal)"); plt.colorbar(label="Counts")
@@ -789,7 +931,7 @@ def ABCD(config):
     # PCA embedding scatter + KDE
     if not config.get("skip_embedding_pca"):
         pca2 = PCA(n_components=2)
-        pca2.fit(latents_masked[labels_masked == 1])
+        pca2.fit(latents_masked[labels_masked == qcd_label])
         emb_2d = pca2.transform(latents_masked)
         sig_emb_2d = pca2.transform(sig_latents_masked) if sig_latents_masked is not None else None
 
@@ -806,7 +948,7 @@ def ABCD(config):
                        s=0.5, alpha=0.4, color="tab:purple", label="TpTp", rasterized=True)
         ax.set_xlabel("PCA Component 1", fontsize=fs)
         ax.set_ylabel("PCA Component 2", fontsize=fs)
-        ax.set_title("NURD latent — PCA scatter (fit on QCD)")
+        ax.set_title(f"NURD latent — PCA scatter (fit on {CLASS_NAMES.get(qcd_label, qcd_label)})")
         ax.legend(markerscale=10, fontsize=fs_legend)
         plt.tick_params(axis="x", labelsize=fs_leg)
         plt.tick_params(axis="y", labelsize=fs_leg)
@@ -836,7 +978,9 @@ def ABCD(config):
             ax.set_ylabel(f"PCA Component {cj + 1}", fontsize=fs)
             ax.legend(markerscale=10, fontsize=fs_legend)
             ax.tick_params(axis="both", labelsize=fs_leg)
-        fig.suptitle("PCA-MD space — pairwise components (NURD latent, fit on QCD)", fontsize=fs)
+        fig.suptitle(
+            f"PCA-MD space — pairwise components (NURD latent, fit on {CLASS_NAMES.get(qcd_label, qcd_label)})",
+            fontsize=fs)
         plt.tight_layout()
         out_corner = os.path.join(plot_dir, "pca_corner.png")
         fig.savefig(out_corner, dpi=200, bbox_inches="tight"); plt.close(fig)
@@ -971,11 +1115,18 @@ def ABCD(config):
             "tune_log_nonclosure": float(best_tune["log_nonclosure"]),
             "report_best_nonclosure": float(best_report_scan.get("nonclosure", np.nan)),
             "report_best_log_nonclosure": float(best_report_scan.get("log_nonclosure", np.nan)),
+            "abcd_scope": scope_name,
             "closure_mode": closure_mode,
+            "min_A": min_A,
+            "min_A_frac": min_A_frac,
+            "min_D": min_D,
+            "selection_stat_weight": selection_stat_weight,
             "report_A": int(report_at_selected["A"]),
             "report_B": int(report_at_selected["B"]),
             "report_C": int(report_at_selected["C"]),
             "report_D": int(report_at_selected["D"]),
+            "report_per_class": selected_per_class,
+            "signal_at_selected": diagnostics.get("signal_at_selected"),
         }, f, indent=2)
     print(f"Thresholds saved to: {thresholds_path}", flush=True)
 
@@ -1000,6 +1151,20 @@ if __name__ == "__main__":
     parser.add_argument("--outdir",       default="outputs_abcd")
     parser.add_argument("--min_A",        type=int, default=50)
     parser.add_argument("--min_D",        type=int, default=500)
+    parser.add_argument("--min_A_frac",   type=float, default=0.0,
+                        help="Minimum A-region fraction on the threshold-tuning sample. "
+                             "Useful to avoid low-stat working points.")
+    parser.add_argument("--selection_stat_weight", type=float, default=0.0,
+                        help="Add this times the tune-split ABCD ratio uncertainty to the "
+                             "threshold-selection score.")
+    parser.add_argument("--scan_percent_min", type=float, default=0.50)
+    parser.add_argument("--scan_percent_max", type=float, default=0.98)
+    parser.add_argument("--scan_percent_steps", type=int, default=48)
+    parser.add_argument("--abcd_scope", default="qcd", choices=["qcd", "all_baselines", "baselines"],
+                        help="Event population used for ABCD threshold selection and reporting.")
+    parser.add_argument("--baseline_labels", default="0,1,2,3",
+                        help="Comma/space-separated baseline background labels.")
+    parser.add_argument("--qcd_label", type=int, default=1)
     parser.add_argument("--n_pca",        type=int, default=None,
                         help="Number of PCA components for MD (default: keep all latent dims)")
     parser.add_argument("--batch_size",   type=int, default=512,
@@ -1023,6 +1188,6 @@ if __name__ == "__main__":
     parser.add_argument("--skip_pca_md_plots",   action="store_true")
     parser.add_argument("--skip_embedding_pca",  action="store_true")
     parser.add_argument("--min_md",              action="store_true",
-                        help="Use min-MD across DY+QCD+WJets (labels 0,1,3) instead of QCD-only MD")
+                        help="Use min-MD across --baseline_labels instead of QCD-only MD")
     args = parser.parse_args()
     ABCD(vars(args))
