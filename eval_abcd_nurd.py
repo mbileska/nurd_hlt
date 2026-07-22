@@ -541,7 +541,10 @@ def ABCD(config):
         print(f"Signal events after masking: {sig_mask.sum()}", flush=True)
 
     # ── ABCD scan ─────────────────────────────────────────────────────────────
-    percent = np.linspace(0.50, 0.98, 48)
+    percent = np.linspace(
+        float(config.get("scan_percent_min", 0.50)),
+        float(config.get("scan_percent_max", 0.98)),
+        int(config.get("scan_percent_steps", 48)))
     min_A   = int(config.get("min_A", 50))
     min_D   = int(config.get("min_D", 500))
     holdout_frac = float(config.get("closure_holdout_frac", 0.5))
@@ -879,13 +882,27 @@ def ABCD(config):
         fig.savefig(out_p, dpi=200, bbox_inches="tight"); plt.close(fig)
         wandb.log({f"Profiles/{key}": wandb.Image(out_p)})
 
-    # 1D closure scan
+    # 1D closure scan. Keep this separate from the ABCD working-point scan so
+    # the diagnostic plot can be widened without changing threshold selection.
     effs, closure_ratio, closure_unc = [], [], []
     curve_axis1 = axis1_report
     curve_axis2 = axis2_report
     Ntot_bkg = float(len(curve_axis1))
+    curve_percent_min = config.get("closure_curve_percent_min")
+    curve_percent_max = config.get("closure_curve_percent_max")
+    curve_percent_steps = config.get("closure_curve_percent_steps")
+    if curve_percent_min is None:
+        curve_percent_min = config.get("scan_percent_min", 0.50)
+    if curve_percent_max is None:
+        curve_percent_max = config.get("scan_percent_max", 0.98)
+    if curve_percent_steps is None:
+        curve_percent_steps = config.get("scan_percent_steps", 48)
+    curve_percent = np.linspace(
+        float(curve_percent_min),
+        float(curve_percent_max),
+        int(curve_percent_steps))
 
-    for p in percent:
+    for p in curve_percent:
         t1, t2, A, B, C, D = abcd_counts(curve_axis1, curve_axis2, p, p)
         A_hat  = (B * C) / max(D, 1e-8)
         ratio  = A_hat / max(A, 1e-8)
@@ -915,6 +932,9 @@ def ABCD(config):
         "p90_abs_ratio_minus1": float(np.quantile(curve_abs, 0.90)) if curve_abs.size else np.nan,
         "min_ratio": float(np.min(closure_ratio)) if closure_ratio.size else np.nan,
         "max_ratio": float(np.max(closure_ratio)) if closure_ratio.size else np.nan,
+        "percent_min": float(curve_percent.min()) if curve_percent.size else np.nan,
+        "percent_max": float(curve_percent.max()) if curve_percent.size else np.nan,
+        "percent_steps": int(curve_percent.size),
     }
     tail = effs <= 0.02
     if tail.any():
@@ -947,6 +967,17 @@ def ABCD(config):
     ax.set_xlabel("Selection Efficiency (bkg A/Ntot)", fontsize=fs)
     ax.set_ylabel("Predicted Bkg. / True Bkg.",        fontsize=fs)
     ax.set_ylim([0.0, 1.5]); ax.set_xscale("log")
+    x_min_cfg = config.get("closure_curve_xmin", None)
+    x_max_cfg = config.get("closure_curve_xmax", None)
+    finite_eff = effs[np.isfinite(effs) & (effs > 0)]
+    if x_min_cfg is not None or x_max_cfg is not None:
+        left = float(x_min_cfg) if x_min_cfg is not None else (
+            max(float(finite_eff.min()) * 0.8, 1e-6) if finite_eff.size else 1e-6)
+        right = float(x_max_cfg) if x_max_cfg is not None else (
+            min(float(finite_eff.max()) * 1.2, 1.0) if finite_eff.size else 1.0)
+        if right <= left:
+            raise ValueError(f"Invalid closure curve x-limits: xmin={left}, xmax={right}")
+        ax.set_xlim(left, right)
     plt.tick_params(axis="x", labelsize=fs_leg)
     plt.tick_params(axis="y", labelsize=fs_leg)
     plt.legend(loc="lower right", fontsize=fs_legend)
@@ -1000,6 +1031,20 @@ if __name__ == "__main__":
     parser.add_argument("--outdir",       default="outputs_abcd")
     parser.add_argument("--min_A",        type=int, default=50)
     parser.add_argument("--min_D",        type=int, default=500)
+    parser.add_argument("--scan_percent_min", type=float, default=0.50)
+    parser.add_argument("--scan_percent_max", type=float, default=0.98)
+    parser.add_argument("--scan_percent_steps", type=int, default=48)
+    parser.add_argument("--closure_curve_percent_min", type=float, default=None,
+                        help="Lowest diagonal quantile used only for the closure-curve plot. "
+                             "Lower values extend the plot to looser/right-side selections.")
+    parser.add_argument("--closure_curve_percent_max", type=float, default=None,
+                        help="Highest diagonal quantile used only for the closure-curve plot.")
+    parser.add_argument("--closure_curve_percent_steps", type=int, default=None,
+                        help="Number of diagonal points used only for the closure-curve plot.")
+    parser.add_argument("--closure_curve_xmin", type=float, default=None,
+                        help="Optional lower x-axis limit for the closure-curve plot.")
+    parser.add_argument("--closure_curve_xmax", type=float, default=None,
+                        help="Optional upper x-axis limit for the closure-curve plot.")
     parser.add_argument("--n_pca",        type=int, default=None,
                         help="Number of PCA components for MD (default: keep all latent dims)")
     parser.add_argument("--batch_size",   type=int, default=512,
