@@ -356,6 +356,42 @@ def closure_scope_labels(labels, args):
     return [int(label) for label in candidates]
 
 
+def compute_class_md_map(activations, labels, args, md_proxy=None, update=True):
+    """Score every event against every available baseline-class reference."""
+    scores = {}
+    for label in args.baseline_labels_values:
+        reference_mask = labels.long() == int(label)
+        if reference_mask.sum() < 2:
+            continue
+        scores[int(label)] = compute_proxy_md(
+            activations, reference_mask, md_proxy=md_proxy,
+            proxy_type=args.md_proxy_type, update=update, label=label)
+    return scores
+
+
+def smooth_union_md(class_md, temperature=1.0):
+    """Smooth min-MD, normalized so non-negative MD inputs give a non-negative score."""
+    if not class_md:
+        raise ValueError("smooth_union_md requires at least one class score.")
+    matrix = torch.stack([class_md[label] for label in sorted(class_md)], dim=1).float()
+    temperature = max(float(temperature), 1e-4)
+    return -temperature * (
+        torch.logsumexp(-matrix / temperature, dim=1)
+        - math.log(matrix.size(1))
+    )
+
+
+def closure_population_mask(labels, scope, args):
+    if scope == "qcd":
+        return labels.long() == int(args.qcd_label)
+    if scope in {"baselines", "all_baselines"}:
+        mask = torch.zeros_like(labels, dtype=torch.bool)
+        for label in args.baseline_labels_values:
+            mask |= labels.long() == int(label)
+        return mask
+    return torch.ones_like(labels, dtype=torch.bool)
+
+
 def compute_scoped_closure_loss(activations, labels, ae_reco, args, md_proxy=None,
                                 update=True):
     losses = []
@@ -368,32 +404,61 @@ def compute_scoped_closure_loss(activations, labels, ae_reco, args, md_proxy=Non
         "tail_abcd": [],
     }
     counts = {}
+    class_md = compute_class_md_map(
+        activations, labels, args, md_proxy=md_proxy, update=update)
 
-    for label in closure_scope_labels(labels, args):
-        mask = labels.long() == int(label)
-        n = int(mask.sum().item())
-        if n < args.closure_class_min_events:
-            continue
-        proxy_md_values = compute_proxy_md(
-            activations, mask, md_proxy=md_proxy,
-            proxy_type=args.md_proxy_type, update=update, label=label)
-        if args.closure_loss_type == "abcd":
-            nw = torch.ones(n, device=activations.device)
-            class_loss = closure_loss_batch(
-                ae_reco[mask].float(), proxy_md_values[mask].float(), nw)
-            corr_val = _safe_pearson_torch(ae_reco[mask], proxy_md_values[mask])
-            class_diag = {"corr": corr_val}
-        else:
-            class_loss, corr_val, class_diag = closure_dependency_loss(
-                ae_reco[mask], proxy_md_values[mask], args)
-        losses.append(class_loss)
-        weights.append(float(n) if args.closure_class_weighting == "count" else 1.0)
-        counts[int(label)] = n
-        if corr_val is not None:
-            diag_values["corr"].append(float(corr_val))
-        for key in ("dcorr", "profile", "profile_reverse", "tail_abcd"):
-            if class_diag.get(key) is not None:
-                diag_values[key].append(float(class_diag[key]))
+    if args.closure_score_mode in {"own_class", "hybrid"}:
+        for label in closure_scope_labels(labels, args):
+            mask = labels.long() == int(label)
+            n = int(mask.sum().item())
+            if n < args.closure_class_min_events or int(label) not in class_md:
+                continue
+            proxy_md_values = class_md[int(label)]
+            if args.closure_loss_type == "abcd":
+                nw = torch.ones(n, device=activations.device)
+                class_loss = closure_loss_batch(
+                    ae_reco[mask].float(), proxy_md_values[mask].float(), nw)
+                corr_val = _safe_pearson_torch(ae_reco[mask], proxy_md_values[mask])
+                class_diag = {"corr": corr_val}
+            else:
+                class_loss, corr_val, class_diag = closure_dependency_loss(
+                    ae_reco[mask], proxy_md_values[mask], args)
+            losses.append(args.closure_own_weight * class_loss)
+            weights.append(float(n) if args.closure_class_weighting == "count" else 1.0)
+            counts[int(label)] = n
+            if corr_val is not None:
+                diag_values["corr"].append(float(corr_val))
+            for key in ("dcorr", "profile", "profile_reverse", "tail_abcd"):
+                if class_diag.get(key) is not None:
+                    diag_values[key].append(float(class_diag[key]))
+
+    if (
+        args.closure_score_mode in {"union", "hybrid"}
+        and len(class_md) == len(args.baseline_labels_values)
+    ):
+        union_mask = closure_population_mask(labels, args.closure_union_scope, args)
+        union_n = int(union_mask.sum().item())
+        if union_n >= args.closure_class_min_events:
+            union_score = smooth_union_md(class_md, args.closure_union_temperature)
+            if args.closure_loss_type == "abcd":
+                nw = torch.ones(union_n, device=activations.device)
+                union_loss = closure_loss_batch(
+                    ae_reco[union_mask].float(), union_score[union_mask].float(), nw)
+                union_corr = _safe_pearson_torch(
+                    ae_reco[union_mask], union_score[union_mask])
+                union_diag = {"corr": union_corr}
+            else:
+                union_loss, union_corr, union_diag = closure_dependency_loss(
+                    ae_reco[union_mask], union_score[union_mask], args)
+            losses.append(args.closure_union_weight * union_loss)
+            weights.append(1.0)
+            counts.setdefault(int(args.qcd_label), union_n)
+            diag_values["union_corr"] = (
+                [float(union_corr)] if union_corr is not None else [])
+            for key in ("dcorr", "profile", "profile_reverse", "tail_abcd"):
+                if union_diag.get(key) is not None:
+                    diag_values.setdefault(f"union_{key}", []).append(
+                        float(union_diag[key]))
 
     if not losses:
         zero = activations.sum() * 0.0
@@ -592,6 +657,20 @@ parser.add_argument("--closure_class_min_events", default=20, type=int,
                     help="Minimum events from a class in a batch before adding its closure term.")
 parser.add_argument("--closure_class_weighting", default="equal", choices=["equal", "count"],
                     help="Average per-class closure terms equally or proportional to class count.")
+parser.add_argument("--closure_score_mode", default="hybrid",
+                    choices=["own_class", "union", "hybrid"],
+                    help="Apply direct closure to each class's own MD, to a smooth all-class "
+                         "union score, or to both. The union term aligns training with the "
+                         "deployable all-background anomaly score.")
+parser.add_argument("--closure_union_scope", default="qcd",
+                    choices=["qcd", "baselines", "all_baselines", "all"],
+                    help="Event population used by the smooth all-class union closure term.")
+parser.add_argument("--closure_union_temperature", default=1.0, type=float,
+                    help="Temperature of the differentiable min over per-class EMA MD scores.")
+parser.add_argument("--closure_own_weight", default=0.5, type=float,
+                    help="Relative weight of auxiliary own-class closure terms.")
+parser.add_argument("--closure_union_weight", default=1.0, type=float,
+                    help="Relative weight of the deployed-score union closure term.")
 parser.add_argument("--closure_weight_start", default=0.0, type=float,
                     help="Starting closure weight; cosine-ramped to --closure_weight.")
 parser.add_argument("--closure_ramp_epochs", default=10, type=int,
@@ -987,6 +1066,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
     critic_qcd_acc_m = AverageMeter()  # same, restricted to QCD when available
     critic_scope_frac_m = AverageMeter()
     closure_proxy_corr_m = AverageMeter()
+    closure_union_corr_m = AverageMeter()
     closure_classes_m = AverageMeter()
     weight_cv_m = AverageMeter()  # coeff. of variation of NURD weights (std/mean); 0 = uniform, >1 = heavy tails
     weight_ess_m = AverageMeter() # effective sample size fraction: ESS/N; 1.0 = no reweighting cost
@@ -1186,6 +1266,9 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                 closure_classes_m.update(len(closure_counts), inputs.size(0))
                 if closure_diag.get("corr") is not None:
                     closure_proxy_corr_m.update(closure_diag["corr"], n_closure)
+                if closure_diag.get("union_corr") is not None:
+                    closure_union_corr_m.update(
+                        closure_diag["union_corr"], n_closure)
                 if closure_diag.get("dcorr") is not None:
                     closure_dcorr_m.update(closure_diag["dcorr"], n_closure)
                 if closure_diag.get("profile") is not None:
@@ -1224,6 +1307,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
               f"mi={mi_m.avg:.5f}  raw_mi={raw_mi_m.avg:.5f}  "
               f"crit_acc={critic_acc_m.avg:.3f}  qcd_crit_acc={critic_qcd_acc_m.avg:.3f}  "
               f"closure_proxy_r={closure_proxy_corr_m.avg:.3f}  "
+              f"closure_union_r={closure_union_corr_m.avg:.3f}  "
               f"closure_classes={closure_classes_m.avg:.1f}  "
               f"w_cv={weight_cv_m.avg:.3f}  w_ess={weight_ess_m.avg:.3f}  "
               f"cw={contrast_w:.3f}  clw={closure_w:.3f}  lr={current_lr:.2e}")
@@ -1246,6 +1330,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
             "Train/critic_qcd_acc":   critic_qcd_acc_m.avg,
             "Train/critic_scope_frac": critic_scope_frac_m.avg,
             "Train/closure_proxy_pearson": closure_proxy_corr_m.avg,
+            "Train/closure_union_pearson": closure_union_corr_m.avg,
             "Train/closure_classes":   closure_classes_m.avg,
             "Train/nurd_weight_cv":   weight_cv_m.avg,
             "Train/nurd_weight_ess":  weight_ess_m.avg,
@@ -1268,6 +1353,8 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args, md_proxy=N
     qcd_proxy_corr_m = AverageMeter()
     x_chunks_by_class = {}
     y_chunks_by_class = {}
+    union_x_chunks = []
+    union_y_chunks = []
 
     model.eval()
     with torch.no_grad():
@@ -1285,13 +1372,16 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args, md_proxy=N
                 rw_acc, rw_loss = record_rw_metrics(
                     rw_acc, rw_loss, inputs, outputs, targets, losses,
                     exact_weights)
+            class_md = compute_class_md_map(
+                activations, targets, args, md_proxy=md_proxy, update=False)
             for label in closure_scope_labels(targets, args):
                 cls_mask = targets.long() == int(label)
-                if cls_mask.sum() < args.closure_class_min_events:
+                if (
+                    cls_mask.sum() < args.closure_class_min_events
+                    or int(label) not in class_md
+                ):
                     continue
-                proxy_md_values = compute_proxy_md(
-                    activations, cls_mask, md_proxy=md_proxy,
-                    proxy_type=args.md_proxy_type, update=False, label=label)
+                proxy_md_values = class_md[int(label)]
                 x_log = torch.log(ae_reco[cls_mask].float().clamp(min=1e-8))
                 y_log = torch.log1p(proxy_md_values[cls_mask].float().clamp(min=0.0))
                 corr_val = _safe_pearson_torch(x_log, y_log)
@@ -1301,12 +1391,27 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args, md_proxy=N
                         qcd_proxy_corr_m.update(corr_val, int(cls_mask.sum().item()))
                 x_chunks_by_class.setdefault(int(label), []).append(x_log.detach().cpu().numpy())
                 y_chunks_by_class.setdefault(int(label), []).append(y_log.detach().cpu().numpy())
+            if (
+                args.closure_score_mode in {"union", "hybrid"}
+                and len(class_md) == len(args.baseline_labels_values)
+            ):
+                union_mask = closure_population_mask(
+                    targets, args.closure_union_scope, args)
+                if union_mask.sum() >= args.closure_class_min_events:
+                    union_score = smooth_union_md(
+                        class_md, args.closure_union_temperature)
+                    union_x_chunks.append(torch.log(
+                        ae_reco[union_mask].float().clamp(min=1e-8)
+                    ).cpu().numpy())
+                    union_y_chunks.append(torch.log1p(
+                        union_score[union_mask].float().clamp(min=0.0)
+                    ).cpu().numpy())
             batch_time.update(time.time() - end); end = time.time()
 
     val_closure_corr = (
         closure_proxy_corr_m.avg if closure_proxy_corr_m.count > 0 else float("nan"))
     val_qcd_corr = qcd_proxy_corr_m.avg if qcd_proxy_corr_m.count > 0 else float("nan")
-    val_abcd = {"score": float("nan"), "n_points": 0}
+    own_class_abcd = {"score": float("nan"), "n_points": 0}
     if x_chunks_by_class:
         metrics_by_class = {}
         for label in sorted(x_chunks_by_class):
@@ -1316,12 +1421,43 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args, md_proxy=N
                 x_cls, y_cls, args.val_abcd_quantiles_values,
                 min_count=args.val_abcd_min_events,
                 tail_min_quantile=args.val_abcd_tail_min_quantile)
-        val_abcd = aggregate_class_abcd_metrics(metrics_by_class)
+        own_class_abcd = aggregate_class_abcd_metrics(metrics_by_class)
+    union_abcd = {"score": float("nan"), "n_points": 0}
+    if union_x_chunks:
+        union_abcd = abcd_grid_metrics_np(
+            np.concatenate(union_x_chunks),
+            np.concatenate(union_y_chunks),
+            args.val_abcd_quantiles_values,
+            min_count=args.val_abcd_min_events,
+            tail_min_quantile=args.val_abcd_tail_min_quantile)
+
+    own_score = own_class_abcd.get("score", float("nan"))
+    union_score = union_abcd.get("score", float("nan"))
+    if args.closure_score_mode == "own_class":
+        selection_score = own_score
+    elif args.closure_score_mode == "union":
+        selection_score = union_score
+    elif np.isfinite(union_score) and np.isfinite(own_score):
+        selection_score = union_score + 0.25 * own_score
+    else:
+        selection_score = union_score if np.isfinite(union_score) else own_score
+    val_abcd = {
+        "score": float(selection_score),
+        "selection_mode": args.closure_score_mode,
+        "n_points": int(
+            own_class_abcd.get("n_points", 0) + union_abcd.get("n_points", 0)),
+        "own_class": own_class_abcd,
+        "union": union_abcd,
+        "max_p90_abs_log_nonclosure": own_class_abcd.get(
+            "max_p90_abs_log_nonclosure",
+            union_abcd.get("p90_abs_log_nonclosure", float("nan"))),
+    }
     log_metrics(log, epoch, batch_time, loss, top1, acc, rw_loss, rw_acc, split="Val")
     log.debug(f"  closure_proxy_r={val_closure_corr:.3f}  qcd_proxy_r={val_qcd_corr:.3f}  "
               f"proxy_abcd_score={val_abcd.get('score', float('nan')):.5f}  "
               f"proxy_abcd_max_p90={val_abcd.get('max_p90_abs_log_nonclosure', val_abcd.get('p90_abs_log_nonclosure', float('nan'))):.5f}  "
-              f"proxy_abcd_worst_class={val_abcd.get('worst_class', -1)}")
+              f"proxy_abcd_union={union_abcd.get('score', float('nan')):.5f}  "
+              f"proxy_abcd_worst_class={own_class_abcd.get('worst_class', -1)}")
     if not args.local_testing:
         wandb.log({
             "Val/loss":    loss.avg,
@@ -1333,12 +1469,14 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args, md_proxy=N
             "Val/qcd_proxy_pearson": val_qcd_corr,
             "Val/proxy_abcd_score": val_abcd.get("score", float("nan")),
             "Val/proxy_abcd_points": val_abcd.get("n_points", 0),
-            "Val/proxy_abcd_n_classes": val_abcd.get("n_classes", 0),
-            "Val/proxy_abcd_worst_class": val_abcd.get("worst_class", -1),
-            "Val/proxy_abcd_mean_score": val_abcd.get("mean_score", float("nan")),
-            "Val/proxy_abcd_max_score": val_abcd.get("max_score", float("nan")),
-            "Val/proxy_abcd_mean_p90_abs_log_nonclosure": val_abcd.get("mean_p90_abs_log_nonclosure", float("nan")),
+            "Val/proxy_abcd_n_classes": own_class_abcd.get("n_classes", 0),
+            "Val/proxy_abcd_worst_class": own_class_abcd.get("worst_class", -1),
+            "Val/proxy_abcd_mean_score": own_class_abcd.get("mean_score", float("nan")),
+            "Val/proxy_abcd_max_score": own_class_abcd.get("max_score", float("nan")),
+            "Val/proxy_abcd_mean_p90_abs_log_nonclosure": own_class_abcd.get("mean_p90_abs_log_nonclosure", float("nan")),
             "Val/proxy_abcd_max_p90_abs_log_nonclosure": val_abcd.get("max_p90_abs_log_nonclosure", float("nan")),
+            "Val/proxy_abcd_union_score": union_abcd.get("score", float("nan")),
+            "Val/proxy_abcd_union_p90": union_abcd.get("p90_abs_log_nonclosure", float("nan")),
         }, step=epoch)
     return_loss = rw_loss.avg if reweight_args["reweight"] else loss.avg
     return return_loss, acc.avg, rw_acc.avg, val_qcd_corr, val_abcd
@@ -1560,7 +1698,8 @@ def main():
                     "state_dict_model": model.state_dict(),
                     "ae_scaler": obj_scaler,
                     "config": vars(args),
-                    "selection_metric": "val_proxy_abcd_all_baselines_score",
+                    "selection_metric": (
+                        f"val_proxy_abcd_{args.closure_score_mode}_score"),
                     "selection_value": float(val_abcd_score),
                     "selection_val_loss": float(val_loss),
                     "selection_val_qcd_proxy_corr": float(val_qcd_corr),

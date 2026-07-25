@@ -18,6 +18,7 @@ set -u
 BASE="${BASE:-/scratch/gpfs/IOJALVO/mb7126/nurd_hlt}"
 CODE_DIR="${CODE_DIR:-/home/mb7126/nurd_hlt}"
 TEST_PT="${TEST_PT:-$BASE/data/hlt_smcocktail_test.pt}"
+REFERENCE_PT="${REFERENCE_PT:-$BASE/data/hlt_smcocktail_train.pt}"
 SIGNAL_PT="${SIGNAL_PT:-$BASE/data/hlt_signal_TpTp.pt}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-256}"
 AE_BATCH_SIZE="${AE_BATCH_SIZE:-4096}"
@@ -30,8 +31,9 @@ WANDB_RUN_NAME="${WANDB_RUN_NAME:-}"
 PREFER_ABCD_CKPT="${PREFER_ABCD_CKPT:-0}"
 PREFER_CLOSURE_CKPT="${PREFER_CLOSURE_CKPT:-0}"
 BASELINE_LABELS="${BASELINE_LABELS:-0,1,2,3}"
-ABCD_SCOPE="${ABCD_SCOPE:-all_baselines}"
-MIN_MD="${MIN_MD:-1}"
+ABCD_SCOPE="${ABCD_SCOPE:-qcd}"
+SCORE_MODE="${SCORE_MODE:-calibrated_union}"
+MIN_MD="${MIN_MD:-0}"
 MIN_A="${MIN_A:-50}"
 MIN_A_FRAC="${MIN_A_FRAC:-0.02}"
 MIN_D="${MIN_D:-500}"
@@ -92,6 +94,10 @@ if [[ ! -f "$TEST_PT" ]]; then
   echo "ERROR: test sample not found: $TEST_PT"
   exit 2
 fi
+if [[ ! -f "$REFERENCE_PT" ]]; then
+  echo "ERROR: training reference sample not found: $REFERENCE_PT"
+  exit 2
+fi
 
 SIGNAL_ARGS=()
 if [[ -n "${SIGNAL_PT:-}" && -f "$SIGNAL_PT" ]]; then
@@ -116,6 +122,7 @@ echo "Results: $OUTDIR"
 echo "AE_CKPT: $AE_CKPT"
 echo "CKPT: $CKPT"
 echo "TEST_PT: $TEST_PT"
+echo "REFERENCE_PT: $REFERENCE_PT"
 echo "SIGNAL_PT: ${SIGNAL_PT:-}"
 echo "EVAL_BATCH_SIZE: $EVAL_BATCH_SIZE"
 echo "AE_BATCH_SIZE: $AE_BATCH_SIZE"
@@ -126,6 +133,7 @@ echo "CLOSURE_HOLDOUT_FRAC: $CLOSURE_HOLDOUT_FRAC"
 echo "CLOSURE_SPLIT_SEED: $CLOSURE_SPLIT_SEED"
 echo "BASELINE_LABELS: $BASELINE_LABELS"
 echo "ABCD_SCOPE: $ABCD_SCOPE"
+echo "SCORE_MODE: $SCORE_MODE"
 echo "MIN_MD: $MIN_MD"
 echo "MIN_A: $MIN_A"
 echo "MIN_A_FRAC: $MIN_A_FRAC"
@@ -152,6 +160,7 @@ python eval_abcd_nurd.py \
   --ckpt "$CKPT" \
   --ae_ckpt "$AE_CKPT" \
   --test_pt "$TEST_PT" \
+  --reference_pt "$REFERENCE_PT" \
   "${SIGNAL_ARGS[@]}" \
   --outdir "$OUTDIR" \
   --wandb_project nurd-ood-hlt \
@@ -163,6 +172,7 @@ python eval_abcd_nurd.py \
   --dcor_sample_size "$DCOR_SAMPLE_SIZE" \
   --baseline_labels "$BASELINE_LABELS" \
   --abcd_scope "$ABCD_SCOPE" \
+  --score_mode "$SCORE_MODE" \
   --min_A "$MIN_A" \
   --min_A_frac "$MIN_A_FRAC" \
   --min_D "$MIN_D" \

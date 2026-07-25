@@ -1,19 +1,8 @@
-"""
-ABCD eval for the NURD contrastive checkpoint (hlt_nurd_con).
+"""Evaluate AE loss against a frozen, class-calibrated NURD anomaly score.
 
-Axis 1: AE reco loss (HLTAutoencoder, loaded from separate ae_ckpt)
-Axis 2: Mahalanobis distance in PCA-whitened NURD latent space
-
-Usage
------
-python eval_abcd_nurd.py \
-    --ckpt      /eos/user/e/escheull/ssl_checkpoints/hlt/hlt/hlt_nurd_run_epoch_critic/checkpoint_main.pth.tar \
-    --ae_ckpt   /eos/user/e/escheull/ssl_checkpoints/hlt/hlt/ae_pretrain/checkpoint_ae.pth \
-    --test_pt   /eos/user/e/escheull/smcocktail_1M_noZB/hlt_smcocktail_test.pt \
-    [--signal_pt /eos/user/e/escheull/signal_pt/hlt_signal_TpTp.pt] \
-    [--n_pca 6] \
-    [--outdir /eos/user/e/escheull/abcd_outputs] \
-    [--wandb_run_name nurd_abcd_v1]
+The training file fits class-conditional latent references, calibrates their
+tail probabilities, and supplies a disjoint validation subset for ABCD
+threshold selection. The test file is used only for the final closure report.
 """
 import os
 import gc
@@ -21,17 +10,17 @@ import json
 import argparse
 import numpy as np
 import torch
-import torch.nn.functional as F
 import wandb
-from sklearn.metrics import roc_auc_score
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from scipy.stats import binned_statistic, gaussian_kde, pearsonr, spearmanr
 from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
 from matplotlib.lines import Line2D
 
 from models.hlt_con import HLTContrastiveModel
 from models.hlt_autoencoder import HLTAutoencoder
+from utils.hlt_score_calibration import fit_class_references, score_latents
 
 CLASS_NAMES = {0: "DY", 1: "QCD", 2: "TT", 3: "WJets"}
 CLASS_COLORS = {0: "tab:blue", 1: "tab:orange", 2: "tab:green", 3: "tab:red"}
@@ -381,7 +370,7 @@ def compute_ae_scores(ae, ae_scaler, pt_path, device, batch_size=4096):
 
 
 def embed_pf(model, pt_path, device, batch_size=512):
-    """Run NURD encoder on PF candidates; return (latents [N,D], labels [N])."""
+    """Run NURD encoder; return latents, classifier logits, and labels."""
     raw    = torch.load(pt_path, map_location="cpu")
     pf     = torch.nan_to_num(raw["pf"], nan=0.0, posinf=0.0, neginf=0.0)
     labels = raw["label"].numpy()
@@ -389,72 +378,55 @@ def embed_pf(model, pt_path, device, batch_size=512):
     print(f"  Encoder inference on {N} events from {pt_path}...", flush=True)
 
     latents = []
+    logits = []
     with torch.no_grad():
         for i0 in range(0, N, batch_size):
             xb = pf[i0:i0 + batch_size].to(device)
-            latent, _ = model(xb)
+            latent, output = model(xb)
             latents.append(latent.cpu())
-    return torch.cat(latents, dim=0).numpy(), labels
+            logits.append(output.cpu())
+    del raw, pf
+    return (
+        torch.cat(latents, dim=0).numpy(),
+        torch.cat(logits, dim=0).numpy(),
+        labels,
+    )
 
 
-def _fit_class_transform(embeddings, mask, n_pca, class_name):
-    """Fit PCA whitening on embeddings[mask]. Returns (mu, W)."""
-    ref = embeddings[mask]
-    print(f"  Fitting PCA whitening on {mask.sum()} {class_name} events (dim={ref.shape[1]})...", flush=True)
-    mu = ref.mean(axis=0)
-    centered = ref - mu
-    cov = (centered.T @ centered) / ref.shape[0]
-    L, V = np.linalg.eigh(cov)
-    if n_pca is not None:
-        V = V[:, -n_pca:]
-        L = L[-n_pca:]
-        print(f"    Using top {n_pca} PCA components", flush=True)
-    L = np.clip(L, 1e-6, None)
-    W = V / np.sqrt(L)
-    return mu, W
+def make_reference_splits(labels, val_fraction=0.1, calibration_fraction=0.5,
+                          seed=42):
+    """Reproduce training split, then divide untouched validation into calibration/tuning."""
+    labels = np.asarray(labels)
+    indices = np.arange(labels.shape[0])
+    train_indices, tune_indices = train_test_split(
+        indices, test_size=val_fraction, random_state=seed, stratify=labels)
+    calibration_indices, tune_indices = train_test_split(
+        tune_indices, train_size=calibration_fraction, random_state=seed + 1,
+        stratify=labels[tune_indices])
+    return train_indices, calibration_indices, tune_indices
 
 
-def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None, bkg_labels=None):
-    """
-    Embed all events, fit PCA whitening per background class, return MD scores.
-
-    bkg_labels: list of class labels to use as reference.
-      [1]       (default) → QCD-only MD.
-      [0, 1, 2, 3] → min-MD across DY, QCD, TT, WJets (element-wise minimum).
-
-    Returns (md [N], labels [N], mu_qcd, W_qcd, latents [N,D], class_transforms).
-    class_transforms is a list of (label, mu, W) — reuse for signal inference.
-    """
-    if bkg_labels is None:
-        bkg_labels = [1]
-
-    latents, labels = embed_pf(model, pt_path, device, batch_size)
-
-    class_transforms = []
-    for cls in bkg_labels:
-        mask = (labels == cls)
-        if mask.sum() < 10:
-            print(f"  WARNING: class {cls} has only {mask.sum()} events — skipping", flush=True)
-            continue
-        mu, W = _fit_class_transform(latents, mask, n_pca, CLASS_NAMES.get(cls, str(cls)))
-        class_transforms.append((cls, mu, W))
-
-    if not class_transforms:
-        raise RuntimeError("No background classes with enough events.")
-
-    md_per_class = []
-    for cls, mu_c, W_c in class_transforms:
-        z_c = (latents - mu_c) @ W_c
-        md_per_class.append((z_c * z_c).sum(axis=1))
-    md = np.stack(md_per_class, axis=0).min(axis=0).astype(np.float32)
-
-    if len(class_transforms) > 1:
-        print(f"  Min-MD across classes {[c for c,_,_ in class_transforms]}", flush=True)
-
-    qcd_entry = next((t for t in class_transforms if t[0] == 1), class_transforms[0])
-    mu_qcd, W_qcd = qcd_entry[1], qcd_entry[2]
-
-    return md, labels, mu_qcd, W_qcd, latents, class_transforms
+def class_assignment_diagnostics(true_labels, score_products):
+    reference_labels = score_products["reference_labels"]
+    true_labels = np.asarray(true_labels)
+    result = {}
+    for name, key in (
+        ("classifier", "classifier_route_index"),
+        ("gaussian", "gaussian_route_index"),
+        ("typicality", "typicality_route_index"),
+    ):
+        predicted = reference_labels[score_products[key]]
+        valid = np.isin(true_labels, reference_labels)
+        matrix = np.zeros((len(reference_labels), len(reference_labels)), dtype=np.int64)
+        for row, true_label in enumerate(reference_labels):
+            for column, predicted_label in enumerate(reference_labels):
+                matrix[row, column] = np.count_nonzero(
+                    (true_labels == true_label) & (predicted == predicted_label))
+        result[name] = {
+            "accuracy": float(np.mean(predicted[valid] == true_labels[valid])) if valid.any() else np.nan,
+            "confusion_matrix": matrix.tolist(),
+        }
+    return result
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -480,16 +452,36 @@ def ABCD(config):
     baseline_labels = parse_int_list(config.get("baseline_labels", "0,1,2,3"))
     qcd_label = int(config.get("qcd_label", 1))
     abcd_scope = config.get("abcd_scope", "qcd")
+    score_mode = config.get("score_mode", "calibrated_union")
+    reference_pt = config.get("reference_pt")
     if not baseline_labels:
         raise ValueError("baseline_labels must contain at least one label")
+    if bool(config.get("min_md")):
+        print("WARNING: --min_md is deprecated; using score_mode=min_md.", flush=True)
+        score_mode = "min_md"
+    score_label = {
+        "calibrated_union": "Calibrated all-background anomaly score",
+        "mixture_nll": "Background-mixture negative log likelihood",
+        "qcd_md": "QCD Mahalanobis distance",
+        "min_md": "Minimum class Mahalanobis distance",
+        "classifier_routed": "Classifier-routed calibrated anomaly score",
+        "gaussian_routed": "Gaussian-routed calibrated anomaly score",
+    }[score_mode]
 
     # ── load models ───────────────────────────────────────────────────────────
     model, main_ckpt = load_nurd_model(config["ckpt"], device)
     ae_scaler = main_ckpt["ae_scaler"]
     ae = load_ae(config["ae_ckpt"], ae_scaler, device)
 
-    # ── AE scores ─────────────────────────────────────────────────────────────
-    print("Computing AE scores (bkg)...", flush=True)
+    # The reference file is the original training sample. Its model-validation
+    # split selects thresholds; the independent test file is report-only.
+    ae_reference = None
+    if reference_pt:
+        print("Computing AE scores (reference)...", flush=True)
+        ae_reference = compute_ae_scores(
+            ae, ae_scaler, reference_pt, device,
+            batch_size=config.get("ae_batch_size", 4096))
+    print("Computing AE scores (test)...", flush=True)
     ae_bkg = compute_ae_scores(
         ae, ae_scaler, config["test_pt"], device,
         batch_size=config.get("ae_batch_size", 4096))
@@ -500,19 +492,69 @@ def ABCD(config):
     if device == "cuda":
         torch.cuda.empty_cache()
 
-    # ── contrastive MD scores ─────────────────────────────────────────────────
-    use_min_md = bool(config.get("min_md")) or abcd_scope in {"all_baselines", "baselines"}
-    bkg_labels = baseline_labels if use_min_md else [qcd_label]
-    if use_min_md:
-        names = [CLASS_NAMES.get(int(c), str(c)) for c in bkg_labels]
-        print(f"Min-MD mode: axis 2 = min MD across {names}", flush=True)
-    print("Computing contrastive MD scores (bkg)...", flush=True)
-    con_bkg, labels, md_mu, md_W, latents_all, class_transforms = compute_md_scores(
+    print(f"Axis 2 score mode: {score_mode}", flush=True)
+    print(f"ABCD event scope: {abcd_scope}", flush=True)
+    reference_details = {}
+    if reference_pt:
+        print("Computing encoder outputs (reference)...", flush=True)
+        reference_latents, reference_logits, reference_labels = embed_pf(
+            model, reference_pt, device,
+            batch_size=config.get("batch_size", 512))
+        fit_idx, calibration_idx, reference_tune_idx = make_reference_splits(
+            reference_labels,
+            val_fraction=float(config.get("reference_val_fraction", 0.1)),
+            calibration_fraction=float(config.get("reference_calibration_fraction", 0.5)),
+            seed=int(config.get("reference_split_seed", 42)))
+        references = fit_class_references(
+            reference_latents, reference_labels, fit_idx, calibration_idx,
+            baseline_labels, n_components=config.get("n_pca"))
+        reference_details = {
+            "fit_n": int(len(fit_idx)),
+            "calibration_n": int(len(calibration_idx)),
+            "threshold_tune_n": int(len(reference_tune_idx)),
+            "per_class_fit": {
+                str(label): int(np.count_nonzero(reference_labels[fit_idx] == label))
+                for label in baseline_labels
+            },
+            "per_class_calibration": {
+                str(label): int(np.count_nonzero(reference_labels[calibration_idx] == label))
+                for label in baseline_labels
+            },
+        }
+        reference_axis2, reference_products = score_latents(
+            reference_latents, reference_logits, references,
+            score_mode=score_mode, qcd_label=qcd_label)
+        print(
+            f"Reference splits: fit={len(fit_idx)} calibration={len(calibration_idx)} "
+            f"threshold_tune={len(reference_tune_idx)}",
+            flush=True)
+    else:
+        print(
+            "WARNING: no --reference_pt supplied. Latent references are fit on the "
+            "test sample, so this compatibility mode must not be quoted as final.",
+            flush=True)
+        reference_latents = reference_logits = reference_labels = None
+        reference_axis2 = reference_products = reference_tune_idx = None
+
+    print("Computing encoder outputs (test)...", flush=True)
+    latents_all, logits_all, labels = embed_pf(
         model, config["test_pt"], device,
-        batch_size=config.get("batch_size", 512),
-        n_pca=config.get("n_pca"),
-        bkg_labels=bkg_labels,
-    )
+        batch_size=config.get("batch_size", 512))
+    if not reference_pt:
+        fit_idx, calibration_idx, _ = make_reference_splits(
+            labels, val_fraction=0.2, calibration_fraction=0.25,
+            seed=int(config.get("reference_split_seed", 42)))
+        references = fit_class_references(
+            latents_all, labels, fit_idx, calibration_idx, baseline_labels,
+            n_components=config.get("n_pca"))
+    con_bkg, score_products = score_latents(
+        latents_all, logits_all, references,
+        score_mode=score_mode, qcd_label=qcd_label)
+    class_transforms = [
+        (ref.label, ref.mean, ref.whitening) for ref in references
+    ]
+    qcd_reference = next(ref for ref in references if ref.label == qcd_label)
+    md_mu, md_W = qcd_reference.mean, qcd_reference.whitening
 
     if len(con_bkg) != len(ae_bkg):
         raise ValueError(f"Length mismatch: contrastive {len(con_bkg)} vs AE {len(ae_bkg)}")
@@ -523,6 +565,11 @@ def ABCD(config):
     axis2_bkg = con_bkg[mask]
     labels_masked  = labels[mask]
     latents_masked = latents_all[mask]
+    masked_score_products = {
+        key: (value[mask] if isinstance(value, np.ndarray)
+              and value.shape[:1] == (len(mask),) else value)
+        for key, value in score_products.items()
+    }
     print(f"Events after masking: {mask.sum()}", flush=True)
 
     emb_pca  = (latents_masked - md_mu) @ md_W
@@ -569,6 +616,16 @@ def ABCD(config):
             axis1_bkg, axis2_bkg, labels_masked, baseline_labels,
             corr_sample_size=corr_sample_size,
             dcor_sample_size=dcor_sample_size),
+        "score_definition": {
+            "mode": score_mode,
+            "abcd_scope": abcd_scope,
+            "reference_source": reference_pt,
+            "reference_labels": baseline_labels,
+            "reference_is_independent_of_test": bool(reference_pt),
+            "reference_splits": reference_details,
+        },
+        "class_assignment": class_assignment_diagnostics(
+            labels_masked, masked_score_products),
     }
     print("Correlation diagnostics:", flush=True)
     for scope, vals in diagnostics["correlations"].items():
@@ -598,14 +655,12 @@ def ABCD(config):
         if device == "cuda":
             torch.cuda.empty_cache()
         print("Running signal inference...", flush=True)
-        sig_latents, _ = embed_pf(
+        sig_latents, sig_logits, _ = embed_pf(
             model, config["signal_pt"], device,
             batch_size=config.get("batch_size", 512))
-        sig_mds = []
-        for cls, mu_c, W_c in class_transforms:
-            z_c = (sig_latents - mu_c) @ W_c
-            sig_mds.append((z_c * z_c).sum(axis=1))
-        sig_con = np.stack(sig_mds, axis=0).min(axis=0).astype(np.float32)
+        sig_con, sig_score_products = score_latents(
+            sig_latents, sig_logits, references,
+            score_mode=score_mode, qcd_label=qcd_label)
 
         ae_sig = load_ae(config["ae_ckpt"], ae_scaler, device)
         sig_ae = compute_ae_scores(
@@ -618,7 +673,9 @@ def ABCD(config):
         sig_axis2         = sig_con[sig_mask]
         sig_latents_masked = sig_latents[sig_mask]
         sig_emb_pca       = (sig_latents_masked - md_mu) @ md_W
-        sig_axis2_pca     = (sig_emb_pca * sig_emb_pca).sum(axis=1).astype(np.float32)
+        # Every main AE-vs-score plot must use the same deployed axis for signal
+        # and background. QCD-coordinate PCA plots use sig_emb_pca explicitly.
+        sig_axis2_pca     = sig_axis2
         print(f"Signal events after masking: {sig_mask.sum()}", flush=True)
 
     # ── ABCD scan ─────────────────────────────────────────────────────────────
@@ -633,25 +690,45 @@ def ABCD(config):
     holdout_frac = float(config.get("closure_holdout_frac", 0.5))
     split_seed = int(config.get("closure_split_seed", 42))
     if abcd_scope in {"all_baselines", "baselines"}:
-        axis1_scan = axis1_baselines
-        axis2_scan = axis2_baselines
-        labels_scan = labels_baselines
+        axis1_report = axis1_baselines
+        axis2_report = axis2_baselines
+        labels_report = labels_baselines
         scope_name = "all_baselines"
     elif abcd_scope == "qcd":
-        axis1_scan = axis1_qcd
-        axis2_scan = axis2_qcd
-        labels_scan = labels_masked[qcd_only]
+        axis1_report = axis1_qcd
+        axis2_report = axis2_qcd
+        labels_report = labels_masked[qcd_only]
         scope_name = "qcd"
     else:
         raise ValueError(f"Unsupported abcd_scope={abcd_scope!r}")
 
-    tune_idx, report_idx, closure_mode = split_for_threshold_report(
-        len(axis1_scan), holdout_frac=holdout_frac, seed=split_seed,
-        axis1=axis1_scan, axis2=axis2_scan,
-        strata_labels=labels_scan if scope_name == "all_baselines" else None)
-    axis1_tune, axis2_tune = axis1_scan[tune_idx], axis2_scan[tune_idx]
-    axis1_report, axis2_report = axis1_scan[report_idx], axis2_scan[report_idx]
-    labels_report = labels_scan[report_idx]
+    if reference_pt:
+        reference_valid = (
+            np.isfinite(ae_reference)
+            & np.isfinite(reference_axis2)
+            & (ae_reference > 0)
+        )
+        reference_candidates = reference_tune_idx[reference_valid[reference_tune_idx]]
+        if scope_name == "qcd":
+            reference_candidates = reference_candidates[
+                reference_labels[reference_candidates] == qcd_label]
+        else:
+            reference_candidates = reference_candidates[
+                label_membership_mask(
+                    reference_labels[reference_candidates], baseline_labels)]
+        axis1_tune = ae_reference[reference_candidates]
+        axis2_tune = reference_axis2[reference_candidates]
+        labels_tune = reference_labels[reference_candidates]
+        closure_mode = "train_validation_to_independent_test"
+    else:
+        tune_idx, report_idx, closure_mode = split_for_threshold_report(
+            len(axis1_report), holdout_frac=holdout_frac, seed=split_seed,
+            axis1=axis1_report, axis2=axis2_report,
+            strata_labels=labels_report if scope_name == "all_baselines" else None)
+        axis1_tune, axis2_tune = axis1_report[tune_idx], axis2_report[tune_idx]
+        labels_tune = labels_report[tune_idx]
+        axis1_report, axis2_report = axis1_report[report_idx], axis2_report[report_idx]
+        labels_report = labels_report[report_idx]
     print(
         f"ABCD threshold scope: {scope_name}; mode: {closure_mode}; "
         f"tune={len(axis1_tune)} report={len(axis1_report)}",
@@ -691,6 +768,7 @@ def ABCD(config):
 
     diagnostics["abcd_selection"] = {
         "scope": scope_name,
+        "score_mode": score_mode,
         "mode": closure_mode,
         "holdout_frac": holdout_frac,
         "split_seed": split_seed,
@@ -732,6 +810,8 @@ def ABCD(config):
         "ABCD/report_best_log_nonclosure": float(best_report_scan.get("log_nonclosure", np.nan)),
         "ABCD/scope_all_baselines": int(scope_name == "all_baselines"),
         "ABCD/closure_mode_holdout": int(closure_mode.startswith("holdout")),
+        "ABCD/closure_mode_independent_test": int(
+            closure_mode == "train_validation_to_independent_test"),
         "ABCD/grid_mean_abs_nonclosure": grid_summary["mean_abs_nonclosure"],
         "ABCD/grid_median_abs_nonclosure": grid_summary["median_abs_nonclosure"],
         "ABCD/grid_p90_abs_nonclosure": grid_summary["p90_abs_nonclosure"],
@@ -782,8 +862,8 @@ def ABCD(config):
     plt.xscale("log"); plt.yscale("log")
     plt.axvline(t1_opt, color="black", linestyle="--", linewidth=1.0)
     plt.axhline(t2_opt, color="black", linestyle="--", linewidth=1.0)
-    plt.xlabel("AE reco loss"); plt.ylabel("NURD Contrastive score (MD)")
-    plt.title("AE vs NURD Contrastive (bkg only)"); plt.colorbar(label="Counts")
+    plt.xlabel("AE reco loss"); plt.ylabel(score_label)
+    plt.title("AE vs NURD score (bkg only)"); plt.colorbar(label="Counts")
     out = os.path.join(plot_dir, "hist2d_bkg.png")
     plt.savefig(out, dpi=200, bbox_inches="tight"); plt.close()
     wandb.log({"Hists2D/bkg": wandb.Image(out)})
@@ -803,8 +883,8 @@ def ABCD(config):
     ax.axhline(t2_opt, color="black", linestyle="--", linewidth=1.0)
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlabel("AE reco loss", fontsize=fs)
-    ax.set_ylabel("NURD Contrastive score (MD)", fontsize=fs)
-    ax.set_title("AE vs NURD Contrastive — all classes")
+    ax.set_ylabel(score_label, fontsize=fs)
+    ax.set_title("AE vs NURD score - all classes")
     ax.legend(markerscale=10, fontsize=fs_legend)
     out_combined = os.path.join(plot_dir, "hist2d_by_class_combined.png")
     fig.savefig(out_combined, dpi=200, bbox_inches="tight"); plt.close(fig)
@@ -820,8 +900,8 @@ def ABCD(config):
         plt.axvline(t1_opt, color="black", linestyle="--", linewidth=1.0)
         plt.axhline(t2_opt, color="black", linestyle="--", linewidth=1.0)
         plt.xlabel("AE reco loss", fontsize=fs)
-        plt.ylabel("NURD Contrastive score (MD)", fontsize=fs)
-        plt.title("AE vs NURD Contrastive — TpTp (signal)"); plt.colorbar(label="Counts")
+        plt.ylabel(score_label, fontsize=fs)
+        plt.title("AE vs NURD score - TpTp (signal)"); plt.colorbar(label="Counts")
         out_sig = os.path.join(plot_dir, "hist2d_TpTp.png")
         plt.savefig(out_sig, dpi=200, bbox_inches="tight"); plt.close()
         wandb.log({"Hists2D/TpTp": wandb.Image(out_sig)})
@@ -839,13 +919,13 @@ def ABCD(config):
         plt.xscale("log"); plt.yscale("log")
         plt.axvline(t1_opt, color="black", linestyle="--", linewidth=1.0)
         plt.xlabel("AE reco loss", fontsize=fs)
-        plt.ylabel("NURD Contrastive score (MD)", fontsize=fs)
-        plt.title(f"AE vs NURD Contrastive — {name}"); plt.colorbar(label="Counts")
+        plt.ylabel(score_label, fontsize=fs)
+        plt.title(f"AE vs NURD score - {name}"); plt.colorbar(label="Counts")
         out_cls = os.path.join(plot_dir, f"hist2d_{name}.png")
         plt.savefig(out_cls, dpi=200, bbox_inches="tight"); plt.close()
         wandb.log({f"Hists2D/{name}": wandb.Image(out_cls)})
 
-    # PCA-MD scatter + KDE
+    # Selected-score scatter + KDE. Filenames retain the historical names.
     if not config.get("skip_pca_md_plots"):
         fig, ax = plt.subplots(figsize=fig_size)
         for cls, name in class_names.items():
@@ -861,8 +941,8 @@ def ABCD(config):
         ax.axhline(t2_opt, color="black", linestyle="--", linewidth=1.0)
         ax.set_xscale("log"); ax.set_yscale("log")
         ax.set_xlabel("AE reco loss", fontsize=fs)
-        ax.set_ylabel("NURD Contrastive score (PCA-MD)", fontsize=fs)
-        ax.set_title("AE vs PCA-MD — all classes (scatter)")
+        ax.set_ylabel(score_label, fontsize=fs)
+        ax.set_title("AE vs selected NURD score - all classes")
         ax.legend(markerscale=10, fontsize=fs_legend)
         plt.tick_params(axis="x", labelsize=fs_leg)
         plt.tick_params(axis="y", labelsize=fs_leg)
@@ -916,10 +996,10 @@ def ABCD(config):
 
         ax.set_xscale("log"); ax.set_yscale("log")
         ax.set_xlabel("AE reco loss", fontsize=fs)
-        ax.set_ylabel("NURD Contrastive score (PCA-MD)", fontsize=fs)
+        ax.set_ylabel(score_label, fontsize=fs)
         ax.axvline(t1_opt, color="black", linestyle="--", linewidth=1.0)
         ax.axhline(t2_opt, color="black", linestyle="--", linewidth=1.0)
-        ax.set_title("AE vs PCA-MD — KDE contours")
+        ax.set_title("AE vs selected NURD score - KDE contours")
         ax.legend(handles=kde_legend_handles, fontsize=fs_legend)
         plt.tick_params(axis="x", labelsize=fs_leg)
         plt.tick_params(axis="y", labelsize=fs_leg)
@@ -988,9 +1068,9 @@ def ABCD(config):
 
     # Profile plots
     for (x_arr, y_arr, xlabel, ylabel, title, key) in [
-        (axis2_bkg, axis1_bkg, "NURD Contrastive score (MD)", "Mean AE reco loss",
+        (axis2_bkg, axis1_bkg, score_label, "Mean AE reco loss",
          "⟨AE loss⟩ vs NURD MD", "AE_vs_contrastive"),
-        (axis1_bkg, axis2_bkg, "AE reco loss", "Mean NURD Contrastive score (MD)",
+        (axis1_bkg, axis2_bkg, "AE reco loss", f"Mean {score_label}",
          "⟨NURD MD⟩ vs AE loss", "contrastive_vs_AE"),
     ]:
         fig, ax = plt.subplots(figsize=fig_size)
@@ -1004,9 +1084,9 @@ def ABCD(config):
         wandb.log({f"Profiles/{key}": wandb.Image(out_p)})
 
     for (x_arr, y_arr, xlabel, ylabel, title, key) in [
-        (axis2_bkg, axis1_bkg, "NURD Contrastive score (MD)", "Mean AE reco loss",
+        (axis2_bkg, axis1_bkg, score_label, "Mean AE reco loss",
          "⟨AE loss⟩ vs NURD MD (by class)", "AE_vs_contrastive_by_class"),
-        (axis1_bkg, axis2_bkg, "AE reco loss", "Mean NURD Contrastive score (MD)",
+        (axis1_bkg, axis2_bkg, "AE reco loss", f"Mean {score_label}",
          "⟨NURD MD⟩ vs AE loss (by class)", "contrastive_vs_AE_by_class"),
     ]:
         fig, ax = plt.subplots(figsize=fig_size)
@@ -1078,8 +1158,10 @@ def ABCD(config):
     })
 
     fig, ax = plt.subplots(figsize=fig_size)
-    curve_label = "AE + NURD Contrastive (MD)"
-    if closure_mode == "holdout":
+    curve_label = f"AE + {score_label}"
+    if closure_mode == "train_validation_to_independent_test":
+        curve_label += " independent test"
+    elif closure_mode.startswith("holdout"):
         curve_label += " held-out"
     ax.plot(effs, closure_ratio, c="g", label=curve_label)
     ax.fill_between(effs, closure_ratio - closure_unc, closure_ratio + closure_unc,
@@ -1116,6 +1198,8 @@ def ABCD(config):
             "report_best_nonclosure": float(best_report_scan.get("nonclosure", np.nan)),
             "report_best_log_nonclosure": float(best_report_scan.get("log_nonclosure", np.nan)),
             "abcd_scope": scope_name,
+            "score_mode": score_mode,
+            "reference_pt": reference_pt,
             "closure_mode": closure_mode,
             "min_A": min_A,
             "min_A_frac": min_A_frac,
@@ -1129,6 +1213,20 @@ def ABCD(config):
             "signal_at_selected": diagnostics.get("signal_at_selected"),
         }, f, indent=2)
     print(f"Thresholds saved to: {thresholds_path}", flush=True)
+
+    score_path = os.path.join(outdir, "event_scores.npz")
+    score_payload = {
+        "ae_score": axis1_bkg.astype(np.float32),
+        "selected_score": axis2_bkg.astype(np.float32),
+        "true_label": labels_masked.astype(np.int16),
+        "score_mode": np.asarray(score_mode),
+    }
+    score_payload.update({
+        key: value for key, value in masked_score_products.items()
+        if isinstance(value, np.ndarray)
+    })
+    np.savez_compressed(score_path, **score_payload)
+    print(f"Class-resolved event scores saved to: {score_path}", flush=True)
 
     diagnostics_path = os.path.join(outdir, "diagnostics.json")
     with open(diagnostics_path, "w") as f:
@@ -1146,6 +1244,9 @@ if __name__ == "__main__":
                         help="Path to AE checkpoint (checkpoint_ae.pth)")
     parser.add_argument("--test_pt",      required=True,
                         help="Path to test .pt file (SM cocktail)")
+    parser.add_argument("--reference_pt", default=None,
+                        help="Training .pt file used to fit class references and select "
+                             "thresholds on its model-validation split. Required for final results.")
     parser.add_argument("--signal_pt",    default=None,
                         help="Optional signal .pt file")
     parser.add_argument("--outdir",       default="outputs_abcd")
@@ -1162,6 +1263,14 @@ if __name__ == "__main__":
     parser.add_argument("--scan_percent_steps", type=int, default=48)
     parser.add_argument("--abcd_scope", default="qcd", choices=["qcd", "all_baselines", "baselines"],
                         help="Event population used for ABCD threshold selection and reporting.")
+    parser.add_argument(
+        "--score_mode", default="calibrated_union",
+        choices=[
+            "calibrated_union", "mixture_nll", "qcd_md", "min_md",
+            "classifier_routed", "gaussian_routed",
+        ],
+        help="Definition of ABCD axis 2, independent of --abcd_scope. "
+             "calibrated_union is high only when an event is atypical for every baseline.")
     parser.add_argument("--baseline_labels", default="0,1,2,3",
                         help="Comma/space-separated baseline background labels.")
     parser.add_argument("--qcd_label", type=int, default=1)
@@ -1176,10 +1285,17 @@ if __name__ == "__main__":
     parser.add_argument("--dcor_sample_size", type=int, default=2_000,
                         help="Max events sampled for distance-correlation diagnostics; 0 disables it")
     parser.add_argument("--closure_holdout_frac", type=float, default=0.5,
-                        help="Fraction of QCD held out for reporting selected ABCD closure. "
-                             "Use 0 to reproduce same-sample threshold tuning/reporting.")
+                        help="Compatibility mode used only without --reference_pt: fraction "
+                             "held out for reporting after threshold selection.")
     parser.add_argument("--closure_split_seed", type=int, default=42,
                         help="Random seed for QCD tune/report split")
+    parser.add_argument("--reference_val_fraction", type=float, default=0.1,
+                        help="Must match the validation fraction used in train_hlt.py.")
+    parser.add_argument("--reference_calibration_fraction", type=float, default=0.5,
+                        help="Fraction of the untouched model-validation split used to "
+                             "calibrate class MD tails; the rest selects ABCD thresholds.")
+    parser.add_argument("--reference_split_seed", type=int, default=42,
+                        help="Seed used to reproduce the model train/validation split.")
     parser.add_argument("--wandb_run_name", default=None)
     parser.add_argument("--wandb_project",  default="AE vs. Contrastive ABCD",
                         help="W&B project to log to")
@@ -1188,6 +1304,6 @@ if __name__ == "__main__":
     parser.add_argument("--skip_pca_md_plots",   action="store_true")
     parser.add_argument("--skip_embedding_pca",  action="store_true")
     parser.add_argument("--min_md",              action="store_true",
-                        help="Use min-MD across --baseline_labels instead of QCD-only MD")
+                        help="Deprecated alias for --score_mode min_md")
     args = parser.parse_args()
     ABCD(vars(args))

@@ -62,13 +62,20 @@ python train_hlt.py \
   --local_testing 1 \
   --critic_schedule warmup \
   --critic_type density_ratio \
-  --critic_scope qcd \
+  --critic_scope baselines \
+  --critic_shuffle within_label \
   --n_critic_steps_per_batch 1 \
+  --baseline_labels 0,1,2,3 \
+  --nuisance_bin_scope per_class \
   --reweight 1 \
   --joint_indep 1 \
   --max_weight_ratio 10.0 \
   --closure_weight 0.1 \
   --closure_loss_type corr \
+  --closure_scope baselines \
+  --closure_score_mode hybrid \
+  --closure_union_scope qcd \
+  --closure_class_min_events 5 \
   --exp_name smoke_nurd \
   --project_name hlt \
   --manualSeed 42

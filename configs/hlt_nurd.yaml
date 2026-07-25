@@ -56,6 +56,16 @@ parameters:
     values: [20]
   closure_class_weighting:
     values: [equal]
+  closure_score_mode:
+    values: [hybrid]
+  closure_union_scope:
+    values: [qcd]
+  closure_union_temperature:
+    values: [1.0]
+  closure_own_weight:
+    values: [0.5]
+  closure_union_weight:
+    values: [1.0]
   closure_weight:
     values: [0.8]
   closure_weight_start:
