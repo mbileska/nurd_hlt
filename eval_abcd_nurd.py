@@ -1,4 +1,4 @@
-"""Evaluate AE loss against a frozen, class-calibrated NURD anomaly score.
+"""Evaluate AE loss against a frozen NURD latent-space anomaly score.
 
 The training file fits class-conditional latent references, calibrates their
 tail probabilities, and supplies a disjoint validation subset for ABCD
@@ -15,7 +15,11 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from scipy.stats import binned_statistic, gaussian_kde, pearsonr, spearmanr
 from sklearn.decomposition import PCA
+from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
 from matplotlib.lines import Line2D
 
 from models.hlt_con import HLTContrastiveModel
@@ -120,12 +124,14 @@ def _grid_summary(abs_nonclosure):
 
 
 def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500,
-                   min_A_frac=0.0, selection_stat_weight=0.0):
+                   min_A_frac=0.0, selection_stat_weight=0.0,
+                   selection_neighbor_weight=0.0, selection_neighbor_radius=1):
     best = {"selection_score": np.inf, "log_nonclosure": np.inf, "nonclosure": np.inf}
     scan_abs_nonclosure = []
     min_A_effective = max(int(min_A), int(np.ceil(float(min_A_frac) * len(loss_1))))
-    for p1 in percent:
-        for p2 in percent:
+    candidates = []
+    for i, p1 in enumerate(percent):
+        for j, p2 in enumerate(percent):
             t1, t2, A, B, C, D = abcd_counts(loss_1, loss_2, p1, p2)
             if A < min_A_effective or D < min_D:
                 continue
@@ -133,20 +139,46 @@ def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500,
             nc = metrics["nonclosure"]
             score = abs(metrics["log_nonclosure"])
             record = abcd_record_at_thresholds(loss_1, loss_2, t1, t2)
-            selection_score = score + float(selection_stat_weight) * record["ratio_unc"]
             if np.isfinite(nc):
                 scan_abs_nonclosure.append(abs(nc))
-            if np.isfinite(selection_score) and selection_score < best["selection_score"]:
-                best.update(dict(p1=float(p1), p2=float(p2), t1=float(t1), t2=float(t2),
-                                 A=int(A), B=int(B), C=int(C), D=int(D),
-                                 A_hat=metrics["A_hat"],
-                                 nonclosure=float(nc),
-                                 legacy_nonclosure=metrics["legacy_nonclosure"],
-                                 log_nonclosure=metrics["log_nonclosure"],
-                                 ratio=metrics["ratio"],
-                                 ratio_unc=record["ratio_unc"],
-                                 selection_score=float(selection_score),
-                                 min_A_effective=int(min_A_effective)))
+            if np.isfinite(score):
+                candidates.append({
+                    "i": i, "j": j, "p1": float(p1), "p2": float(p2),
+                    "t1": float(t1), "t2": float(t2),
+                    "A": int(A), "B": int(B), "C": int(C), "D": int(D),
+                    "A_hat": metrics["A_hat"],
+                    "nonclosure": float(nc),
+                    "legacy_nonclosure": metrics["legacy_nonclosure"],
+                    "log_nonclosure": metrics["log_nonclosure"],
+                    "ratio": metrics["ratio"],
+                    "ratio_unc": record["ratio_unc"],
+                    "abs_log_nonclosure": float(score),
+                })
+
+    radius = max(int(selection_neighbor_radius), 0)
+    for candidate in candidates:
+        neighborhood = [
+            item["abs_log_nonclosure"] for item in candidates
+            if abs(item["i"] - candidate["i"]) <= radius
+            and abs(item["j"] - candidate["j"]) <= radius
+        ]
+        neighbor_median = float(np.median(neighborhood))
+        selection_score = (
+            candidate["abs_log_nonclosure"]
+            + float(selection_stat_weight) * candidate["ratio_unc"]
+            + float(selection_neighbor_weight) * neighbor_median
+        )
+        if selection_score < best["selection_score"]:
+            best.update({
+                key: value for key, value in candidate.items()
+                if key not in {"i", "j", "abs_log_nonclosure"}
+            })
+            best.update({
+                "selection_score": float(selection_score),
+                "neighbor_median_abs_log_nonclosure": neighbor_median,
+                "neighbor_points": int(len(neighborhood)),
+                "min_A_effective": int(min_A_effective),
+            })
     return best, _grid_summary(scan_abs_nonclosure)
 
 
@@ -429,6 +461,62 @@ def class_assignment_diagnostics(true_labels, score_products):
     return result
 
 
+def nuisance_auditor(train_latents, train_ae, test_latents, test_ae, bin_edges,
+                     seed=42):
+    """Train a fresh nonlinear QCD auditor and report on independent test QCD."""
+    edges = np.asarray(bin_edges, dtype=np.float64).reshape(-1)
+    train_bins = np.searchsorted(edges[1:-1], train_ae, side="right")
+    test_bins = np.searchsorted(edges[1:-1], test_ae, side="right")
+    classes = np.arange(len(edges) - 1)
+    auditor = make_pipeline(
+        StandardScaler(),
+        MLPClassifier(
+            hidden_layer_sizes=(64, 64),
+            activation="relu",
+            alpha=1e-4,
+            batch_size=1024,
+            learning_rate_init=1e-3,
+            max_iter=100,
+            early_stopping=True,
+            validation_fraction=0.2,
+            n_iter_no_change=8,
+            random_state=seed,
+        ),
+    )
+    auditor.fit(train_latents, train_bins)
+    probabilities = auditor.predict_proba(test_latents)
+    aligned_probabilities = np.full(
+        (len(test_bins), len(classes)), 1e-12, dtype=np.float64)
+    aligned_probabilities[:, auditor.classes_.astype(int)] = probabilities
+    aligned_probabilities /= aligned_probabilities.sum(axis=1, keepdims=True)
+
+    train_prior = np.bincount(
+        train_bins, minlength=len(classes)).astype(np.float64)
+    train_prior /= train_prior.sum()
+    chance_probabilities = np.broadcast_to(
+        train_prior, aligned_probabilities.shape)
+    try:
+        macro_auc = roc_auc_score(
+            test_bins, aligned_probabilities, labels=classes,
+            multi_class="ovr", average="macro")
+    except ValueError:
+        macro_auc = np.nan
+    return {
+        "train_n": int(len(train_bins)),
+        "test_n": int(len(test_bins)),
+        "n_bins": int(len(classes)),
+        "accuracy": float(np.mean(auditor.predict(test_latents) == test_bins)),
+        "majority_accuracy": float(np.bincount(
+            test_bins, minlength=len(classes)).max() / len(test_bins)),
+        "cross_entropy": float(log_loss(
+            test_bins, aligned_probabilities, labels=classes)),
+        "prior_cross_entropy": float(log_loss(
+            test_bins, chance_probabilities, labels=classes)),
+        "macro_ovr_auc": float(macro_auc),
+        "iterations": int(auditor[-1].n_iter_),
+    }
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def ABCD(config):
@@ -452,7 +540,7 @@ def ABCD(config):
     baseline_labels = parse_int_list(config.get("baseline_labels", "0,1,2,3"))
     qcd_label = int(config.get("qcd_label", 1))
     abcd_scope = config.get("abcd_scope", "qcd")
-    score_mode = config.get("score_mode", "calibrated_union")
+    score_mode = config.get("score_mode", "qcd_md")
     reference_pt = config.get("reference_pt")
     if not baseline_labels:
         raise ValueError("baseline_labels must contain at least one label")
@@ -646,6 +734,43 @@ def ABCD(config):
         "Corr/qcd_spearman": diagnostics["correlations"]["qcd"]["spearman"],
         "Corr/qcd_distance": diagnostics["correlations"]["qcd"]["distance_corr"],
     })
+    if reference_pt and not config.get("skip_nuisance_auditor", False):
+        saved_edges = main_ckpt.get("nuisance_bin_edges")
+        if isinstance(saved_edges, dict):
+            saved_edges = saved_edges.get(qcd_label)
+        if saved_edges is not None:
+            if torch.is_tensor(saved_edges):
+                saved_edges = saved_edges.detach().cpu().numpy()
+            auditor_train_idx = fit_idx[
+                (reference_labels[fit_idx] == qcd_label)
+                & np.isfinite(ae_reference[fit_idx])
+                & (ae_reference[fit_idx] > 0)
+            ]
+            diagnostics["nuisance_auditor"] = nuisance_auditor(
+                reference_latents[auditor_train_idx],
+                ae_reference[auditor_train_idx],
+                latents_masked[qcd_only],
+                axis1_qcd,
+                saved_edges,
+                seed=int(config.get("reference_split_seed", 42)),
+            )
+            auditor_diag = diagnostics["nuisance_auditor"]
+            print(
+                "Frozen QCD nuisance auditor: "
+                f"accuracy={auditor_diag['accuracy']:.4f} "
+                f"(majority={auditor_diag['majority_accuracy']:.4f}) "
+                f"AUC={auditor_diag['macro_ovr_auc']:.4f} "
+                f"CE={auditor_diag['cross_entropy']:.4f} "
+                f"(prior={auditor_diag['prior_cross_entropy']:.4f})",
+                flush=True,
+            )
+            wandb.log({
+                "Auditor/qcd_accuracy": auditor_diag["accuracy"],
+                "Auditor/qcd_majority_accuracy": auditor_diag["majority_accuracy"],
+                "Auditor/qcd_macro_ovr_auc": auditor_diag["macro_ovr_auc"],
+                "Auditor/qcd_cross_entropy": auditor_diag["cross_entropy"],
+                "Auditor/qcd_prior_cross_entropy": auditor_diag["prior_cross_entropy"],
+            })
 
     # ── signal (optional) ─────────────────────────────────────────────────────
     sig_axis1 = sig_axis2 = sig_axis2_pca = None
@@ -685,8 +810,12 @@ def ABCD(config):
         int(config.get("scan_percent_steps", 48)))
     min_A   = int(config.get("min_A", 50))
     min_D   = int(config.get("min_D", 500))
-    min_A_frac = float(config.get("min_A_frac", 0.0))
-    selection_stat_weight = float(config.get("selection_stat_weight", 0.0))
+    min_A_frac = float(config.get("min_A_frac", 0.05))
+    selection_stat_weight = float(config.get("selection_stat_weight", 0.5))
+    selection_neighbor_weight = float(
+        config.get("selection_neighbor_weight", 1.0))
+    selection_neighbor_radius = int(
+        config.get("selection_neighbor_radius", 1))
     holdout_frac = float(config.get("closure_holdout_frac", 0.5))
     split_seed = int(config.get("closure_split_seed", 42))
     if abcd_scope in {"all_baselines", "baselines"}:
@@ -737,7 +866,9 @@ def ABCD(config):
 
     best_tune, tune_grid_summary = scan_abcd_grid(
         axis1_tune, axis2_tune, percent, min_A=min_A, min_D=min_D,
-        min_A_frac=min_A_frac, selection_stat_weight=selection_stat_weight)
+        min_A_frac=min_A_frac, selection_stat_weight=selection_stat_weight,
+        selection_neighbor_weight=selection_neighbor_weight,
+        selection_neighbor_radius=selection_neighbor_radius)
     if "t1" not in best_tune:
         raise RuntimeError("No ABCD working point found on threshold-tuning split. "
                            "Try lowering min_A/min_D or closure_holdout_frac.")
@@ -753,7 +884,9 @@ def ABCD(config):
     })
     best_report_scan, grid_summary = scan_abcd_grid(
         axis1_report, axis2_report, percent, min_A=min_A, min_D=min_D,
-        min_A_frac=min_A_frac, selection_stat_weight=selection_stat_weight)
+        min_A_frac=min_A_frac, selection_stat_weight=selection_stat_weight,
+        selection_neighbor_weight=selection_neighbor_weight,
+        selection_neighbor_radius=selection_neighbor_radius)
     selected_per_class = per_class_abcd_at_thresholds(
         axis1_report, axis2_report, labels_report, baseline_labels, t1_opt, t2_opt)
 
@@ -776,6 +909,8 @@ def ABCD(config):
         "min_A_frac": min_A_frac,
         "min_D": min_D,
         "selection_stat_weight": selection_stat_weight,
+        "selection_neighbor_weight": selection_neighbor_weight,
+        "selection_neighbor_radius": selection_neighbor_radius,
         "tune_n": int(len(axis1_tune)),
         "report_n": int(len(axis1_report)),
         "tune_best": best_tune,
@@ -1252,19 +1387,24 @@ if __name__ == "__main__":
     parser.add_argument("--outdir",       default="outputs_abcd")
     parser.add_argument("--min_A",        type=int, default=50)
     parser.add_argument("--min_D",        type=int, default=500)
-    parser.add_argument("--min_A_frac",   type=float, default=0.0,
+    parser.add_argument("--min_A_frac",   type=float, default=0.05,
                         help="Minimum A-region fraction on the threshold-tuning sample. "
                              "Useful to avoid low-stat working points.")
-    parser.add_argument("--selection_stat_weight", type=float, default=0.0,
+    parser.add_argument("--selection_stat_weight", type=float, default=0.5,
                         help="Add this times the tune-split ABCD ratio uncertainty to the "
                              "threshold-selection score.")
+    parser.add_argument("--selection_neighbor_weight", type=float, default=1.0,
+                        help="Add this times the local median absolute log-nonclosure "
+                             "around a candidate to favor stable working points.")
+    parser.add_argument("--selection_neighbor_radius", type=int, default=1,
+                        help="Grid-index radius used for threshold-neighborhood stability.")
     parser.add_argument("--scan_percent_min", type=float, default=0.50)
     parser.add_argument("--scan_percent_max", type=float, default=0.98)
     parser.add_argument("--scan_percent_steps", type=int, default=48)
     parser.add_argument("--abcd_scope", default="qcd", choices=["qcd", "all_baselines", "baselines"],
                         help="Event population used for ABCD threshold selection and reporting.")
     parser.add_argument(
-        "--score_mode", default="calibrated_union",
+        "--score_mode", default="qcd_md",
         choices=[
             "calibrated_union", "mixture_nll", "qcd_md", "min_md",
             "classifier_routed", "gaussian_routed",
@@ -1303,6 +1443,8 @@ if __name__ == "__main__":
                         help="Resume an existing W&B run (e.g. the training run from a sweep)")
     parser.add_argument("--skip_pca_md_plots",   action="store_true")
     parser.add_argument("--skip_embedding_pca",  action="store_true")
+    parser.add_argument("--skip_nuisance_auditor", action="store_true",
+                        help="Skip the fresh nonlinear QCD AE-bin auditor.")
     parser.add_argument("--min_md",              action="store_true",
                         help="Deprecated alias for --score_mode min_md")
     args = parser.parse_args()

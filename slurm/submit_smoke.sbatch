@@ -4,7 +4,7 @@
 #SBATCH --error=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/%x-%j.err
 #SBATCH --time=01:00:00
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=64G
+#SBATCH --mem=24G
 #SBATCH --gres=gpu:a100:1
 
 set -eo pipefail
@@ -62,19 +62,21 @@ python train_hlt.py \
   --local_testing 1 \
   --critic_schedule warmup \
   --critic_type density_ratio \
-  --critic_scope baselines \
-  --critic_shuffle within_label \
+  --critic_penalty_type ratio_to_one \
+  --critic_scope qcd \
+  --critic_shuffle global \
+  --critic_train_frac 1.0 \
   --n_critic_steps_per_batch 1 \
   --baseline_labels 0,1,2,3 \
-  --nuisance_bin_scope per_class \
+  --nuisance_bin_scope qcd \
+  --n_bins 20 \
   --reweight 1 \
   --joint_indep 1 \
   --max_weight_ratio 10.0 \
   --closure_weight 0.1 \
-  --closure_loss_type corr \
-  --closure_scope baselines \
-  --closure_score_mode hybrid \
-  --closure_union_scope qcd \
+  --closure_loss_type hybrid \
+  --closure_scope qcd \
+  --closure_score_mode own_class \
   --closure_class_min_events 5 \
   --exp_name smoke_nurd \
   --project_name hlt \

@@ -23,6 +23,10 @@ def _make_nurd_weights(labels, nuisances, max_weight_ratio=10.0):
     max_weight_ratio × mean to prevent extreme weights from destabilising training.
     """
     N = len(labels)
+    if N == 0:
+        raise ValueError("Cannot fit NURD weights on an empty sample.")
+    if max_weight_ratio < 1.0:
+        raise ValueError("max_weight_ratio must be at least 1.0.")
     labels_list    = [int(y) for y in labels.tolist()]
     nuisances_list = [int(z) for z in nuisances.tolist()]
 
@@ -34,12 +38,30 @@ def _make_nurd_weights(labels, nuisances, max_weight_ratio=10.0):
         (y, z): (label_counts[y] * nuisance_counts[z]) / (N * n_yz)
         for (y, z), n_yz in group_counts.items()
     }
-    # normalize so E[w] = 1 over all training samples
+    # Normalize so E[w] = 1 over all training samples.
     mean_w = sum(weights_raw[k] * v for k, v in group_counts.items()) / N
     weights_norm = {k: v / mean_w for k, v in weights_raw.items()}
-    # clip to max_weight_ratio × 1.0 (since mean is now 1) to reduce variance
-    cap = max_weight_ratio
-    return {k: min(v, cap) for k, v in weights_norm.items()}
+
+    # Find a common scale for min(scale * w, cap) whose sample-weighted mean is
+    # one. Clipping and then renormalizing directly can violate the requested cap.
+    cap = float(max_weight_ratio)
+
+    def clipped_mean(scale):
+        return sum(
+            min(scale * weights_norm[k], cap) * count
+            for k, count in group_counts.items()
+        ) / N
+
+    low, high = 0.0, 1.0
+    while clipped_mean(high) < 1.0:
+        high *= 2.0
+    for _ in range(64):
+        mid = 0.5 * (low + high)
+        if clipped_mean(mid) < 1.0:
+            low = mid
+        else:
+            high = mid
+    return {k: min(high * value, cap) for k, value in weights_norm.items()}
 
 
 def _label_mask(labels, label_values):
@@ -80,7 +102,8 @@ class HLTSmCocktailDataset(Dataset):
         split:      "train" | "val"
     """
     def __init__(self, pf_data, labels, nuisances_all, ae_reco_all, idx,
-                 split="train", bin_edges=None, max_weight_ratio=10.0):
+                 split="train", bin_edges=None, max_weight_ratio=10.0,
+                 weight_table=None):
         super().__init__()
         self.bin_edges = bin_edges
 
@@ -99,19 +122,49 @@ class HLTSmCocktailDataset(Dataset):
         # ── NURD exact weights ────────────────────────────────────────────────
         labels_split = labels[self.idx]
         nuisances_split = nuisances_all[self.idx]
-        self.weights = _make_nurd_weights(
-            labels_split, nuisances_split, max_weight_ratio=max_weight_ratio)
-        self.sample_weights = torch.tensor(
-            [self.weights[(int(y.item()), int(z.item()))]
-             for y, z in zip(labels_split, nuisances_split)],
-            dtype=torch.float32,
+        if weight_table is None:
+            self.weights = _make_nurd_weights(
+                labels_split, nuisances_split,
+                max_weight_ratio=max_weight_ratio)
+            weight_source = split
+        else:
+            self.weights = dict(weight_table)
+            weight_source = "train"
+
+        split_groups = {
+            (int(pair[0]), int(pair[1]))
+            for pair in torch.unique(
+                torch.stack([labels_split, nuisances_split], dim=1), dim=0
+            ).tolist()
+        }
+        missing_groups = sorted(split_groups.difference(self.weights))
+        if missing_groups:
+            print(
+                f"[{split}] WARNING: {len(missing_groups)} label/nuisance groups "
+                f"were absent from the training weight fit; using the cap."
+            )
+        max_label = max(
+            int(labels_split.max().item()),
+            max(label for label, _ in self.weights),
         )
-        _w = list(self.weights.values())
-        import statistics
-        _w_mean = sum(_w) / len(_w)
-        _w_std = statistics.stdev(_w) if len(_w) > 1 else 0.0
-        print(f"[{split}] NURD weight groups={len(_w)}  mean={_w_mean:.3f}  "
-              f"std={_w_std:.3f}  min={min(_w):.3f}  max={max(_w):.3f}")
+        max_nuisance = max(
+            int(nuisances_split.max().item()),
+            max(nuisance for _, nuisance in self.weights),
+        )
+        weight_lookup = torch.full(
+            (max_label + 1, max_nuisance + 1),
+            float(max_weight_ratio), dtype=torch.float32)
+        for (label, nuisance), value in self.weights.items():
+            weight_lookup[label, nuisance] = float(value)
+        self.sample_weights = weight_lookup[labels_split, nuisances_split]
+        print(
+            f"[{split}] NURD weights fit={weight_source} "
+            f"groups={len(self.weights)}  "
+            f"sample_mean={self.sample_weights.mean().item():.3f}  "
+            f"sample_std={self.sample_weights.std(unbiased=False).item():.3f}  "
+            f"min={self.sample_weights.min().item():.3f}  "
+            f"max={self.sample_weights.max().item():.3f}"
+        )
 
     def __len__(self):
         return len(self.idx)
@@ -146,7 +199,7 @@ class HLTSmCocktailDataset(Dataset):
         return {k: v / total for k, v in counts.items()}
 
 
-def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42,
+def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
                        max_events=-1, ae_scaler=None, ae_batch_size=4096,
                        max_weight_ratio=10.0, nuisance_bin_scope="all",
                        qcd_label=1, baseline_labels=None):
@@ -180,46 +233,9 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42,
     obj_scaler = {"mu": mu.cpu(), "std": std.cpu()}
     del obj, obj_flat
 
-    # AE reco is the nuisance definition. Compute it once, then split.
+    # AE reco is the nuisance definition. Compute it once, then fit all nuisance
+    # preprocessing on the training split only.
     ae_reco_all = _compute_ae_reco(obj_norm, ae_model, batch_size=ae_batch_size)
-    quantiles = torch.linspace(0, 1, n_bins + 1)
-    if baseline_labels is None:
-        baseline_labels = sorted(int(v) for v in torch.unique(labels).tolist())
-
-    if nuisance_bin_scope == "qcd":
-        bin_source = ae_reco_all[labels == int(qcd_label)]
-        if bin_source.numel() == 0:
-            raise ValueError(
-                f"Cannot build QCD-scoped nuisance bins: no label={qcd_label} events found."
-            )
-        bin_edges = torch.quantile(bin_source, quantiles)
-        nuisances_all = torch.bucketize(ae_reco_all, bin_edges[1:-1]).long()
-    elif nuisance_bin_scope == "all":
-        bin_source = ae_reco_all
-        bin_edges = torch.quantile(bin_source, quantiles)
-        nuisances_all = torch.bucketize(ae_reco_all, bin_edges[1:-1]).long()
-    elif nuisance_bin_scope in {"per_class", "per_label", "baseline_per_class"}:
-        nuisances_all = torch.zeros_like(labels, dtype=torch.long)
-        bin_edges = {}
-        assigned = torch.zeros_like(labels, dtype=torch.bool)
-        for label in baseline_labels:
-            label = int(label)
-            mask = labels == label
-            if mask.sum() == 0:
-                continue
-            edges = torch.quantile(ae_reco_all[mask], quantiles)
-            nuisances_all[mask] = torch.bucketize(ae_reco_all[mask], edges[1:-1]).long()
-            bin_edges[label] = edges
-            assigned |= mask
-        if not assigned.all():
-            remaining = ~assigned
-            for label in sorted(int(v) for v in torch.unique(labels[remaining]).tolist()):
-                mask = labels == label
-                edges = torch.quantile(ae_reco_all[mask], quantiles)
-                nuisances_all[mask] = torch.bucketize(ae_reco_all[mask], edges[1:-1]).long()
-                bin_edges[label] = edges
-    else:
-        raise ValueError(f"Unsupported nuisance_bin_scope={nuisance_bin_scope!r}")
     del obj_norm
 
     idx_all = np.arange(len(labels))
@@ -230,6 +246,54 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42,
     idx_tr = torch.tensor(idx_tr, dtype=torch.long)
     idx_val = torch.tensor(idx_val, dtype=torch.long)
 
+    quantiles = torch.linspace(0, 1, n_bins + 1)
+    if baseline_labels is None:
+        baseline_labels = sorted(int(v) for v in torch.unique(labels).tolist())
+
+    if nuisance_bin_scope == "qcd":
+        train_qcd = labels[idx_tr] == int(qcd_label)
+        bin_source = ae_reco_all[idx_tr][train_qcd]
+        if bin_source.numel() == 0:
+            raise ValueError(
+                f"Cannot build QCD-scoped nuisance bins: no training "
+                f"label={qcd_label} events found."
+            )
+        bin_edges = torch.quantile(bin_source, quantiles)
+        nuisances_all = torch.bucketize(ae_reco_all, bin_edges[1:-1]).long()
+    elif nuisance_bin_scope == "all":
+        bin_source = ae_reco_all[idx_tr]
+        bin_edges = torch.quantile(bin_source, quantiles)
+        nuisances_all = torch.bucketize(ae_reco_all, bin_edges[1:-1]).long()
+    elif nuisance_bin_scope in {"per_class", "per_label", "baseline_per_class"}:
+        nuisances_all = torch.zeros_like(labels, dtype=torch.long)
+        bin_edges = {}
+        assigned = torch.zeros_like(labels, dtype=torch.bool)
+        for label in baseline_labels:
+            label = int(label)
+            train_mask = labels[idx_tr] == label
+            if train_mask.sum() == 0:
+                continue
+            edges = torch.quantile(ae_reco_all[idx_tr][train_mask], quantiles)
+            mask = labels == label
+            nuisances_all[mask] = torch.bucketize(ae_reco_all[mask], edges[1:-1]).long()
+            bin_edges[label] = edges
+            assigned |= mask
+        if not assigned.all():
+            remaining = ~assigned
+            for label in sorted(int(v) for v in torch.unique(labels[remaining]).tolist()):
+                train_mask = labels[idx_tr] == label
+                if train_mask.sum() == 0:
+                    raise ValueError(
+                        f"Cannot define nuisance bins for label={label}: "
+                        "the class is absent from the training split."
+                    )
+                mask = labels == label
+                edges = torch.quantile(ae_reco_all[idx_tr][train_mask], quantiles)
+                nuisances_all[mask] = torch.bucketize(ae_reco_all[mask], edges[1:-1]).long()
+                bin_edges[label] = edges
+    else:
+        raise ValueError(f"Unsupported nuisance_bin_scope={nuisance_bin_scope!r}")
+
     ds_train = HLTSmCocktailDataset(
         pf, labels, nuisances_all, ae_reco_all, idx_tr,
         split="train", bin_edges=bin_edges,
@@ -237,5 +301,6 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42,
     ds_val = HLTSmCocktailDataset(
         pf, labels, nuisances_all, ae_reco_all, idx_val,
         split="val", bin_edges=bin_edges,
-        max_weight_ratio=max_weight_ratio)
+        max_weight_ratio=max_weight_ratio,
+        weight_table=ds_train.weights)
     return ds_train, ds_val, obj_scaler
