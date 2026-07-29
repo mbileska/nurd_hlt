@@ -18,7 +18,7 @@ because the primary ABCD estimate is evaluated on QCD.
 
 - AE reconstruction is computed once. The train/validation split is made before
   fitting nuisance preprocessing.
-- Twenty AE-loss nuisance bins are fitted from training QCD only, then the same
+- Forty AE-loss nuisance bins are fitted from training QCD only, then the same
   edges are applied to every training and validation event. Validation data
   cannot influence the nuisance definition.
 - Exact NURD weights are fitted on training data only and reused unchanged for
@@ -32,32 +32,42 @@ because the primary ABCD estimate is evaluated on QCD.
 
 - All-background classifier and supervised contrastive losses are unchanged in
   scope: all four backgrounds teach the encoder their structure.
-- The density-ratio critic is trained on QCD every batch. It distinguishes real
-  `(latent, AE-bin)` pairs from globally shuffled QCD pairs.
-- The encoder minimizes a uniform-target density-ratio penalty. Its minimum is
-  a learned density ratio of one; unlike the old raw-logit objective, it is
-  bounded below and invariant to a common logit shift.
+- Training batches contain 25% QCD so the closure terms see about 1024 QCD
+  events at batch size 4096. Constant importance corrections preserve the
+  natural all-background classifier objective.
+- A direct QCD nuisance critic predicts AE-loss bins at 10-, 20-, and 40-bin
+  resolutions. Critic updates use unweighted natural QCD, not NURD weights.
+- The encoder minimizes `KL(nuisance prior || critic prediction)` for every
+  critic head. This bounded objective removes event-level AE-bin information
+  without maximizing an unbounded cross-entropy.
 - Direct QCD closure regularization acts on continuous AE loss and QCD MD. It
-  combines log-correlation, distance correlation, forward/reverse profile
-  flatness, and soft tail-ABCD terms.
-- The QCD MD proxy uses lagged EMA first and second moments. It scores a batch
-  with the previous reference and updates afterward. This fixes the old
-  covariance averaging error and prevents the reference from absorbing the
-  batch before it is scored.
+  combines log-correlation, distance correlation, forward profile flatness, a
+  differentiable reverse profile, and normalized soft copula-grid residuals.
+- The reverse profile now has a real encoder gradient. The previous hard MD
+  bucketization detached the only trainable axis, making that term inert.
+- The QCD MD proxy is frozen for a complete epoch. It accumulates detached
+  moments and atomically updates between epochs, so every batch in an epoch is
+  scored against one reference rather than a batch-order-dependent EMA.
 - Contrastive weight decreases from `0.15` to `0.02` over 40 epochs. Closure
   weight increases from `0` to `1.0` over 15 epochs.
 
 ### Selection And Evaluation
 
 - `checkpoint_main_*` is selected by validation NURD loss.
+- Validation QCD MD is two-fold cross-fitted with Ledoit-Wolf covariance,
+  matching final evaluation geometry while ensuring no validation event helps
+  define its own MD. Closure checkpoints use a five-epoch rolling median.
 - `checkpoint_abcd.pth.tar` and `checkpoint_closure.pth.tar` are selected by a
-  broad QCD MD closure score: p90 plus tail and median log-nonclosure, subject
-  to a validation-loss tolerance.
+  broad cross-fitted QCD MD score: p90 plus tail and median log-nonclosure,
+  subject to a validation-loss tolerance.
 - Final threshold selection uses the untouched model-validation portion of the
   training file. The complete test file is report-only.
-- The default working-point scan requires at least 5% of tuning QCD in region A
-  and penalizes statistical uncertainty and unstable neighboring grid points.
-  This avoids selecting an apparently perfect but sparse fluctuation.
+- For QCD MD, all untouched model-validation QCD tune thresholds because this
+  score does not use empirical tail calibration. The independent test file
+  remains report-only.
+- The default scan requires at least 10% of tuning QCD in region A, at least 1%
+  in every region, and at most 5% propagated ratio uncertainty. Selection uses
+  five-fold and neighboring-grid stability instead of the closure of one cell.
 - Evaluation trains a fresh nonlinear nuisance auditor after freezing the
   encoder. Its test-QCD accuracy/AUC/CE diagnose residual AE-bin information.
 - `calibrated_union`, `min_md`, and other all-background scores remain available
@@ -149,9 +159,11 @@ CPU                   8 cores, 48 GiB RAM
 batch size            4096
 AE epochs             100
 NURD epochs           200
-nuisance bins         20, fitted on training QCD
-critic                QCD density ratio, one update per batch
-closure               QCD AE loss vs lagged QCD MD
+nuisance bins         40, fitted on training QCD
+training batches      25% QCD, importance-corrected for classification
+critic                direct QCD 10/20/40-bin predictor, two updates per batch
+closure               QCD AE loss vs epoch-frozen QCD MD
+checkpoint MD         two-fold cross-fitted Ledoit-Wolf
 ```
 
 The previous 150-epoch jobs finished in about 6.5 hours. Two hundred NURD
@@ -172,9 +184,12 @@ The `.out` header should contain:
 
 ```text
 CRITIC_SCOPE=qcd
-CRITIC_TYPE=density_ratio
-CRITIC_PENALTY_TYPE=ratio_to_one
+CRITIC_TYPE=bin_pred
+CRITIC_BIN_RESOLUTIONS=10,20,40
+CRITIC_PENALTY_TYPE=prior_match
 CRITIC_SHUFFLE=global
+N_BINS=40
+QCD_BATCH_FRACTION=0.25
 NUISANCE_BIN_SCOPE=qcd
 CLOSURE_SCOPE=qcd
 CLOSURE_SCORE_MODE=own_class
@@ -214,11 +229,14 @@ optimization experiment.
 The latest-eval script defaults to:
 
 ```text
-NURD_GLOB=hlt_nurd_closure_bs4096_experimental_qcd_v4_*
+NURD_GLOB=hlt_nurd_closure_bs4096_experimental_qcd_v5_*
 PREFER_ABCD_CKPT=1
 ABCD_SCOPE=qcd
 SCORE_MODE=qcd_md
-MIN_A_FRAC=0.05
+MIN_A_FRAC=0.10
+MIN_REGION_FRAC=0.01
+MAX_RATIO_UNC=0.05
+SELECTION_FOLDS=5
 SELECTION_STAT_WEIGHT=0.5
 SELECTION_NEIGHBOR_WEIGHT=1.0
 SCAN_PERCENT_MAX=0.98
@@ -238,7 +256,7 @@ Evaluate the latest validation-loss checkpoint for comparison:
 ```bash
 unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP NURD_GLOB
 PREFER_ABCD_CKPT=0 PREFER_CLOSURE_CKPT=0 \
-  WANDB_NAME_PREFIX=experimental_qcd_v4_main \
+  WANDB_NAME_PREFIX=experimental_qcd_v5_main \
   sbatch slurm/submit_eval_latest.sbatch
 ```
 

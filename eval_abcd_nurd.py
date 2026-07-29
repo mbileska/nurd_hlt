@@ -125,15 +125,29 @@ def _grid_summary(abs_nonclosure):
 
 def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500,
                    min_A_frac=0.0, selection_stat_weight=0.0,
-                   selection_neighbor_weight=0.0, selection_neighbor_radius=1):
+                   selection_neighbor_weight=0.0, selection_neighbor_radius=1,
+                   min_region_frac=0.0, max_ratio_unc=np.inf,
+                   selection_folds=1, selection_seed=42):
     best = {"selection_score": np.inf, "log_nonclosure": np.inf, "nonclosure": np.inf}
     scan_abs_nonclosure = []
     min_A_effective = max(int(min_A), int(np.ceil(float(min_A_frac) * len(loss_1))))
+    min_region_effective = max(
+        1, int(np.ceil(float(min_region_frac) * len(loss_1))))
+    selection_folds = max(int(selection_folds), 1)
+    fold_ids = None
+    if selection_folds > 1 and len(loss_1) >= selection_folds * 4:
+        rng = np.random.default_rng(int(selection_seed))
+        shuffled = rng.permutation(len(loss_1))
+        fold_ids = np.empty(len(loss_1), dtype=np.int16)
+        fold_ids[shuffled] = np.arange(len(loss_1)) % selection_folds
     candidates = []
     for i, p1 in enumerate(percent):
         for j, p2 in enumerate(percent):
             t1, t2, A, B, C, D = abcd_counts(loss_1, loss_2, p1, p2)
-            if A < min_A_effective or D < min_D:
+            if (
+                A < min_A_effective or D < min_D
+                or min(A, B, C, D) < min_region_effective
+            ):
                 continue
             metrics = closure_metrics(A, B, C, D)
             nc = metrics["nonclosure"]
@@ -141,7 +155,28 @@ def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500,
             record = abcd_record_at_thresholds(loss_1, loss_2, t1, t2)
             if np.isfinite(nc):
                 scan_abs_nonclosure.append(abs(nc))
-            if np.isfinite(score):
+            if np.isfinite(score) and record["ratio_unc"] <= max_ratio_unc:
+                fold_abs_logs = []
+                if fold_ids is not None:
+                    for fold in range(selection_folds):
+                        fold_mask = fold_ids == fold
+                        fold_record = abcd_record_at_thresholds(
+                            loss_1[fold_mask], loss_2[fold_mask], t1, t2)
+                        fold_value = abs(fold_record["log_nonclosure"])
+                        if np.isfinite(fold_value):
+                            fold_abs_logs.append(fold_value)
+                    # Never make an unstable candidate look better by silently
+                    # omitting a fold with an empty or invalid ABCD region.
+                    if len(fold_abs_logs) != selection_folds:
+                        continue
+                fold_median = (
+                    float(np.median(fold_abs_logs))
+                    if fold_abs_logs else float(score)
+                )
+                fold_p90 = (
+                    float(np.quantile(fold_abs_logs, 0.90))
+                    if fold_abs_logs else float(score)
+                )
                 candidates.append({
                     "i": i, "j": j, "p1": float(p1), "p2": float(p2),
                     "t1": float(t1), "t2": float(t2),
@@ -153,18 +188,22 @@ def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500,
                     "ratio": metrics["ratio"],
                     "ratio_unc": record["ratio_unc"],
                     "abs_log_nonclosure": float(score),
+                    "fold_median_abs_log_nonclosure": fold_median,
+                    "fold_p90_abs_log_nonclosure": fold_p90,
+                    "selection_folds": int(
+                        selection_folds if fold_ids is not None else 1),
                 })
 
     radius = max(int(selection_neighbor_radius), 0)
     for candidate in candidates:
         neighborhood = [
-            item["abs_log_nonclosure"] for item in candidates
+            item["fold_p90_abs_log_nonclosure"] for item in candidates
             if abs(item["i"] - candidate["i"]) <= radius
             and abs(item["j"] - candidate["j"]) <= radius
         ]
         neighbor_median = float(np.median(neighborhood))
         selection_score = (
-            candidate["abs_log_nonclosure"]
+            candidate["fold_p90_abs_log_nonclosure"]
             + float(selection_stat_weight) * candidate["ratio_unc"]
             + float(selection_neighbor_weight) * neighbor_median
         )
@@ -178,6 +217,8 @@ def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500,
                 "neighbor_median_abs_log_nonclosure": neighbor_median,
                 "neighbor_points": int(len(neighborhood)),
                 "min_A_effective": int(min_A_effective),
+                "min_region_effective": int(min_region_effective),
+                "max_ratio_unc": float(max_ratio_unc),
             })
     return best, _grid_summary(scan_abs_nonclosure)
 
@@ -596,10 +637,19 @@ def ABCD(config):
         references = fit_class_references(
             reference_latents, reference_labels, fit_idx, calibration_idx,
             baseline_labels, n_components=config.get("n_pca"))
+        threshold_tune_source = "disjoint_uncalibrated_validation"
+        if score_mode == "qcd_md":
+            # QCD MD uses only the covariance fitted on fit_idx; it does not use
+            # empirical tail calibration. Reclaim the full untouched validation
+            # split for statistically stronger threshold selection.
+            reference_tune_idx = np.concatenate(
+                [calibration_idx, reference_tune_idx])
+            threshold_tune_source = "full_model_validation"
         reference_details = {
             "fit_n": int(len(fit_idx)),
             "calibration_n": int(len(calibration_idx)),
             "threshold_tune_n": int(len(reference_tune_idx)),
+            "threshold_tune_source": threshold_tune_source,
             "per_class_fit": {
                 str(label): int(np.count_nonzero(reference_labels[fit_idx] == label))
                 for label in baseline_labels
@@ -609,7 +659,7 @@ def ABCD(config):
                 for label in baseline_labels
             },
         }
-        reference_axis2, reference_products = score_latents(
+        reference_axis2, _reference_products = score_latents(
             reference_latents, reference_logits, references,
             score_mode=score_mode, qcd_label=qcd_label)
         print(
@@ -622,7 +672,7 @@ def ABCD(config):
             "test sample, so this compatibility mode must not be quoted as final.",
             flush=True)
         reference_latents = reference_logits = reference_labels = None
-        reference_axis2 = reference_products = reference_tune_idx = None
+        reference_axis2 = reference_tune_idx = None
 
     print("Computing encoder outputs (test)...", flush=True)
     latents_all, logits_all, labels = embed_pf(
@@ -638,9 +688,6 @@ def ABCD(config):
     con_bkg, score_products = score_latents(
         latents_all, logits_all, references,
         score_mode=score_mode, qcd_label=qcd_label)
-    class_transforms = [
-        (ref.label, ref.mean, ref.whitening) for ref in references
-    ]
     qcd_reference = next(ref for ref in references if ref.label == qcd_label)
     md_mu, md_W = qcd_reference.mean, qcd_reference.whitening
 
@@ -816,6 +863,9 @@ def ABCD(config):
         config.get("selection_neighbor_weight", 1.0))
     selection_neighbor_radius = int(
         config.get("selection_neighbor_radius", 1))
+    min_region_frac = float(config.get("min_region_frac", 0.01))
+    max_ratio_unc = float(config.get("max_ratio_unc", 0.05))
+    selection_folds = int(config.get("selection_folds", 5))
     holdout_frac = float(config.get("closure_holdout_frac", 0.5))
     split_seed = int(config.get("closure_split_seed", 42))
     if abcd_scope in {"all_baselines", "baselines"}:
@@ -847,7 +897,6 @@ def ABCD(config):
                     reference_labels[reference_candidates], baseline_labels)]
         axis1_tune = ae_reference[reference_candidates]
         axis2_tune = reference_axis2[reference_candidates]
-        labels_tune = reference_labels[reference_candidates]
         closure_mode = "train_validation_to_independent_test"
     else:
         tune_idx, report_idx, closure_mode = split_for_threshold_report(
@@ -855,7 +904,6 @@ def ABCD(config):
             axis1=axis1_report, axis2=axis2_report,
             strata_labels=labels_report if scope_name == "all_baselines" else None)
         axis1_tune, axis2_tune = axis1_report[tune_idx], axis2_report[tune_idx]
-        labels_tune = labels_report[tune_idx]
         axis1_report, axis2_report = axis1_report[report_idx], axis2_report[report_idx]
         labels_report = labels_report[report_idx]
     print(
@@ -868,7 +916,9 @@ def ABCD(config):
         axis1_tune, axis2_tune, percent, min_A=min_A, min_D=min_D,
         min_A_frac=min_A_frac, selection_stat_weight=selection_stat_weight,
         selection_neighbor_weight=selection_neighbor_weight,
-        selection_neighbor_radius=selection_neighbor_radius)
+        selection_neighbor_radius=selection_neighbor_radius,
+        min_region_frac=min_region_frac, max_ratio_unc=max_ratio_unc,
+        selection_folds=selection_folds, selection_seed=split_seed)
     if "t1" not in best_tune:
         raise RuntimeError("No ABCD working point found on threshold-tuning split. "
                            "Try lowering min_A/min_D or closure_holdout_frac.")
@@ -886,7 +936,9 @@ def ABCD(config):
         axis1_report, axis2_report, percent, min_A=min_A, min_D=min_D,
         min_A_frac=min_A_frac, selection_stat_weight=selection_stat_weight,
         selection_neighbor_weight=selection_neighbor_weight,
-        selection_neighbor_radius=selection_neighbor_radius)
+        selection_neighbor_radius=selection_neighbor_radius,
+        min_region_frac=min_region_frac, max_ratio_unc=max_ratio_unc,
+        selection_folds=selection_folds, selection_seed=split_seed)
     selected_per_class = per_class_abcd_at_thresholds(
         axis1_report, axis2_report, labels_report, baseline_labels, t1_opt, t2_opt)
 
@@ -911,6 +963,9 @@ def ABCD(config):
         "selection_stat_weight": selection_stat_weight,
         "selection_neighbor_weight": selection_neighbor_weight,
         "selection_neighbor_radius": selection_neighbor_radius,
+        "min_region_frac": min_region_frac,
+        "max_ratio_unc": max_ratio_unc,
+        "selection_folds": selection_folds,
         "tune_n": int(len(axis1_tune)),
         "report_n": int(len(axis1_report)),
         "tune_best": best_tune,
@@ -1340,6 +1395,9 @@ def ABCD(config):
             "min_A_frac": min_A_frac,
             "min_D": min_D,
             "selection_stat_weight": selection_stat_weight,
+            "min_region_frac": min_region_frac,
+            "max_ratio_unc": max_ratio_unc,
+            "selection_folds": selection_folds,
             "report_A": int(report_at_selected["A"]),
             "report_B": int(report_at_selected["B"]),
             "report_C": int(report_at_selected["C"]),
@@ -1387,7 +1445,7 @@ if __name__ == "__main__":
     parser.add_argument("--outdir",       default="outputs_abcd")
     parser.add_argument("--min_A",        type=int, default=50)
     parser.add_argument("--min_D",        type=int, default=500)
-    parser.add_argument("--min_A_frac",   type=float, default=0.05,
+    parser.add_argument("--min_A_frac",   type=float, default=0.10,
                         help="Minimum A-region fraction on the threshold-tuning sample. "
                              "Useful to avoid low-stat working points.")
     parser.add_argument("--selection_stat_weight", type=float, default=0.5,
@@ -1398,6 +1456,12 @@ if __name__ == "__main__":
                              "around a candidate to favor stable working points.")
     parser.add_argument("--selection_neighbor_radius", type=int, default=1,
                         help="Grid-index radius used for threshold-neighborhood stability.")
+    parser.add_argument("--min_region_frac", type=float, default=0.01,
+                        help="Minimum tuning-sample fraction required in every ABCD region.")
+    parser.add_argument("--max_ratio_unc", type=float, default=0.05,
+                        help="Reject tuning candidates with larger propagated ABCD ratio uncertainty.")
+    parser.add_argument("--selection_folds", type=int, default=5,
+                        help="Number of deterministic tuning folds used to score closure stability.")
     parser.add_argument("--scan_percent_min", type=float, default=0.50)
     parser.add_argument("--scan_percent_max", type=float, default=0.98)
     parser.add_argument("--scan_percent_steps", type=int, default=48)

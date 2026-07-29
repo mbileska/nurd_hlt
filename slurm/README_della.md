@@ -43,8 +43,10 @@ $BASE/logs/nurd_smoke-<job_id>.out
 sbatch slurm/submit_train.sbatch
 ```
 
-Defaults: 100 AE epochs, 150 NURD epochs, 10-hour hard limit, one 80 GB A100,
-8 CPU cores, 64 GB CPU memory, and zero DataLoader workers.
+Defaults: 100 AE epochs, 200 NURD epochs, a 12-hour hard limit, one 80 GB A100,
+8 CPU cores, 48 GB CPU memory, and zero DataLoader workers. Training uses
+40 QCD-defined nuisance bins, a 10/20/40-bin direct critic, 25% QCD batches
+with importance correction, and cross-fitted validation MD.
 
 Monitor:
 
@@ -57,18 +59,16 @@ tail -f $BASE/logs/nurd_hlt_train-$JOB.err
 
 ## Evaluate
 
-Recommended independent-test QCD closure with the calibrated all-background
-score:
+Recommended independent-test QCD closure with QCD Mahalanobis distance:
 
 ```bash
-ABCD_SCOPE=qcd SCORE_MODE=calibrated_union \
-  sbatch slurm/submit_eval_latest.sbatch
+sbatch slurm/submit_eval_latest.sbatch
 ```
 
 Closure-selected checkpoint:
 
 ```bash
-PREFER_ABCD_CKPT=1 ABCD_SCOPE=qcd SCORE_MODE=calibrated_union \
+PREFER_ABCD_CKPT=1 ABCD_SCOPE=qcd SCORE_MODE=qcd_md \
   sbatch slurm/submit_eval_latest.sbatch
 ```
 

@@ -61,15 +61,17 @@ python train_hlt.py \
   --max_events 2000 \
   --local_testing 1 \
   --critic_schedule warmup \
-  --critic_type density_ratio \
-  --critic_penalty_type ratio_to_one \
+  --critic_type bin_pred \
+  --critic_bin_resolutions 5,10 \
+  --critic_penalty_type prior_match \
   --critic_scope qcd \
   --critic_shuffle global \
   --critic_train_frac 1.0 \
   --n_critic_steps_per_batch 1 \
   --baseline_labels 0,1,2,3 \
   --nuisance_bin_scope qcd \
-  --n_bins 20 \
+  --n_bins 10 \
+  --qcd_batch_fraction 0.25 \
   --reweight 1 \
   --joint_indep 1 \
   --max_weight_ratio 10.0 \
@@ -78,6 +80,10 @@ python train_hlt.py \
   --closure_scope qcd \
   --closure_score_mode own_class \
   --closure_class_min_events 5 \
+  --closure_tail_quantiles 0.5,0.7,0.9 \
+  --val_md_folds 2 \
+  --abcd_ckpt_smoothing_epochs 1 \
+  --md_proxy_type epoch \
   --exp_name smoke_nurd \
   --project_name hlt \
   --manualSeed 42
