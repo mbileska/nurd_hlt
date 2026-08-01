@@ -16,6 +16,17 @@ because the primary ABCD estimate is evaluated on QCD.
 
 ### Data And Weights
 
+- The legacy campaign uses `hlt_smcocktail_train.pt` and
+  `hlt_smcocktail_test.pt`. The new Mequinna campaign is stored separately under
+  `data/mequinna_1M_noZB/`; never overwrite the legacy files because that makes
+  checkpoint provenance ambiguous.
+- The Mequinna release also provides event-aligned `weight_train.pt` and
+  `weight_test.pt` generator weights. These are physics generator weights, not
+  the NURD label/nuisance weights described below.
+- **Current status:** commit `b70c9da` does not yet consume the separate
+  generator-weight files. Copy and validate them, but do not submit the full
+  Mequinna campaign until generator weights are wired through training,
+  validation, ABCD yields, and uncertainties.
 - AE reconstruction is computed once. The train/validation split is made before
   fitting nuisance preprocessing.
 - Forty AE-loss nuisance bins are fitted from training QCD only, then the same
@@ -98,7 +109,99 @@ Verify the environment:
 python -c "import torch, wandb, numpy, sklearn, scipy, matplotlib; print('imports ok'); print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
 ```
 
-Verify the data:
+## Mequinna Dataset
+
+Keep the new release in a versioned scratch directory:
+
+```text
+$BASE/data/mequinna_1M_noZB/hlt_smcocktail_mequinna_train.pt
+$BASE/data/mequinna_1M_noZB/hlt_smcocktail_mequinna_test.pt
+$BASE/data/mequinna_1M_noZB/weight_train.pt
+$BASE/data/mequinna_1M_noZB/weight_test.pt
+```
+
+The CERN source is:
+
+```text
+/eos/user/e/escheull/smcocktail_1M_noZB/
+```
+
+If the files are not already on Della, run from a Della login node:
+
+```bash
+export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
+export DATA_DIR=$BASE/data/mequinna_1M_noZB
+export EOS_DIR=/eos/user/e/escheull/smcocktail_1M_noZB
+mkdir -p "$DATA_DIR"
+
+rsync -ahP mbileska@lxplus.cern.ch:$EOS_DIR/hlt_smcocktail_mequinna_train.pt "$DATA_DIR/"
+rsync -ahP mbileska@lxplus.cern.ch:$EOS_DIR/hlt_smcocktail_mequinna_test.pt "$DATA_DIR/"
+rsync -ahP mbileska@lxplus.cern.ch:$EOS_DIR/genweight_lookup/weight_train.pt "$DATA_DIR/"
+rsync -ahP mbileska@lxplus.cern.ch:$EOS_DIR/genweight_lookup/weight_test.pt "$DATA_DIR/"
+```
+
+Validate event alignment, tensor structure, finite values, and signed weights
+before training:
+
+```bash
+export DATA_DIR=$BASE/data/mequinna_1M_noZB
+python - <<'PY'
+import os
+import torch
+
+root = os.environ["DATA_DIR"]
+for split in ("train", "test"):
+    sample = torch.load(
+        os.path.join(root, f"hlt_smcocktail_mequinna_{split}.pt"),
+        map_location="cpu",
+    )
+    weight_object = torch.load(
+        os.path.join(root, f"weight_{split}.pt"), map_location="cpu"
+    )
+    print(f"\n{split}: keys={list(sample)}")
+    for key, value in sample.items():
+        print(f"  {key}: shape={tuple(value.shape)} dtype={value.dtype}")
+    print(f"  weight object: {type(weight_object)}")
+    if isinstance(weight_object, dict):
+        for key, value in weight_object.items():
+            if torch.is_tensor(value):
+                print(
+                    f"  weight[{key}]: shape={tuple(value.shape)} "
+                    f"dtype={value.dtype}"
+                )
+            else:
+                print(f"  weight[{key}]: type={type(value)}")
+    else:
+        weights = torch.as_tensor(weight_object).reshape(-1)
+        assert weights.numel() == sample["label"].shape[0]
+        assert torch.isfinite(weights).all()
+        print(
+            "  weights:",
+            f"n={weights.numel()}",
+            f"min={weights.min().item():.6g}",
+            f"max={weights.max().item():.6g}",
+            f"sum={weights.sum().item():.6g}",
+            f"negative={(weights < 0).sum().item()}",
+            f"zero={(weights == 0).sum().item()}",
+        )
+PY
+```
+
+Do not assume `(loss * gen_weight).sum() / gen_weight.sum()` is safe until the
+negative-weight count and total sum are known. The weighted implementation must
+also use generator-weighted NURD frequency estimates and weighted ABCD yields;
+multiplying only the classifier loss would define an inconsistent objective.
+
+An unweighted format-only smoke test is allowed:
+
+```bash
+TRAIN_PT=$DATA_DIR/hlt_smcocktail_mequinna_train.pt \
+  sbatch slurm/submit_smoke.sbatch
+```
+
+This smoke test deliberately does **not** validate generator-weight handling.
+
+Verify the legacy data when reproducing an older campaign:
 
 ```bash
 export TRAIN_PT=$BASE/data/hlt_smcocktail_train.pt
