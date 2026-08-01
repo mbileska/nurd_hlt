@@ -26,6 +26,24 @@ def test_capped_nurd_weights_preserve_sample_mean():
     assert sample_weights.min() > 0.0
 
 
+def test_capped_nurd_weights_preserve_generator_weighted_mean():
+    labels = torch.tensor([0, 0, 0, 1, 1, 1])
+    nuisances = torch.tensor([0, 0, 1, 0, 1, 1])
+    generator_weights = torch.tensor([1.0, 3.0, 2.0, 4.0, 1.0, 5.0])
+    table = _make_nurd_weights(
+        labels, nuisances, max_weight_ratio=4.0,
+        base_weights=generator_weights)
+    nurd_weights = torch.tensor([
+        table[(int(label), int(nuisance))]
+        for label, nuisance in zip(labels, nuisances)
+    ])
+
+    physical_mean = (
+        generator_weights * nurd_weights
+    ).sum() / generator_weights.sum()
+    assert torch.isclose(physical_mean, torch.tensor(1.0), atol=1e-6)
+
+
 def test_qcd_md_proxy_tracks_full_second_moment():
     proxy = RunningQCDMDProxy(momentum=0.5, eps=1e-6)
     reference = torch.tensor([
@@ -68,6 +86,21 @@ def test_qcd_md_proxy_reference_is_frozen_for_the_epoch():
     assert restored.updates == proxy.updates
     assert torch.allclose(restored.mean, proxy.mean.cpu())
     assert torch.allclose(restored.second_moment, proxy.second_moment.cpu())
+
+
+def test_qcd_md_proxy_ema_scores_before_tracking_current_batch():
+    proxy = RunningQCDMDProxy(momentum=0.5, eps=1e-6, mode="ema")
+    initial = torch.tensor([
+        [0.0, 0.0], [0.0, 2.0], [2.0, 0.0], [2.0, 2.0],
+    ])
+    shifted = initial + 4.0
+    mask = torch.ones(shifted.size(0), dtype=torch.bool)
+    proxy.update(initial)
+
+    scores = proxy.md(shifted, mask, update=True)
+
+    assert scores.mean() > 20.0
+    assert torch.allclose(proxy.mean, torch.tensor([3.0, 3.0]))
 
 
 def test_reverse_profile_has_conditioner_gradient():

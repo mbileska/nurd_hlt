@@ -13,7 +13,7 @@ import torch
 import wandb
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
-from scipy.stats import binned_statistic, gaussian_kde, pearsonr, spearmanr
+from scipy.stats import binned_statistic, gaussian_kde, rankdata
 from sklearn.decomposition import PCA
 from sklearn.metrics import log_loss, roc_auc_score
 from sklearn.model_selection import train_test_split
@@ -25,6 +25,10 @@ from matplotlib.lines import Line2D
 from models.hlt_con import HLTContrastiveModel
 from models.hlt_autoencoder import HLTAutoencoder
 from utils.hlt_score_calibration import fit_class_references, score_latents
+from utils.event_weights import (
+    load_event_weights,
+    weighted_quantile_numpy,
+)
 
 CLASS_NAMES = {0: "DY", 1: "QCD", 2: "TT", 3: "WJets"}
 CLASS_COLORS = {0: "tab:blue", 1: "tab:orange", 2: "tab:green", 3: "tab:red"}
@@ -47,19 +51,32 @@ def label_membership_mask(labels, label_values):
 
 # ── ABCD helpers (identical to eval_abcd.py) ─────────────────────────────────
 
-def abcd_counts(loss_1, loss_2, percent_1, percent_2):
-    thresh_1 = np.quantile(loss_1, percent_1)
-    thresh_2 = np.quantile(loss_2, percent_2)
-    A, B, C, D = abcd_counts_at_thresholds(loss_1, loss_2, thresh_1, thresh_2)
+def abcd_counts(loss_1, loss_2, percent_1, percent_2, weights=None):
+    thresh_1 = weighted_quantile_numpy(loss_1, [percent_1], weights)[0]
+    thresh_2 = weighted_quantile_numpy(loss_2, [percent_2], weights)[0]
+    A, B, C, D = abcd_counts_at_thresholds(
+        loss_1, loss_2, thresh_1, thresh_2, weights=weights)
     return thresh_1, thresh_2, A, B, C, D
 
 
-def abcd_counts_at_thresholds(loss_1, loss_2, thresh_1, thresh_2):
-    A = int(((loss_1 > thresh_1) & (loss_2 > thresh_2)).sum())
-    B = int(((loss_1 > thresh_1) & (loss_2 <= thresh_2)).sum())
-    C = int(((loss_1 <= thresh_1) & (loss_2 > thresh_2)).sum())
-    D = int(((loss_1 <= thresh_1) & (loss_2 <= thresh_2)).sum())
-    return A, B, C, D
+def _abcd_masks(loss_1, loss_2, thresh_1, thresh_2):
+    high_1 = loss_1 > thresh_1
+    high_2 = loss_2 > thresh_2
+    return (
+        high_1 & high_2,
+        high_1 & ~high_2,
+        ~high_1 & high_2,
+        ~high_1 & ~high_2,
+    )
+
+
+def abcd_counts_at_thresholds(loss_1, loss_2, thresh_1, thresh_2,
+                              weights=None):
+    masks = _abcd_masks(loss_1, loss_2, thresh_1, thresh_2)
+    if weights is None:
+        weights = np.ones(len(loss_1), dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    return tuple(float(weights[mask].sum()) for mask in masks)
 
 
 def closure_metrics(A, B, C, D, eps=1e-8):
@@ -87,23 +104,30 @@ def nonclosure_A(A, B, C, D, eps=1e-8):
     return metrics["nonclosure"], metrics["A_hat"]
 
 
-def abcd_record_at_thresholds(loss_1, loss_2, thresh_1, thresh_2):
-    A, B, C, D = abcd_counts_at_thresholds(loss_1, loss_2, thresh_1, thresh_2)
+def abcd_record_at_thresholds(loss_1, loss_2, thresh_1, thresh_2,
+                              weights=None):
+    if weights is None:
+        weights = np.ones(len(loss_1), dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    masks = _abcd_masks(loss_1, loss_2, thresh_1, thresh_2)
+    A, B, C, D = [float(weights[mask].sum()) for mask in masks]
+    A2, B2, C2, D2 = [float((weights[mask] ** 2).sum()) for mask in masks]
+    A_n, B_n, C_n, D_n = [int(mask.sum()) for mask in masks]
     metrics = closure_metrics(A, B, C, D)
     ratio = metrics["ratio"]
-    invA = 0.0 if A == 0 else 1.0 / A
-    invB = 0.0 if B == 0 else 1.0 / B
-    invC = 0.0 if C == 0 else 1.0 / C
-    invD = 0.0 if D == 0 else 1.0 / D
+    invA = 0.0 if A == 0 else A2 / (A * A)
+    invB = 0.0 if B == 0 else B2 / (B * B)
+    invC = 0.0 if C == 0 else C2 / (C * C)
+    invD = 0.0 if D == 0 else D2 / (D * D)
     rel_var = invA + invB + invC + invD
     ratio_unc = abs(ratio) * np.sqrt(rel_var) if rel_var > 0 else 0.0
     return {
         "t1": float(thresh_1),
         "t2": float(thresh_2),
-        "A": int(A),
-        "B": int(B),
-        "C": int(C),
-        "D": int(D),
+        "A": A, "B": B, "C": C, "D": D,
+        "A_n": A_n, "B_n": B_n, "C_n": C_n, "D_n": D_n,
+        "A_sumw2": A2, "B_sumw2": B2,
+        "C_sumw2": C2, "D_sumw2": D2,
         "A_hat": metrics["A_hat"],
         "nonclosure": metrics["nonclosure"],
         "legacy_nonclosure": metrics["legacy_nonclosure"],
@@ -127,12 +151,20 @@ def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500,
                    min_A_frac=0.0, selection_stat_weight=0.0,
                    selection_neighbor_weight=0.0, selection_neighbor_radius=1,
                    min_region_frac=0.0, max_ratio_unc=np.inf,
-                   selection_folds=1, selection_seed=42):
+                   selection_folds=1, selection_seed=42, weights=None):
     best = {"selection_score": np.inf, "log_nonclosure": np.inf, "nonclosure": np.inf}
     scan_abs_nonclosure = []
-    min_A_effective = max(int(min_A), int(np.ceil(float(min_A_frac) * len(loss_1))))
-    min_region_effective = max(
-        1, int(np.ceil(float(min_region_frac) * len(loss_1))))
+    weights = (
+        np.ones(len(loss_1), dtype=np.float64) if weights is None
+        else np.asarray(weights, dtype=np.float64).reshape(-1)
+    )
+    if weights.shape[0] != len(loss_1):
+        raise ValueError("weights must align with ABCD axes")
+    total_weight = float(weights.sum())
+    min_A_weight = float(min_A_frac) * total_weight
+    min_region_weight = float(min_region_frac) * total_weight
+    min_A_effective = int(min_A)
+    min_region_effective = 1
     selection_folds = max(int(selection_folds), 1)
     fold_ids = None
     if selection_folds > 1 and len(loss_1) >= selection_folds * 4:
@@ -143,16 +175,22 @@ def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500,
     candidates = []
     for i, p1 in enumerate(percent):
         for j, p2 in enumerate(percent):
-            t1, t2, A, B, C, D = abcd_counts(loss_1, loss_2, p1, p2)
+            t1, t2, A, B, C, D = abcd_counts(
+                loss_1, loss_2, p1, p2, weights=weights)
+            record = abcd_record_at_thresholds(
+                loss_1, loss_2, t1, t2, weights=weights)
             if (
-                A < min_A_effective or D < min_D
-                or min(A, B, C, D) < min_region_effective
+                record["A_n"] < min_A_effective
+                or record["D_n"] < int(min_D)
+                or min(record[f"{region}_n"] for region in "ABCD")
+                < min_region_effective
+                or A < min_A_weight
+                or min(A, B, C, D) < min_region_weight
             ):
                 continue
             metrics = closure_metrics(A, B, C, D)
             nc = metrics["nonclosure"]
             score = abs(metrics["log_nonclosure"])
-            record = abcd_record_at_thresholds(loss_1, loss_2, t1, t2)
             if np.isfinite(nc):
                 scan_abs_nonclosure.append(abs(nc))
             if np.isfinite(score) and record["ratio_unc"] <= max_ratio_unc:
@@ -161,7 +199,8 @@ def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500,
                     for fold in range(selection_folds):
                         fold_mask = fold_ids == fold
                         fold_record = abcd_record_at_thresholds(
-                            loss_1[fold_mask], loss_2[fold_mask], t1, t2)
+                            loss_1[fold_mask], loss_2[fold_mask], t1, t2,
+                            weights=weights[fold_mask])
                         fold_value = abs(fold_record["log_nonclosure"])
                         if np.isfinite(fold_value):
                             fold_abs_logs.append(fold_value)
@@ -180,7 +219,10 @@ def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500,
                 candidates.append({
                     "i": i, "j": j, "p1": float(p1), "p2": float(p2),
                     "t1": float(t1), "t2": float(t2),
-                    "A": int(A), "B": int(B), "C": int(C), "D": int(D),
+                    "A": float(A), "B": float(B),
+                    "C": float(C), "D": float(D),
+                    "A_n": record["A_n"], "B_n": record["B_n"],
+                    "C_n": record["C_n"], "D_n": record["D_n"],
                     "A_hat": metrics["A_hat"],
                     "nonclosure": float(nc),
                     "legacy_nonclosure": metrics["legacy_nonclosure"],
@@ -218,6 +260,8 @@ def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500,
                 "neighbor_points": int(len(neighborhood)),
                 "min_A_effective": int(min_A_effective),
                 "min_region_effective": int(min_region_effective),
+                "min_A_weight": float(min_A_weight),
+                "min_region_weight": float(min_region_weight),
                 "max_ratio_unc": float(max_ratio_unc),
             })
     return best, _grid_summary(scan_abs_nonclosure)
@@ -274,22 +318,39 @@ def split_for_threshold_report(n_events, holdout_frac=0.5, seed=42,
     return rng.permutation(tune_idx), rng.permutation(report_idx), "holdout_stratified"
 
 
-def profile_plot(ax, x, y, nbins=30, logx=False, min_per_bin=20, label="mean ± SE"):
+def profile_plot(ax, x, y, nbins=30, logx=False, min_per_bin=20,
+                 label="mean +/- SE", weights=None):
     x, y = np.asarray(x), np.asarray(y)
-    m = np.isfinite(x) & np.isfinite(y)
+    weights = (
+        np.ones(len(x), dtype=np.float64) if weights is None
+        else np.asarray(weights, dtype=np.float64)
+    )
+    m = np.isfinite(x) & np.isfinite(y) & np.isfinite(weights) & (weights >= 0)
     if logx:
         m &= (x > 0)
-    x, y = x[m], y[m]
+    x, y, weights = x[m], y[m], weights[m]
     xu = np.log10(x) if logx else x
     lo, hi = float(xu.min()), float(xu.max())
     if lo == hi:
         hi = np.nextafter(hi, np.inf)
     edges = np.linspace(lo, hi, nbins + 1)
     centers = 0.5 * (edges[:-1] + edges[1:])
-    mean, _, _ = binned_statistic(xu, y, statistic="mean", bins=edges)
-    std,  _, _ = binned_statistic(xu, y, statistic="std",  bins=edges)
-    cnt,  _, _ = binned_statistic(xu, y, statistic="count",bins=edges)
-    sem = std / np.sqrt(np.maximum(cnt, 1))
+    bin_ids = np.clip(np.searchsorted(edges, xu, side="right") - 1, 0, nbins - 1)
+    mean = np.full(nbins, np.nan)
+    sem = np.full(nbins, np.nan)
+    cnt = np.bincount(bin_ids, minlength=nbins)
+    for index in range(nbins):
+        selected = bin_ids == index
+        if not selected.any() or weights[selected].sum() <= 0.0:
+            continue
+        bin_weights = weights[selected]
+        bin_values = y[selected]
+        total = bin_weights.sum()
+        mean[index] = np.sum(bin_weights * bin_values) / total
+        variance = np.sum(
+            bin_weights * (bin_values - mean[index]) ** 2) / total
+        effective_n = total * total / max(np.sum(bin_weights ** 2), 1e-12)
+        sem[index] = np.sqrt(max(variance, 0.0) / max(effective_n, 1.0))
     good = cnt >= min_per_bin
     xc = centers[good]
     xplot = (10.0 ** xc) if logx else xc
@@ -313,24 +374,62 @@ def _sample_pair(x, y, max_points, seed=42):
     return x.astype(np.float64), y.astype(np.float64)
 
 
-def _safe_correlations(x, y, max_points=50_000, dcor_points=2_000, seed=42):
-    x_s, y_s = _sample_pair(x, y, max_points, seed=seed)
+def _sample_weighted_pair(x, y, weights, max_points, seed=42):
+    x = np.asarray(x)
+    y = np.asarray(y)
+    weights = np.asarray(weights, dtype=np.float64)
+    valid = np.isfinite(x) & np.isfinite(y) & np.isfinite(weights) & (weights >= 0)
+    x, y, weights = x[valid], y[valid], weights[valid]
+    if max_points and max_points > 0 and x.shape[0] > max_points:
+        rng = np.random.default_rng(seed)
+        idx = rng.choice(x.shape[0], max_points, replace=False)
+        x, y, weights = x[idx], y[idx], weights[idx]
+    return x.astype(np.float64), y.astype(np.float64), weights
+
+
+def _weighted_pearson(x, y, weights):
+    total = weights.sum()
+    if total <= 0.0:
+        return np.nan
+    weights = weights / total
+    x_centered = x - np.sum(weights * x)
+    y_centered = y - np.sum(weights * y)
+    denominator = np.sqrt(
+        np.sum(weights * x_centered * x_centered)
+        * np.sum(weights * y_centered * y_centered))
+    if denominator <= 0.0:
+        return np.nan
+    return float(np.sum(weights * x_centered * y_centered) / denominator)
+
+
+def _safe_correlations(x, y, max_points=50_000, dcor_points=2_000, seed=42,
+                       weights=None):
+    if weights is None:
+        weights = np.ones(len(x), dtype=np.float64)
+    x_s, y_s, w_s = _sample_weighted_pair(
+        x, y, weights, max_points, seed=seed)
     out = {"n": int(x_s.shape[0]), "pearson": np.nan, "spearman": np.nan,
            "distance_corr": np.nan}
     if x_s.shape[0] < 3 or np.std(x_s) == 0 or np.std(y_s) == 0:
         return out
-    out["pearson"] = float(pearsonr(x_s, y_s).statistic)
-    out["spearman"] = float(spearmanr(x_s, y_s).statistic)
+    out["pearson"] = _weighted_pearson(x_s, y_s, w_s)
+    out["spearman"] = _weighted_pearson(
+        rankdata(x_s), rankdata(y_s), w_s)
     if dcor_points and dcor_points > 0:
-        x_d, y_d = _sample_pair(x, y, dcor_points, seed=seed + 1)
+        x_d, y_d, w_d = _sample_weighted_pair(
+            x, y, weights, dcor_points, seed=seed + 1)
         if x_d.shape[0] >= 3 and np.std(x_d) > 0 and np.std(y_d) > 0:
             ax = np.abs(x_d[:, None] - x_d[None, :])
             ay = np.abs(y_d[:, None] - y_d[None, :])
-            ax = ax - ax.mean(axis=0, keepdims=True) - ax.mean(axis=1, keepdims=True) + ax.mean()
-            ay = ay - ay.mean(axis=0, keepdims=True) - ay.mean(axis=1, keepdims=True) + ay.mean()
-            dcov2 = np.mean(ax * ay)
-            dvarx = np.mean(ax * ax)
-            dvary = np.mean(ay * ay)
+            w_d = w_d / max(w_d.sum(), 1e-12)
+            ax_row = ax @ w_d
+            ay_row = ay @ w_d
+            ax = ax - ax_row[:, None] - ax_row[None, :] + w_d @ ax_row
+            ay = ay - ay_row[:, None] - ay_row[None, :] + w_d @ ay_row
+            pair_weights = w_d[:, None] * w_d[None, :]
+            dcov2 = np.sum(pair_weights * ax * ay)
+            dvarx = np.sum(pair_weights * ax * ax)
+            dvary = np.sum(pair_weights * ay * ay)
             denom = np.sqrt(max(dvarx * dvary, 0.0))
             if denom > 0:
                 out["distance_corr"] = float(np.sqrt(max(dcov2, 0.0) / denom))
@@ -338,7 +437,8 @@ def _safe_correlations(x, y, max_points=50_000, dcor_points=2_000, seed=42):
 
 
 def per_class_correlations(axis1, axis2, labels, class_labels,
-                           corr_sample_size=50_000, dcor_sample_size=2_000):
+                           corr_sample_size=50_000, dcor_sample_size=2_000,
+                           weights=None):
     out = {}
     for cls in class_labels:
         mask = labels == int(cls)
@@ -346,17 +446,21 @@ def per_class_correlations(axis1, axis2, labels, class_labels,
             axis1[mask], axis2[mask],
             max_points=corr_sample_size,
             dcor_points=dcor_sample_size,
-            seed=42 + int(cls))
+            seed=42 + int(cls),
+            weights=None if weights is None else weights[mask])
     return out
 
 
-def per_class_abcd_at_thresholds(axis1, axis2, labels, class_labels, t1, t2):
+def per_class_abcd_at_thresholds(axis1, axis2, labels, class_labels, t1, t2,
+                                 weights=None):
     out = {}
     for cls in class_labels:
         mask = labels == int(cls)
         if mask.sum() == 0:
             continue
-        out[str(int(cls))] = abcd_record_at_thresholds(axis1[mask], axis2[mask], t1, t2)
+        class_weights = None if weights is None else weights[mask]
+        out[str(int(cls))] = abcd_record_at_thresholds(
+            axis1[mask], axis2[mask], t1, t2, weights=class_weights)
     return out
 
 
@@ -418,12 +522,15 @@ def load_ae(ae_ckpt_path, ae_scaler, device):
 
 # ── Inference ─────────────────────────────────────────────────────────────────
 
-def compute_ae_scores(ae, ae_scaler, pt_path, device, batch_size=4096):
+def compute_ae_scores(ae, ae_scaler, pt_path, device, batch_size=4096,
+                      gen_weight_path=None):
     """AE reco loss (MSE) per event using obj features from pt_path."""
     mu = ae_scaler["mu"].detach().cpu().float()
     std = ae_scaler["std"].detach().cpu().float().clamp(min=1e-8)
 
     raw = torch.load(pt_path, map_location="cpu")
+    event_weights, weight_metadata = load_event_weights(
+        gen_weight_path, raw)
     obj = raw["obj"]
     N = obj.shape[0]
     print(f"  AE inference on {N} events...", flush=True)
@@ -439,7 +546,11 @@ def compute_ae_scores(ae, ae_scaler, pt_path, device, batch_size=4096):
             mse = ((recon - xb) ** 2).mean(dim=1)
             scores.append(mse.cpu())
     del raw
-    return torch.cat(scores).numpy().astype(np.float32)
+    return (
+        torch.cat(scores).numpy().astype(np.float32),
+        event_weights.numpy().astype(np.float64),
+        weight_metadata,
+    )
 
 
 def embed_pf(model, pt_path, device, batch_size=512):
@@ -607,13 +718,15 @@ def ABCD(config):
     ae_reference = None
     if reference_pt:
         print("Computing AE scores (reference)...", flush=True)
-        ae_reference = compute_ae_scores(
+        ae_reference, reference_weights, reference_weight_metadata = compute_ae_scores(
             ae, ae_scaler, reference_pt, device,
-            batch_size=config.get("ae_batch_size", 4096))
+            batch_size=config.get("ae_batch_size", 4096),
+            gen_weight_path=config.get("reference_weights"))
     print("Computing AE scores (test)...", flush=True)
-    ae_bkg = compute_ae_scores(
+    ae_bkg, bkg_weights, test_weight_metadata = compute_ae_scores(
         ae, ae_scaler, config["test_pt"], device,
-        batch_size=config.get("ae_batch_size", 4096))
+        batch_size=config.get("ae_batch_size", 4096),
+        gen_weight_path=config.get("test_weights"))
 
     # free AE GPU memory before running encoder
     del ae
@@ -636,7 +749,8 @@ def ABCD(config):
             seed=int(config.get("reference_split_seed", 42)))
         references = fit_class_references(
             reference_latents, reference_labels, fit_idx, calibration_idx,
-            baseline_labels, n_components=config.get("n_pca"))
+            baseline_labels, n_components=config.get("n_pca"),
+            sample_weights=reference_weights)
         threshold_tune_source = "disjoint_uncalibrated_validation"
         if score_mode == "qcd_md":
             # QCD MD uses only the covariance fitted on fit_idx; it does not use
@@ -684,7 +798,7 @@ def ABCD(config):
             seed=int(config.get("reference_split_seed", 42)))
         references = fit_class_references(
             latents_all, labels, fit_idx, calibration_idx, baseline_labels,
-            n_components=config.get("n_pca"))
+            n_components=config.get("n_pca"), sample_weights=bkg_weights)
     con_bkg, score_products = score_latents(
         latents_all, logits_all, references,
         score_mode=score_mode, qcd_label=qcd_label)
@@ -699,6 +813,7 @@ def ABCD(config):
     axis1_bkg = ae_bkg[mask]
     axis2_bkg = con_bkg[mask]
     labels_masked  = labels[mask]
+    weights_masked = bkg_weights[mask]
     latents_masked = latents_all[mask]
     masked_score_products = {
         key: (value[mask] if isinstance(value, np.ndarray)
@@ -715,9 +830,11 @@ def ABCD(config):
     baseline_only = label_membership_mask(labels_masked, baseline_labels)
     axis1_qcd = axis1_bkg[qcd_only]
     axis2_qcd = axis2_pca[qcd_only]
+    weights_qcd = weights_masked[qcd_only]
     axis1_baselines = axis1_bkg[baseline_only]
     axis2_baselines = axis2_pca[baseline_only]
     labels_baselines = labels_masked[baseline_only]
+    weights_baselines = weights_masked[baseline_only]
     print(f"QCD events for ABCD: {qcd_only.sum()}", flush=True)
     print(f"Baseline events for ABCD: {baseline_only.sum()} labels={baseline_labels}", flush=True)
 
@@ -737,20 +854,24 @@ def ABCD(config):
             "all_background": _safe_correlations(
                 axis1_bkg, axis2_bkg,
                 max_points=corr_sample_size,
-                dcor_points=dcor_sample_size),
+                dcor_points=dcor_sample_size,
+                weights=weights_masked),
             "all_baselines": _safe_correlations(
                 axis1_baselines, axis2_baselines,
                 max_points=corr_sample_size,
-                dcor_points=dcor_sample_size),
+                dcor_points=dcor_sample_size,
+                weights=weights_baselines),
             "qcd": _safe_correlations(
                 axis1_qcd, axis2_qcd,
                 max_points=corr_sample_size,
-                dcor_points=dcor_sample_size),
+                dcor_points=dcor_sample_size,
+                weights=weights_qcd),
         },
         "per_class_correlations": per_class_correlations(
             axis1_bkg, axis2_bkg, labels_masked, baseline_labels,
             corr_sample_size=corr_sample_size,
-            dcor_sample_size=dcor_sample_size),
+            dcor_sample_size=dcor_sample_size,
+            weights=weights_masked),
         "score_definition": {
             "mode": score_mode,
             "abcd_scope": abcd_scope,
@@ -758,6 +879,9 @@ def ABCD(config):
             "reference_labels": baseline_labels,
             "reference_is_independent_of_test": bool(reference_pt),
             "reference_splits": reference_details,
+            "reference_weight_metadata": (
+                reference_weight_metadata if reference_pt else None),
+            "test_weight_metadata": test_weight_metadata,
         },
         "class_assignment": class_assignment_diagnostics(
             labels_masked, masked_score_products),
@@ -821,6 +945,7 @@ def ABCD(config):
 
     # ── signal (optional) ─────────────────────────────────────────────────────
     sig_axis1 = sig_axis2 = sig_axis2_pca = None
+    sig_weights_masked = None
     sig_latents_masked = sig_emb_pca = None
     if config.get("signal_pt"):
         gc.collect()
@@ -835,9 +960,10 @@ def ABCD(config):
             score_mode=score_mode, qcd_label=qcd_label)
 
         ae_sig = load_ae(config["ae_ckpt"], ae_scaler, device)
-        sig_ae = compute_ae_scores(
+        sig_ae, sig_weights, signal_weight_metadata = compute_ae_scores(
             ae_sig, ae_scaler, config["signal_pt"], device,
-            batch_size=config.get("ae_batch_size", 4096))
+            batch_size=config.get("ae_batch_size", 4096),
+            gen_weight_path=config.get("signal_weights"))
         del ae_sig
 
         sig_mask = np.isfinite(sig_ae) & np.isfinite(sig_con) & (sig_ae > 0)
@@ -848,6 +974,9 @@ def ABCD(config):
         # Every main AE-vs-score plot must use the same deployed axis for signal
         # and background. QCD-coordinate PCA plots use sig_emb_pca explicitly.
         sig_axis2_pca     = sig_axis2
+        sig_weights_masked = sig_weights[sig_mask]
+        diagnostics["score_definition"]["signal_weight_metadata"] = (
+            signal_weight_metadata)
         print(f"Signal events after masking: {sig_mask.sum()}", flush=True)
 
     # ── ABCD scan ─────────────────────────────────────────────────────────────
@@ -872,11 +1001,13 @@ def ABCD(config):
         axis1_report = axis1_baselines
         axis2_report = axis2_baselines
         labels_report = labels_baselines
+        weights_report = weights_baselines
         scope_name = "all_baselines"
     elif abcd_scope == "qcd":
         axis1_report = axis1_qcd
         axis2_report = axis2_qcd
         labels_report = labels_masked[qcd_only]
+        weights_report = weights_qcd
         scope_name = "qcd"
     else:
         raise ValueError(f"Unsupported abcd_scope={abcd_scope!r}")
@@ -897,6 +1028,7 @@ def ABCD(config):
                     reference_labels[reference_candidates], baseline_labels)]
         axis1_tune = ae_reference[reference_candidates]
         axis2_tune = reference_axis2[reference_candidates]
+        weights_tune = reference_weights[reference_candidates]
         closure_mode = "train_validation_to_independent_test"
     else:
         tune_idx, report_idx, closure_mode = split_for_threshold_report(
@@ -904,7 +1036,9 @@ def ABCD(config):
             axis1=axis1_report, axis2=axis2_report,
             strata_labels=labels_report if scope_name == "all_baselines" else None)
         axis1_tune, axis2_tune = axis1_report[tune_idx], axis2_report[tune_idx]
+        weights_tune = weights_report[tune_idx]
         axis1_report, axis2_report = axis1_report[report_idx], axis2_report[report_idx]
+        weights_report = weights_report[report_idx]
         labels_report = labels_report[report_idx]
     print(
         f"ABCD threshold scope: {scope_name}; mode: {closure_mode}; "
@@ -918,13 +1052,16 @@ def ABCD(config):
         selection_neighbor_weight=selection_neighbor_weight,
         selection_neighbor_radius=selection_neighbor_radius,
         min_region_frac=min_region_frac, max_ratio_unc=max_ratio_unc,
-        selection_folds=selection_folds, selection_seed=split_seed)
+        selection_folds=selection_folds, selection_seed=split_seed,
+        weights=weights_tune)
     if "t1" not in best_tune:
         raise RuntimeError("No ABCD working point found on threshold-tuning split. "
                            "Try lowering min_A/min_D or closure_holdout_frac.")
 
     t1_opt, t2_opt = best_tune["t1"], best_tune["t2"]
-    report_at_selected = abcd_record_at_thresholds(axis1_report, axis2_report, t1_opt, t2_opt)
+    report_at_selected = abcd_record_at_thresholds(
+        axis1_report, axis2_report, t1_opt, t2_opt,
+        weights=weights_report)
     report_at_selected.update({
         "p1": float(best_tune["p1"]),
         "p2": float(best_tune["p2"]),
@@ -938,9 +1075,11 @@ def ABCD(config):
         selection_neighbor_weight=selection_neighbor_weight,
         selection_neighbor_radius=selection_neighbor_radius,
         min_region_frac=min_region_frac, max_ratio_unc=max_ratio_unc,
-        selection_folds=selection_folds, selection_seed=split_seed)
+        selection_folds=selection_folds, selection_seed=split_seed,
+        weights=weights_report)
     selected_per_class = per_class_abcd_at_thresholds(
-        axis1_report, axis2_report, labels_report, baseline_labels, t1_opt, t2_opt)
+        axis1_report, axis2_report, labels_report, baseline_labels, t1_opt,
+        t2_opt, weights=weights_report)
 
     print(f"Optimized on tune split: p1={best_tune['p1']:.3f}, p2={best_tune['p2']:.3f}", flush=True)
     print(f"Thresholds: t1={t1_opt:.4g}, t2={t2_opt:.4g}", flush=True)
@@ -968,6 +1107,8 @@ def ABCD(config):
         "selection_folds": selection_folds,
         "tune_n": int(len(axis1_tune)),
         "report_n": int(len(axis1_report)),
+        "tune_sum_weights": float(weights_tune.sum()),
+        "report_sum_weights": float(weights_report.sum()),
         "tune_best": best_tune,
         "report_at_selected": report_at_selected,
         "report_at_selected_per_class": selected_per_class,
@@ -1006,19 +1147,22 @@ def ABCD(config):
         "ABCD/grid_median_abs_nonclosure": grid_summary["median_abs_nonclosure"],
         "ABCD/grid_p90_abs_nonclosure": grid_summary["p90_abs_nonclosure"],
         "ABCD/grid_points": grid_summary["n_points"],
-        "ABCD/A": int(report_at_selected["A"]), "ABCD/B": int(report_at_selected["B"]),
-        "ABCD/C": int(report_at_selected["C"]), "ABCD/D": int(report_at_selected["D"]),
+        "ABCD/A": float(report_at_selected["A"]),
+        "ABCD/B": float(report_at_selected["B"]),
+        "ABCD/C": float(report_at_selected["C"]),
+        "ABCD/D": float(report_at_selected["D"]),
     })
 
     if sig_axis1 is not None and sig_axis2 is not None:
-        sig_A, sig_B, sig_C, sig_D = abcd_counts_at_thresholds(sig_axis1, sig_axis2, t1_opt, t2_opt)
-        sig_total = max(len(sig_axis1), 1)
+        sig_A, sig_B, sig_C, sig_D = abcd_counts_at_thresholds(
+            sig_axis1, sig_axis2, t1_opt, t2_opt,
+            weights=sig_weights_masked)
+        sig_total = max(float(sig_weights_masked.sum()), 1e-12)
         signal_metrics = {
             "N": int(len(sig_axis1)),
-            "A": int(sig_A),
-            "B": int(sig_B),
-            "C": int(sig_C),
-            "D": int(sig_D),
+            "sum_weights": float(sig_total),
+            "A": float(sig_A), "B": float(sig_B),
+            "C": float(sig_C), "D": float(sig_D),
             "eff_A": float(sig_A / sig_total),
             "eff_B": float(sig_B / sig_total),
             "eff_C": float(sig_C / sig_total),
@@ -1048,7 +1192,9 @@ def ABCD(config):
     fig = plt.figure(figsize=(6, 5))
     xbins = np.geomspace(axis1_bkg[axis1_bkg > 0].min(), axis1_bkg.max(), 201)
     ybins = np.geomspace(axis2_bkg[axis2_bkg > 0].min(), axis2_bkg.max(), 201)
-    plt.hist2d(axis1_bkg, axis2_bkg, bins=[xbins, ybins], norm=LogNorm(vmin=1), cmin=1)
+    plt.hist2d(
+        axis1_bkg, axis2_bkg, bins=[xbins, ybins],
+        weights=weights_masked, norm=LogNorm())
     plt.xscale("log"); plt.yscale("log")
     plt.axvline(t1_opt, color="black", linestyle="--", linewidth=1.0)
     plt.axhline(t2_opt, color="black", linestyle="--", linewidth=1.0)
@@ -1085,7 +1231,9 @@ def ABCD(config):
         fig = plt.figure(figsize=(6, 5))
         xbins_s = np.geomspace(sig_axis1[sig_axis1 > 0].min(), sig_axis1.max(), 101)
         ybins_s = np.geomspace(sig_axis2[sig_axis2 > 0].min(), sig_axis2.max(), 101)
-        plt.hist2d(sig_axis1, sig_axis2, bins=[xbins_s, ybins_s], norm=LogNorm(vmin=1), cmin=1)
+        plt.hist2d(
+            sig_axis1, sig_axis2, bins=[xbins_s, ybins_s],
+            weights=sig_weights_masked, norm=LogNorm())
         plt.xscale("log"); plt.yscale("log")
         plt.axvline(t1_opt, color="black", linestyle="--", linewidth=1.0)
         plt.axhline(t2_opt, color="black", linestyle="--", linewidth=1.0)
@@ -1105,7 +1253,9 @@ def ABCD(config):
         fig = plt.figure(figsize=(6, 5))
         xbins_c = np.geomspace(x_cls[x_cls > 0].min(), x_cls.max(), 101)
         ybins_c = np.geomspace(y_cls[y_cls > 0].min(), y_cls.max(), 101)
-        plt.hist2d(x_cls, y_cls, bins=[xbins_c, ybins_c], norm=LogNorm(vmin=1), cmin=1)
+        plt.hist2d(
+            x_cls, y_cls, bins=[xbins_c, ybins_c],
+            weights=weights_masked[m], norm=LogNorm())
         plt.xscale("log"); plt.yscale("log")
         plt.axvline(t1_opt, color="black", linestyle="--", linewidth=1.0)
         plt.xlabel("AE reco loss", fontsize=fs)
@@ -1163,19 +1313,22 @@ def ABCD(config):
         for cls, name in all_classes_for_kde:
             if cls == -1:
                 x_raw, y_raw = sig_axis1, sig_axis2_pca
+                w_raw = sig_weights_masked
                 color = "tab:purple"
             else:
                 m = labels_masked == cls
                 if m.sum() < 50:
                     continue
                 x_raw, y_raw = axis1_bkg[m], axis2_pca[m]
+                w_raw = weights_masked[m]
                 color = class_colors[cls]
             valid = (x_raw > 0) & (y_raw > 0) & np.isfinite(x_raw) & np.isfinite(y_raw)
             lx = np.log10(x_raw[valid]); ly = np.log10(y_raw[valid])
+            kde_weights = w_raw[valid]
             if lx.shape[0] > 20_000:
                 idx = rng_pca.choice(lx.shape[0], 20_000, replace=False)
-                lx, ly = lx[idx], ly[idx]
-            kde = gaussian_kde(np.vstack([lx, ly]))
+                lx, ly, kde_weights = lx[idx], ly[idx], kde_weights[idx]
+            kde = gaussian_kde(np.vstack([lx, ly]), weights=kde_weights)
             zi  = kde(np.vstack([xi_global.flatten(), yi_global.flatten()]))
             zi_grid = zi.reshape(xi_global.shape)
             # only draw contours in the bulk; suppress far-tail lines
@@ -1264,7 +1417,9 @@ def ABCD(config):
          "⟨NURD MD⟩ vs AE loss", "contrastive_vs_AE"),
     ]:
         fig, ax = plt.subplots(figsize=fig_size)
-        profile_plot(ax, x_arr, y_arr, nbins=60, logx=True)
+        profile_plot(
+            ax, x_arr, y_arr, nbins=60, logx=True,
+            weights=weights_masked)
         ax.set_xlabel(xlabel, fontsize=fs); ax.set_ylabel(ylabel, fontsize=fs)
         ax.set_title(title)
         plt.tick_params(axis="x", labelsize=fs_leg)
@@ -1284,7 +1439,9 @@ def ABCD(config):
             m = labels_masked == cls
             if m.sum() < 20:
                 continue
-            profile_plot(ax, x_arr[m], y_arr[m], nbins=40, logx=True, label=name)
+            profile_plot(
+                ax, x_arr[m], y_arr[m], nbins=40, logx=True, label=name,
+                weights=weights_masked[m])
         ax.set_xlabel(xlabel, fontsize=fs); ax.set_ylabel(ylabel, fontsize=fs)
         ax.set_title(title); ax.legend(fontsize=fs_legend)
         plt.tick_params(axis="x", labelsize=fs_leg)
@@ -1297,21 +1454,17 @@ def ABCD(config):
     effs, closure_ratio, closure_unc = [], [], []
     curve_axis1 = axis1_report
     curve_axis2 = axis2_report
-    Ntot_bkg = float(len(curve_axis1))
+    curve_weights = weights_report
+    Ntot_bkg = float(curve_weights.sum())
 
     for p in percent:
-        t1, t2, A, B, C, D = abcd_counts(curve_axis1, curve_axis2, p, p)
-        A_hat  = (B * C) / max(D, 1e-8)
-        ratio  = A_hat / max(A, 1e-8)
-        invA   = 0.0 if A == 0 else 1.0 / A
-        invB   = 0.0 if B == 0 else 1.0 / B
-        invC   = 0.0 if C == 0 else 1.0 / C
-        invD   = 0.0 if D == 0 else 1.0 / D
-        rel_var = invA + invB + invC + invD
-        sigma  = abs(ratio) * np.sqrt(rel_var) if rel_var > 0 else 0.0
-        effs.append(A / max(Ntot_bkg, 1.0))
-        closure_ratio.append(ratio)
-        closure_unc.append(sigma)
+        t1, t2, _A, _B, _C, _D = abcd_counts(
+            curve_axis1, curve_axis2, p, p, weights=curve_weights)
+        record = abcd_record_at_thresholds(
+            curve_axis1, curve_axis2, t1, t2, weights=curve_weights)
+        effs.append(record["A"] / max(Ntot_bkg, 1e-12))
+        closure_ratio.append(record["ratio"])
+        closure_unc.append(record["ratio_unc"])
 
     effs          = np.array(effs)
     closure_ratio = np.array(closure_ratio)
@@ -1398,10 +1551,10 @@ def ABCD(config):
             "min_region_frac": min_region_frac,
             "max_ratio_unc": max_ratio_unc,
             "selection_folds": selection_folds,
-            "report_A": int(report_at_selected["A"]),
-            "report_B": int(report_at_selected["B"]),
-            "report_C": int(report_at_selected["C"]),
-            "report_D": int(report_at_selected["D"]),
+            "report_A": float(report_at_selected["A"]),
+            "report_B": float(report_at_selected["B"]),
+            "report_C": float(report_at_selected["C"]),
+            "report_D": float(report_at_selected["D"]),
             "report_per_class": selected_per_class,
             "signal_at_selected": diagnostics.get("signal_at_selected"),
         }, f, indent=2)
@@ -1412,6 +1565,7 @@ def ABCD(config):
         "ae_score": axis1_bkg.astype(np.float32),
         "selected_score": axis2_bkg.astype(np.float32),
         "true_label": labels_masked.astype(np.int16),
+        "event_weight": weights_masked.astype(np.float32),
         "score_mode": np.asarray(score_mode),
     }
     score_payload.update({
@@ -1437,11 +1591,17 @@ if __name__ == "__main__":
                         help="Path to AE checkpoint (checkpoint_ae.pth)")
     parser.add_argument("--test_pt",      required=True,
                         help="Path to test .pt file (SM cocktail)")
+    parser.add_argument("--test_weights", default=None,
+                        help="Event-aligned generator weights for --test_pt.")
     parser.add_argument("--reference_pt", default=None,
                         help="Training .pt file used to fit class references and select "
                              "thresholds on its model-validation split. Required for final results.")
+    parser.add_argument("--reference_weights", default=None,
+                        help="Event-aligned generator weights for --reference_pt.")
     parser.add_argument("--signal_pt",    default=None,
                         help="Optional signal .pt file")
+    parser.add_argument("--signal_weights", default=None,
+                        help="Optional event-aligned generator weights for --signal_pt.")
     parser.add_argument("--outdir",       default="outputs_abcd")
     parser.add_argument("--min_A",        type=int, default=50)
     parser.add_argument("--min_D",        type=int, default=500)

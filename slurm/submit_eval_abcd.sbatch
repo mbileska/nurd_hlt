@@ -17,8 +17,12 @@ set -u
 
 BASE="${BASE:-/scratch/gpfs/IOJALVO/mb7126/nurd_hlt}"
 CODE_DIR="${CODE_DIR:-/home/mb7126/nurd_hlt}"
-TEST_PT="${TEST_PT:-$BASE/data/hlt_smcocktail_test.pt}"
-REFERENCE_PT="${REFERENCE_PT:-$BASE/data/hlt_smcocktail_train.pt}"
+MEQUINNA_DIR="${MEQUINNA_DIR:-$BASE/data/mequinna_1M_noZB}"
+TEST_PT="${TEST_PT:-$MEQUINNA_DIR/hlt_smcocktail_mequinna_test.pt}"
+REFERENCE_PT="${REFERENCE_PT:-$MEQUINNA_DIR/hlt_smcocktail_mequinna_train.pt}"
+TEST_WEIGHTS="${TEST_WEIGHTS:-$MEQUINNA_DIR/weight_test.pt}"
+REFERENCE_WEIGHTS="${REFERENCE_WEIGHTS:-$MEQUINNA_DIR/weight_train.pt}"
+SIGNAL_WEIGHTS="${SIGNAL_WEIGHTS:-}"
 SIGNAL_PT="${SIGNAL_PT:-$BASE/data/hlt_signal_TpTp.pt}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-256}"
 AE_BATCH_SIZE="${AE_BATCH_SIZE:-4096}"
@@ -103,10 +107,17 @@ if [[ ! -f "$REFERENCE_PT" ]]; then
   echo "ERROR: training reference sample not found: $REFERENCE_PT"
   exit 2
 fi
+if [[ ! -f "$TEST_WEIGHTS" || ! -f "$REFERENCE_WEIGHTS" ]]; then
+  echo "ERROR: generator-weight files are missing."
+  exit 2
+fi
 
 SIGNAL_ARGS=()
 if [[ -n "${SIGNAL_PT:-}" && -f "$SIGNAL_PT" ]]; then
   SIGNAL_ARGS=(--signal_pt "$SIGNAL_PT")
+  if [[ -n "$SIGNAL_WEIGHTS" && -f "$SIGNAL_WEIGHTS" ]]; then
+    SIGNAL_ARGS+=(--signal_weights "$SIGNAL_WEIGHTS")
+  fi
 fi
 
 EXTRA_ARGS=()
@@ -131,6 +142,8 @@ echo "AE_CKPT: $AE_CKPT"
 echo "CKPT: $CKPT"
 echo "TEST_PT: $TEST_PT"
 echo "REFERENCE_PT: $REFERENCE_PT"
+echo "TEST_WEIGHTS: $TEST_WEIGHTS"
+echo "REFERENCE_WEIGHTS: $REFERENCE_WEIGHTS"
 echo "SIGNAL_PT: ${SIGNAL_PT:-}"
 echo "EVAL_BATCH_SIZE: $EVAL_BATCH_SIZE"
 echo "AE_BATCH_SIZE: $AE_BATCH_SIZE"
@@ -173,7 +186,9 @@ python eval_abcd_nurd.py \
   --ckpt "$CKPT" \
   --ae_ckpt "$AE_CKPT" \
   --test_pt "$TEST_PT" \
+  --test_weights "$TEST_WEIGHTS" \
   --reference_pt "$REFERENCE_PT" \
+  --reference_weights "$REFERENCE_WEIGHTS" \
   "${SIGNAL_ARGS[@]}" \
   --outdir "$OUTDIR" \
   --wandb_project nurd-ood-hlt \

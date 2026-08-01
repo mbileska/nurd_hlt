@@ -5,41 +5,68 @@ The nuisance variable z is the **binned AE reconstruction loss**.
 NURD exact weights w(y,z) = p(y)*p(z)/p(y,z) are pre-computed on load
 so that train_exact.py can look them up with dataset.weights[(y,z)].
 
-Dataset returns (pf_features, label, nuisance_bin, ae_reco, nurd_weight)
+Dataset returns (pf_features, label, nuisance_bin, ae_reco, nurd_weight,
+generator_weight)
 per event.
 """
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from collections import Counter
+from collections import Counter, defaultdict
 from sklearn.model_selection import train_test_split
 
+from utils.event_weights import (
+    load_event_weights,
+    weighted_mean_and_std,
+    weighted_quantile,
+)
 
-def _make_nurd_weights(labels, nuisances, max_weight_ratio=10.0):
+
+def _make_nurd_weights(labels, nuisances, max_weight_ratio=10.0,
+                       base_weights=None):
     """
     Exact NURD weights: w(y,z) = p(y)*p(z)/p(y,z) = n_y*n_z / (N*n_yz).
     Under this weighting, y and z are marginally independent.
     Normalized so that the per-sample mean weight equals 1, then clipped at
     max_weight_ratio × mean to prevent extreme weights from destabilising training.
     """
-    N = len(labels)
-    if N == 0:
+    n_events = len(labels)
+    if n_events == 0:
         raise ValueError("Cannot fit NURD weights on an empty sample.")
     if max_weight_ratio < 1.0:
         raise ValueError("max_weight_ratio must be at least 1.0.")
-    labels_list    = [int(y) for y in labels.tolist()]
+    labels_list = [int(y) for y in labels.tolist()]
     nuisances_list = [int(z) for z in nuisances.tolist()]
+    if base_weights is None:
+        base_weights = torch.ones(n_events, dtype=torch.float64)
+    base_weights = torch.as_tensor(base_weights).double().reshape(-1)
+    if base_weights.numel() != n_events:
+        raise ValueError("base_weights must align with labels and nuisances.")
+    if (base_weights < 0).any() or not torch.isfinite(base_weights).all():
+        raise ValueError("NURD base weights must be finite and non-negative.")
 
-    group_counts    = Counter(zip(labels_list, nuisances_list))
-    label_counts    = Counter(labels_list)
-    nuisance_counts = Counter(nuisances_list)
+    group_counts = Counter(zip(labels_list, nuisances_list))
+    group_sums = defaultdict(float)
+    label_sums = defaultdict(float)
+    nuisance_sums = defaultdict(float)
+    for y, z, weight in zip(labels_list, nuisances_list, base_weights.tolist()):
+        group_sums[(y, z)] += weight
+        label_sums[y] += weight
+        nuisance_sums[z] += weight
+    total_weight = float(base_weights.sum().item())
+    if total_weight <= 0.0:
+        raise ValueError("NURD base weights have non-positive total weight.")
 
     weights_raw = {
-        (y, z): (label_counts[y] * nuisance_counts[z]) / (N * n_yz)
-        for (y, z), n_yz in group_counts.items()
+        (y, z): (label_sums[y] * nuisance_sums[z])
+        / (total_weight * group_weight)
+        for (y, z), group_weight in group_sums.items()
+        if group_weight > 0.0
     }
-    # Normalize so E[w] = 1 over all training samples.
-    mean_w = sum(weights_raw[k] * v for k, v in group_counts.items()) / N
+    # Normalize so E_gen[w_NURD] = 1 over the physical training measure.
+    mean_w = sum(
+        weights_raw[k] * group_sums[k] for k in weights_raw
+    ) / total_weight
     weights_norm = {k: v / mean_w for k, v in weights_raw.items()}
 
     # Find a common scale for min(scale * w, cap) whose sample-weighted mean is
@@ -48,9 +75,9 @@ def _make_nurd_weights(labels, nuisances, max_weight_ratio=10.0):
 
     def clipped_mean(scale):
         return sum(
-            min(scale * weights_norm[k], cap) * count
-            for k, count in group_counts.items()
-        ) / N
+            min(scale * weights_norm[k], cap) * group_sums[k]
+            for k in weights_norm
+        ) / total_weight
 
     low, high = 0.0, 1.0
     while clipped_mean(high) < 1.0:
@@ -98,10 +125,12 @@ class HLTSmCocktailDataset(Dataset):
         labels:        [N] long
         nuisances_all: [N] binned AE reconstruction-loss nuisance
         ae_reco_all:   [N] continuous AE reconstruction loss
+        gen_weights:   [N] generator/event weights
         idx:           selected event indices for this split
         split:      "train" | "val"
     """
-    def __init__(self, pf_data, labels, nuisances_all, ae_reco_all, idx,
+    def __init__(self, pf_data, labels, nuisances_all, ae_reco_all,
+                 gen_weights, idx,
                  split="train", bin_edges=None, max_weight_ratio=10.0,
                  weight_table=None):
         super().__init__()
@@ -111,6 +140,7 @@ class HLTSmCocktailDataset(Dataset):
         self.labels_all = labels
         self.nuisances_all = nuisances_all
         self.ae_reco_all = ae_reco_all
+        self.gen_weights_all = gen_weights
         self.idx = idx.long()
         self.split = split
         self.num_tokens = pf_data.size(1)
@@ -118,6 +148,7 @@ class HLTSmCocktailDataset(Dataset):
         self.labels = labels[self.idx].float()
         self.nuisances = nuisances_all[self.idx].float()
         self.ae_reco = ae_reco_all[self.idx].float()
+        self.gen_weights = gen_weights[self.idx].float()
 
         # ── NURD exact weights ────────────────────────────────────────────────
         labels_split = labels[self.idx]
@@ -125,7 +156,8 @@ class HLTSmCocktailDataset(Dataset):
         if weight_table is None:
             self.weights = _make_nurd_weights(
                 labels_split, nuisances_split,
-                max_weight_ratio=max_weight_ratio)
+                max_weight_ratio=max_weight_ratio,
+                base_weights=self.gen_weights)
             weight_source = split
         else:
             self.weights = dict(weight_table)
@@ -157,10 +189,12 @@ class HLTSmCocktailDataset(Dataset):
         for (label, nuisance), value in self.weights.items():
             weight_lookup[label, nuisance] = float(value)
         self.sample_weights = weight_lookup[labels_split, nuisances_split]
+        combined = self.sample_weights * self.gen_weights
+        combined_mean = combined.sum() / self.gen_weights.sum().clamp(min=1e-8)
         print(
             f"[{split}] NURD weights fit={weight_source} "
             f"groups={len(self.weights)}  "
-            f"sample_mean={self.sample_weights.mean().item():.3f}  "
+            f"physical_mean={combined_mean.item():.3f}  "
             f"sample_std={self.sample_weights.std(unbiased=False).item():.3f}  "
             f"min={self.sample_weights.min().item():.3f}  "
             f"max={self.sample_weights.max().item():.3f}"
@@ -177,38 +211,48 @@ class HLTSmCocktailDataset(Dataset):
             self.nuisances[idx],
             self.ae_reco[idx],
             self.sample_weights[idx],
+            self.gen_weights[idx],
         )
 
     def get_label_prior(self):
-        total = len(self.labels)
-        counts = Counter(int(y) for y in self.labels.tolist())
+        total = float(self.gen_weights.sum().item())
+        counts = defaultdict(float)
+        for label, weight in zip(self.labels.tolist(), self.gen_weights.tolist()):
+            counts[int(label)] += float(weight)
         return {k: v / total for k, v in counts.items()}
 
     def get_nuisance_prior(self, label=None):
         nuisances = self.nuisances
+        weights = self.gen_weights
         if label is not None:
             if isinstance(label, (list, tuple, set)):
                 label_mask = _label_mask(self.labels.long(), label)
             else:
                 label_mask = self.labels.long() == int(label)
             nuisances = nuisances[label_mask]
-        total = len(nuisances)
-        if total == 0:
+            weights = weights[label_mask]
+        total = float(weights.sum().item())
+        if nuisances.numel() == 0 or total <= 0.0:
             return {}
-        counts = Counter(int(z) for z in nuisances.tolist())
+        counts = defaultdict(float)
+        for nuisance, weight in zip(nuisances.tolist(), weights.tolist()):
+            counts[int(nuisance)] += float(weight)
         return {k: v / total for k, v in counts.items()}
 
 
 def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
                        max_events=-1, ae_scaler=None, ae_batch_size=4096,
                        max_weight_ratio=10.0, nuisance_bin_scope="all",
-                       qcd_label=1, baseline_labels=None):
+                       qcd_label=1, baseline_labels=None,
+                       gen_weight_path=None):
     """
     Load the HLT .pt file, pre-normalise obj features, and return
     (train_dataset, val_dataset).  Call once; pass the same bin_edges
     to both splits so nuisance definitions are consistent.
     """
     raw = torch.load(pt_path, map_location="cpu")
+    gen_weights, gen_weight_metadata = load_event_weights(
+        gen_weight_path, raw, max_events=max_events)
     pf     = raw["pf"]
     labels = raw["label"].long()
     obj    = raw["obj"]
@@ -216,11 +260,20 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
         pf, labels, obj = pf[:max_events], labels[:max_events], obj[:max_events]
     pf = torch.nan_to_num(pf, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # flatten + z-score normalise obj features (first 4 features per cand)
+    idx_all = np.arange(len(labels))
+    idx_tr, idx_val = train_test_split(
+        idx_all, test_size=val_split, random_state=seed,
+        stratify=labels.cpu().numpy()
+    )
+    idx_tr = torch.tensor(idx_tr, dtype=torch.long)
+    idx_val = torch.tensor(idx_val, dtype=torch.long)
+
+    # Flatten object features and fit fallback normalization on training events
+    # only. The normal path uses the scaler saved by the weighted AE checkpoint.
     obj_flat = obj[:, :, :4].reshape(obj.shape[0], -1).float()
     if ae_scaler is None:
-        mu = obj_flat.mean(dim=0)
-        std = obj_flat.std(dim=0, unbiased=False)
+        mu, std = weighted_mean_and_std(
+            obj_flat[idx_tr], gen_weights[idx_tr], dim=0)
         std = torch.where(std < 1e-8, torch.ones_like(std), std)
     else:
         mu = _as_float_tensor(ae_scaler["mu"])
@@ -238,14 +291,6 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
     ae_reco_all = _compute_ae_reco(obj_norm, ae_model, batch_size=ae_batch_size)
     del obj_norm
 
-    idx_all = np.arange(len(labels))
-    idx_tr, idx_val = train_test_split(
-        idx_all, test_size=val_split, random_state=seed,
-        stratify=labels.cpu().numpy()
-    )
-    idx_tr = torch.tensor(idx_tr, dtype=torch.long)
-    idx_val = torch.tensor(idx_val, dtype=torch.long)
-
     quantiles = torch.linspace(0, 1, n_bins + 1)
     if baseline_labels is None:
         baseline_labels = sorted(int(v) for v in torch.unique(labels).tolist())
@@ -258,11 +303,13 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
                 f"Cannot build QCD-scoped nuisance bins: no training "
                 f"label={qcd_label} events found."
             )
-        bin_edges = torch.quantile(bin_source, quantiles)
+        bin_edges = weighted_quantile(
+            bin_source, quantiles, gen_weights[idx_tr][train_qcd])
         nuisances_all = torch.bucketize(ae_reco_all, bin_edges[1:-1]).long()
     elif nuisance_bin_scope == "all":
         bin_source = ae_reco_all[idx_tr]
-        bin_edges = torch.quantile(bin_source, quantiles)
+        bin_edges = weighted_quantile(
+            bin_source, quantiles, gen_weights[idx_tr])
         nuisances_all = torch.bucketize(ae_reco_all, bin_edges[1:-1]).long()
     elif nuisance_bin_scope in {"per_class", "per_label", "baseline_per_class"}:
         nuisances_all = torch.zeros_like(labels, dtype=torch.long)
@@ -273,7 +320,9 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
             train_mask = labels[idx_tr] == label
             if train_mask.sum() == 0:
                 continue
-            edges = torch.quantile(ae_reco_all[idx_tr][train_mask], quantiles)
+            edges = weighted_quantile(
+                ae_reco_all[idx_tr][train_mask], quantiles,
+                gen_weights[idx_tr][train_mask])
             mask = labels == label
             nuisances_all[mask] = torch.bucketize(ae_reco_all[mask], edges[1:-1]).long()
             bin_edges[label] = edges
@@ -288,19 +337,21 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
                         "the class is absent from the training split."
                     )
                 mask = labels == label
-                edges = torch.quantile(ae_reco_all[idx_tr][train_mask], quantiles)
+                edges = weighted_quantile(
+                    ae_reco_all[idx_tr][train_mask], quantiles,
+                    gen_weights[idx_tr][train_mask])
                 nuisances_all[mask] = torch.bucketize(ae_reco_all[mask], edges[1:-1]).long()
                 bin_edges[label] = edges
     else:
         raise ValueError(f"Unsupported nuisance_bin_scope={nuisance_bin_scope!r}")
 
     ds_train = HLTSmCocktailDataset(
-        pf, labels, nuisances_all, ae_reco_all, idx_tr,
+        pf, labels, nuisances_all, ae_reco_all, gen_weights, idx_tr,
         split="train", bin_edges=bin_edges,
         max_weight_ratio=max_weight_ratio)
     ds_val = HLTSmCocktailDataset(
-        pf, labels, nuisances_all, ae_reco_all, idx_val,
+        pf, labels, nuisances_all, ae_reco_all, gen_weights, idx_val,
         split="val", bin_edges=bin_edges,
         max_weight_ratio=max_weight_ratio,
         weight_table=ds_train.weights)
-    return ds_train, ds_val, obj_scaler
+    return ds_train, ds_val, obj_scaler, gen_weight_metadata

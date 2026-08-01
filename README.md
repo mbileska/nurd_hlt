@@ -23,13 +23,13 @@ because the primary ABCD estimate is evaluated on QCD.
 - The Mequinna release also provides event-aligned `weight_train.pt` and
   `weight_test.pt` generator weights. These are physics generator weights, not
   the NURD label/nuisance weights described below.
-- **Current status:** commit `b70c9da` does not yet consume the separate
-  generator-weight files. Copy and validate them, but do not submit the full
-  Mequinna campaign until generator weights are wired through training,
-  validation, ABCD yields, and uncertainties.
+- Generator weights are now required by the default Mequinna Slurm campaign.
+  They are applied consistently to AE and NURD losses, nuisance-bin quantiles,
+  NURD frequency estimates, critic/closure objectives, latent references,
+  validation checkpoint selection, and final ABCD yields.
 - AE reconstruction is computed once. The train/validation split is made before
   fitting nuisance preprocessing.
-- Forty AE-loss nuisance bins are fitted from training QCD only, then the same
+- Twenty generator-weighted AE-loss nuisance bins are fitted from training QCD only, then the same
   edges are applied to every training and validation event. Validation data
   cannot influence the nuisance definition.
 - Exact NURD weights are fitted on training data only and reused unchanged for
@@ -43,29 +43,26 @@ because the primary ABCD estimate is evaluated on QCD.
 
 - All-background classifier and supervised contrastive losses are unchanged in
   scope: all four backgrounds teach the encoder their structure.
-- Training batches contain 25% QCD so the closure terms see about 1024 QCD
-  events at batch size 4096. Constant importance corrections preserve the
-  natural all-background classifier objective.
-- A direct QCD nuisance critic predicts AE-loss bins at 10-, 20-, and 40-bin
-  resolutions. Critic updates use unweighted natural QCD, not NURD weights.
-- The encoder minimizes `KL(nuisance prior || critic prediction)` for every
-  critic head. This bounded objective removes event-level AE-bin information
-  without maximizing an unbounded cross-entropy.
+- Natural shuffled batches are used by default; QCD-rich sampling remains an
+  explicit optional experiment.
+- A QCD density-ratio critic distinguishes real `(latent, AE-bin)` pairs from
+  shuffled pairs. It takes one update per selected batch and is weighted by the
+  physical generator measure, but not by NURD label/nuisance weights.
+- The encoder uses the bounded `ratio_to_one` objective, making the learned
+  density ratio approach one without an unbounded adversarial CE objective.
 - Direct QCD closure regularization acts on continuous AE loss and QCD MD. It
-  combines log-correlation, distance correlation, forward profile flatness, a
-  differentiable reverse profile, and normalized soft copula-grid residuals.
-- The reverse profile now has a real encoder gradient. The previous hard MD
-  bucketization detached the only trainable axis, making that term inert.
-- The QCD MD proxy is frozen for a complete epoch. It accumulates detached
-  moments and atomically updates between epochs, so every batch in an epoch is
-  scored against one reference rather than a batch-order-dependent EMA.
-- Contrastive weight decreases from `0.15` to `0.02` over 40 epochs. Closure
-  weight increases from `0` to `1.0` over 15 epochs.
+  combines weighted log-correlation, distance correlation, and forward profile
+  flatness. The higher-variance v5 reverse-profile/copula terms remain optional.
+- The QCD MD proxy is a real online EMA. A batch is scored against the previous
+  detached reference before that batch updates the weighted moments, avoiding
+  self-scoring while tracking the changing encoder.
+- Contrastive weight decreases from `0.15` to `0.05` over 40 epochs. Closure
+  weight increases from `0` to `0.5` over 15 epochs.
 
 ### Selection And Evaluation
 
 - `checkpoint_main_*` is selected by validation NURD loss.
-- Validation QCD MD is two-fold cross-fitted with Ledoit-Wolf covariance,
+- Validation QCD MD is two-fold cross-fitted with weighted shrinkage covariance,
   matching final evaluation geometry while ensuring no validation event helps
   define its own MD. Closure checkpoints use a five-epoch rolling median.
 - `checkpoint_abcd.pth.tar` and `checkpoint_closure.pth.tar` are selected by a
@@ -73,6 +70,9 @@ because the primary ABCD estimate is evaluated on QCD.
   subject to a validation-loss tolerance.
 - Final threshold selection uses the untouched model-validation portion of the
   training file. The complete test file is report-only.
+- ABCD cuts use weighted quantiles. `A/B/C/D` are generator-weighted yields,
+  ratio uncertainty uses per-region `sumw2`, and raw event-count minima are
+  retained as a guard against a few high-weight events.
 - For QCD MD, all untouched model-validation QCD tune thresholds because this
   score does not use empirical tail calibration. The independent test file
   remains report-only.
@@ -140,14 +140,15 @@ rsync -ahP mbileska@lxplus.cern.ch:$EOS_DIR/genweight_lookup/weight_train.pt "$D
 rsync -ahP mbileska@lxplus.cern.ch:$EOS_DIR/genweight_lookup/weight_test.pt "$DATA_DIR/"
 ```
 
-Validate event alignment, tensor structure, finite values, and signed weights
-before training:
+Validate event alignment, finite values, signs, total weight, and effective
+sample size with the same loader used by training:
 
 ```bash
 export DATA_DIR=$BASE/data/mequinna_1M_noZB
 python - <<'PY'
 import os
 import torch
+from utils.event_weights import load_event_weights
 
 root = os.environ["DATA_DIR"]
 for split in ("train", "test"):
@@ -155,51 +156,22 @@ for split in ("train", "test"):
         os.path.join(root, f"hlt_smcocktail_mequinna_{split}.pt"),
         map_location="cpu",
     )
-    weight_object = torch.load(
-        os.path.join(root, f"weight_{split}.pt"), map_location="cpu"
-    )
     print(f"\n{split}: keys={list(sample)}")
     for key, value in sample.items():
         print(f"  {key}: shape={tuple(value.shape)} dtype={value.dtype}")
-    print(f"  weight object: {type(weight_object)}")
-    if isinstance(weight_object, dict):
-        for key, value in weight_object.items():
-            if torch.is_tensor(value):
-                print(
-                    f"  weight[{key}]: shape={tuple(value.shape)} "
-                    f"dtype={value.dtype}"
-                )
-            else:
-                print(f"  weight[{key}]: type={type(value)}")
-    else:
-        weights = torch.as_tensor(weight_object).reshape(-1)
-        assert weights.numel() == sample["label"].shape[0]
-        assert torch.isfinite(weights).all()
-        print(
-            "  weights:",
-            f"n={weights.numel()}",
-            f"min={weights.min().item():.6g}",
-            f"max={weights.max().item():.6g}",
-            f"sum={weights.sum().item():.6g}",
-            f"negative={(weights < 0).sum().item()}",
-            f"zero={(weights == 0).sum().item()}",
-        )
+    _, metadata = load_event_weights(
+        os.path.join(root, f"weight_{split}.pt"), sample)
+    print("  generator weights:", metadata)
 PY
 ```
 
-Do not assume `(loss * gen_weight).sum() / gen_weight.sum()` is safe until the
-negative-weight count and total sum are known. The weighted implementation must
-also use generator-weighted NURD frequency estimates and weighted ABCD yields;
-multiplying only the classifier loss would define an inconsistent objective.
-
-An unweighted format-only smoke test is allowed:
+Negative weights are rejected with a clear error because these positive
+weighted classification and closure losses do not implement signed-weight
+statistics. The smoke test now validates the real generator-weight path:
 
 ```bash
-TRAIN_PT=$DATA_DIR/hlt_smcocktail_mequinna_train.pt \
-  sbatch slurm/submit_smoke.sbatch
+sbatch slurm/submit_smoke.sbatch
 ```
-
-This smoke test deliberately does **not** validate generator-weight handling.
 
 Verify the legacy data when reproducing an older campaign:
 
@@ -222,6 +194,7 @@ Before submissions, remove inherited overrides:
 unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP RUN_TAG NURD_GLOB
 unset WANDB_RUN_NAME WANDB_RUN_ID ABCD_SCOPE SCORE_MODE MIN_MD
 unset PREFER_ABCD_CKPT PREFER_CLOSURE_CKPT
+unset TRAIN_PT TEST_PT REFERENCE_PT GEN_WEIGHT_TRAIN TEST_WEIGHTS REFERENCE_WEIGHTS
 ```
 
 ## Smoke Test
@@ -262,11 +235,13 @@ CPU                   8 cores, 48 GiB RAM
 batch size            4096
 AE epochs             100
 NURD epochs           200
-nuisance bins         40, fitted on training QCD
-training batches      25% QCD, importance-corrected for classification
-critic                direct QCD 10/20/40-bin predictor, two updates per batch
-closure               QCD AE loss vs epoch-frozen QCD MD
-checkpoint MD         two-fold cross-fitted Ledoit-Wolf
+nuisance bins         20 weighted quantiles, fitted on training QCD
+training batches      natural shuffled all-background batches
+critic                QCD density-ratio critic, one update per batch
+critic penalty        bounded ratio_to_one
+closure               weighted QCD dCorr/profile vs online EMA QCD MD
+checkpoint MD         two-fold cross-fitted weighted shrinkage covariance
+ABCD yields           generator weighted, uncertainty from sumw2
 ```
 
 The previous 150-epoch jobs finished in about 6.5 hours. Two hundred NURD
@@ -287,16 +262,17 @@ The `.out` header should contain:
 
 ```text
 CRITIC_SCOPE=qcd
-CRITIC_TYPE=bin_pred
-CRITIC_BIN_RESOLUTIONS=10,20,40
-CRITIC_PENALTY_TYPE=prior_match
+CRITIC_TYPE=density_ratio
+CRITIC_BIN_RESOLUTIONS=20
+CRITIC_PENALTY_TYPE=ratio_to_one
 CRITIC_SHUFFLE=global
-N_BINS=40
-QCD_BATCH_FRACTION=0.25
+N_BINS=20
+QCD_BATCH_FRACTION=0.0
 NUISANCE_BIN_SCOPE=qcd
 CLOSURE_SCOPE=qcd
 CLOSURE_SCORE_MODE=own_class
 NURD_EPOCHS=200
+MD_PROXY_TYPE=ema
 ```
 
 Training is complete only when the output contains `TRAINING DONE`.
@@ -332,7 +308,7 @@ optimization experiment.
 The latest-eval script defaults to:
 
 ```text
-NURD_GLOB=hlt_nurd_closure_bs4096_experimental_qcd_v5_*
+NURD_GLOB=hlt_nurd_closure_bs4096_experimental_qcd_weighted_v6_*
 PREFER_ABCD_CKPT=1
 ABCD_SCOPE=qcd
 SCORE_MODE=qcd_md
@@ -359,7 +335,7 @@ Evaluate the latest validation-loss checkpoint for comparison:
 ```bash
 unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP NURD_GLOB
 PREFER_ABCD_CKPT=0 PREFER_CLOSURE_CKPT=0 \
-  WANDB_NAME_PREFIX=experimental_qcd_v5_main \
+  WANDB_NAME_PREFIX=experimental_qcd_weighted_v6_main \
   sbatch slurm/submit_eval_latest.sbatch
 ```
 

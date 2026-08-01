@@ -18,7 +18,9 @@ set -u
 
 BASE="${BASE:-/scratch/gpfs/IOJALVO/mb7126/nurd_hlt}"
 CODE_DIR="${CODE_DIR:-/home/mb7126/nurd_hlt}"
-TRAIN_PT="${TRAIN_PT:-$BASE/data/hlt_smcocktail_train.pt}"
+MEQUINNA_DIR="${MEQUINNA_DIR:-$BASE/data/mequinna_1M_noZB}"
+TRAIN_PT="${TRAIN_PT:-$MEQUINNA_DIR/hlt_smcocktail_mequinna_train.pt}"
+GEN_WEIGHT_TRAIN="${GEN_WEIGHT_TRAIN:-$MEQUINNA_DIR/weight_train.pt}"
 MIN_GPU_MEM_GB="${MIN_GPU_MEM_GB:-75}"
 
 mkdir -p "$BASE/checkpoints" "$BASE/logs" "$BASE/outputs" "$BASE/wandb"
@@ -46,23 +48,23 @@ if [[ -e checkpoints && ! -L checkpoints ]]; then
 fi
 ln -sfnT "$BASE/checkpoints" checkpoints
 
-RUN_TAG="${RUN_TAG:-experimental_qcd_v5_$(date +%Y%m%d_%H%M%S)}"
+RUN_TAG="${RUN_TAG:-experimental_qcd_weighted_v6_$(date +%Y%m%d_%H%M%S)}"
 AE_EXP="${AE_EXP:-ae_pretrain_$RUN_TAG}"
 NURD_EXP="${NURD_EXP:-hlt_nurd_closure_bs4096_$RUN_TAG}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
 AE_EPOCHS="${AE_EPOCHS:-100}"
 NURD_EPOCHS="${NURD_EPOCHS:-200}"
-CLOSURE_WEIGHT="${CLOSURE_WEIGHT:-1.0}"
+CLOSURE_WEIGHT="${CLOSURE_WEIGHT:-0.5}"
 CLOSURE_WEIGHT_START="${CLOSURE_WEIGHT_START:-0.0}"
 CLOSURE_RAMP_EPOCHS="${CLOSURE_RAMP_EPOCHS:-15}"
-CLOSURE_LOSS_TYPE="${CLOSURE_LOSS_TYPE:-hybrid}"
+CLOSURE_LOSS_TYPE="${CLOSURE_LOSS_TYPE:-dcorr_profile}"
 CLOSURE_SCOPE="${CLOSURE_SCOPE:-qcd}"
 CLOSURE_CLASS_MIN_EVENTS="${CLOSURE_CLASS_MIN_EVENTS:-20}"
 CLOSURE_CLASS_WEIGHTING="${CLOSURE_CLASS_WEIGHTING:-equal}"
 CLOSURE_SCORE_MODE="${CLOSURE_SCORE_MODE:-own_class}"
 CLOSURE_REVERSE_PROFILE_WEIGHT="${CLOSURE_REVERSE_PROFILE_WEIGHT:-0.5}"
 CLOSURE_TAIL_ABCD_WEIGHT="${CLOSURE_TAIL_ABCD_WEIGHT:-1.0}"
-CLOSURE_TAIL_QUANTILES="${CLOSURE_TAIL_QUANTILES:-0.50,0.60,0.70,0.80,0.85,0.90,0.95}"
+CLOSURE_TAIL_QUANTILES="${CLOSURE_TAIL_QUANTILES:-0.50,0.65,0.80,0.90}"
 CLOSURE_TAIL_SCALE="${CLOSURE_TAIL_SCALE:-12.0}"
 CLOSURE_TAIL_MIN_EVENTS="${CLOSURE_TAIL_MIN_EVENTS:-5}"
 CLOSURE_TAIL_FOCUS_WEIGHT="${CLOSURE_TAIL_FOCUS_WEIGHT:-2.0}"
@@ -73,18 +75,18 @@ ABCD_CKPT_LOSS_TOL="${ABCD_CKPT_LOSS_TOL:-1.10}"
 BASELINE_LABELS="${BASELINE_LABELS:-0,1,2,3}"
 NUISANCE_BIN_SCOPE="${NUISANCE_BIN_SCOPE:-qcd}"
 CRITIC_SCOPE="${CRITIC_SCOPE:-qcd}"
-N_BINS="${N_BINS:-40}"
-CRITIC_TYPE="${CRITIC_TYPE:-bin_pred}"
-CRITIC_BIN_RESOLUTIONS="${CRITIC_BIN_RESOLUTIONS:-10,20,40}"
-CRITIC_PENALTY_TYPE="${CRITIC_PENALTY_TYPE:-prior_match}"
+N_BINS="${N_BINS:-20}"
+CRITIC_TYPE="${CRITIC_TYPE:-density_ratio}"
+CRITIC_BIN_RESOLUTIONS="${CRITIC_BIN_RESOLUTIONS:-20}"
+CRITIC_PENALTY_TYPE="${CRITIC_PENALTY_TYPE:-ratio_to_one}"
 CRITIC_SHUFFLE="${CRITIC_SHUFFLE:-global}"
-N_CRITIC_STEPS="${N_CRITIC_STEPS:-2}"
-QCD_BATCH_FRACTION="${QCD_BATCH_FRACTION:-0.25}"
-CONTRAST_WEIGHT="${CONTRAST_WEIGHT:-0.02}"
+N_CRITIC_STEPS="${N_CRITIC_STEPS:-1}"
+QCD_BATCH_FRACTION="${QCD_BATCH_FRACTION:-0.0}"
+CONTRAST_WEIGHT="${CONTRAST_WEIGHT:-0.05}"
 CONTRAST_WEIGHT_START="${CONTRAST_WEIGHT_START:-0.15}"
 CONTRAST_RAMP_EPOCHS="${CONTRAST_RAMP_EPOCHS:-40}"
 MAX_WEIGHT_RATIO="${MAX_WEIGHT_RATIO:-10.0}"
-MD_PROXY_TYPE="${MD_PROXY_TYPE:-epoch}"
+MD_PROXY_TYPE="${MD_PROXY_TYPE:-ema}"
 MD_EMA_MOMENTUM="${MD_EMA_MOMENTUM:-0.05}"
 MD_PROXY_SHRINKAGE="${MD_PROXY_SHRINKAGE:-0.05}"
 VAL_MD_FOLDS="${VAL_MD_FOLDS:-2}"
@@ -97,6 +99,7 @@ echo "Host: $(hostname)"
 echo "Code: $CODE_DIR"
 echo "Scratch: $BASE"
 echo "Train data: $TRAIN_PT"
+echo "Generator weights: $GEN_WEIGHT_TRAIN"
 echo "AE_EXP=$AE_EXP"
 echo "NURD_EXP=$NURD_EXP"
 echo "BATCH_SIZE=$BATCH_SIZE"
@@ -148,6 +151,7 @@ python -c "import torch; print('torch', torch.__version__, 'cuda build', torch.v
 python -c "import torch, sys; assert torch.cuda.is_available(), 'CUDA is not available'; props=torch.cuda.get_device_properties(0); mem_gib=props.total_memory/1024**3; print(f'GPU memory: {mem_gib:.2f} GiB'); sys.exit(0 if mem_gib >= float('$MIN_GPU_MEM_GB') else 42)"
 python -c "import numpy, sklearn, scipy, matplotlib, wandb; print('training/eval imports ok')"
 python -c "import torch; x=torch.load('$TRAIN_PT',map_location='cpu'); print('keys', x.keys()); print('pf', x['pf'].shape); print('obj', x['obj'].shape); print('label', x['label'].shape)"
+python -c "import torch; from utils.event_weights import load_event_weights; x=torch.load('$TRAIN_PT',map_location='cpu'); _,m=load_event_weights('$GEN_WEIGHT_TRAIN',x); print('generator weight metadata',m)"
 
 if [[ "${SKIP_AE:-0}" == "1" ]]; then
   if [[ ! -f "$AE_CKPT" ]]; then
@@ -159,6 +163,7 @@ else
   echo "=== Step 1: AE pretraining ==="
   python train_ae.py \
     --data "$TRAIN_PT" \
+    --gen_weights "$GEN_WEIGHT_TRAIN" \
     --epochs "$AE_EPOCHS" \
     --batch_size "$BATCH_SIZE" \
     --lr 1e-3 \
@@ -172,6 +177,7 @@ fi
 echo "=== Step 2: NURD closure training ==="
 python train_hlt.py \
   --data "$TRAIN_PT" \
+  --gen_weights "$GEN_WEIGHT_TRAIN" \
   --ae_ckpt "$AE_CKPT" \
   --epochs "$NURD_EPOCHS" \
   --batch_size "$BATCH_SIZE" \

@@ -17,8 +17,12 @@ set -u
 
 BASE="${BASE:-/scratch/gpfs/IOJALVO/mb7126/nurd_hlt}"
 CODE_DIR="${CODE_DIR:-/home/mb7126/nurd_hlt}"
-TEST_PT="${TEST_PT:-$BASE/data/hlt_smcocktail_test.pt}"
-REFERENCE_PT="${REFERENCE_PT:-$BASE/data/hlt_smcocktail_train.pt}"
+MEQUINNA_DIR="${MEQUINNA_DIR:-$BASE/data/mequinna_1M_noZB}"
+TEST_PT="${TEST_PT:-$MEQUINNA_DIR/hlt_smcocktail_mequinna_test.pt}"
+REFERENCE_PT="${REFERENCE_PT:-$MEQUINNA_DIR/hlt_smcocktail_mequinna_train.pt}"
+TEST_WEIGHTS="${TEST_WEIGHTS:-$MEQUINNA_DIR/weight_test.pt}"
+REFERENCE_WEIGHTS="${REFERENCE_WEIGHTS:-$MEQUINNA_DIR/weight_train.pt}"
+SIGNAL_WEIGHTS="${SIGNAL_WEIGHTS:-}"
 SIGNAL_PT="${SIGNAL_PT:-$BASE/data/hlt_signal_TpTp.pt}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-256}"
 AE_BATCH_SIZE="${AE_BATCH_SIZE:-4096}"
@@ -27,8 +31,8 @@ CORR_SAMPLE_SIZE="${CORR_SAMPLE_SIZE:-50000}"
 DCOR_SAMPLE_SIZE="${DCOR_SAMPLE_SIZE:-2000}"
 CLOSURE_HOLDOUT_FRAC="${CLOSURE_HOLDOUT_FRAC:-0.5}"
 CLOSURE_SPLIT_SEED="${CLOSURE_SPLIT_SEED:-42}"
-NURD_GLOB="${NURD_GLOB:-hlt_nurd_closure_bs4096_experimental_qcd_v5_*}"
-WANDB_NAME_PREFIX="${WANDB_NAME_PREFIX:-experimental_qcd_eval}"
+NURD_GLOB="${NURD_GLOB:-hlt_nurd_closure_bs4096_experimental_qcd_weighted_v6_*}"
+WANDB_NAME_PREFIX="${WANDB_NAME_PREFIX:-experimental_qcd_weighted_eval}"
 SYNC_WANDB="${SYNC_WANDB:-0}"
 PREFER_ABCD_CKPT="${PREFER_ABCD_CKPT:-1}"
 PREFER_CLOSURE_CKPT="${PREFER_CLOSURE_CKPT:-0}"
@@ -132,10 +136,19 @@ if [[ ! -f "$REFERENCE_PT" ]]; then
   echo "ERROR: training reference sample not found: $REFERENCE_PT"
   exit 2
 fi
+if [[ ! -f "$TEST_WEIGHTS" || ! -f "$REFERENCE_WEIGHTS" ]]; then
+  echo "ERROR: generator-weight files are missing."
+  echo "TEST_WEIGHTS=$TEST_WEIGHTS"
+  echo "REFERENCE_WEIGHTS=$REFERENCE_WEIGHTS"
+  exit 2
+fi
 
 SIGNAL_ARGS=()
 if [[ -n "${SIGNAL_PT:-}" && -f "$SIGNAL_PT" ]]; then
   SIGNAL_ARGS=(--signal_pt "$SIGNAL_PT")
+  if [[ -n "$SIGNAL_WEIGHTS" && -f "$SIGNAL_WEIGHTS" ]]; then
+    SIGNAL_ARGS+=(--signal_weights "$SIGNAL_WEIGHTS")
+  fi
 fi
 
 EXTRA_ARGS=()
@@ -162,6 +175,8 @@ echo "NURD_EXP: $NURD_EXP"
 echo "CKPT_TAG: $CKPT_TAG"
 echo "TEST_PT: $TEST_PT"
 echo "REFERENCE_PT: $REFERENCE_PT"
+echo "TEST_WEIGHTS: $TEST_WEIGHTS"
+echo "REFERENCE_WEIGHTS: $REFERENCE_WEIGHTS"
 echo "SIGNAL_PT: ${SIGNAL_PT:-}"
 echo "EVAL_BATCH_SIZE: $EVAL_BATCH_SIZE"
 echo "AE_BATCH_SIZE: $AE_BATCH_SIZE"
@@ -201,7 +216,9 @@ python eval_abcd_nurd.py \
   --ckpt "$CKPT" \
   --ae_ckpt "$AE_CKPT" \
   --test_pt "$TEST_PT" \
+  --test_weights "$TEST_WEIGHTS" \
   --reference_pt "$REFERENCE_PT" \
+  --reference_weights "$REFERENCE_WEIGHTS" \
   "${SIGNAL_ARGS[@]}" \
   --outdir "$OUTDIR" \
   --wandb_project nurd-ood-hlt \

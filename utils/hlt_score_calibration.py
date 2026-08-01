@@ -16,6 +16,7 @@ class ClassReference:
     logdet: float
     prior: float
     calibration_md: np.ndarray
+    calibration_weight: np.ndarray
 
 
 def _softmax(values, axis=1):
@@ -25,14 +26,25 @@ def _softmax(values, axis=1):
 
 
 def fit_class_references(latents, labels, fit_indices, calibration_indices,
-                         class_labels, n_components=None, min_events=20):
+                         class_labels, n_components=None, min_events=20,
+                         sample_weights=None, shrinkage=0.05):
     """Fit shrinkage-covariance references on fit events and calibrate on disjoint events."""
     latents = np.asarray(latents, dtype=np.float64)
     labels = np.asarray(labels)
     fit_indices = np.asarray(fit_indices, dtype=np.int64)
     calibration_indices = np.asarray(calibration_indices, dtype=np.int64)
     class_labels = [int(label) for label in class_labels]
-    fit_total = sum(np.count_nonzero(labels[fit_indices] == label) for label in class_labels)
+    if sample_weights is None:
+        sample_weights = np.ones(latents.shape[0], dtype=np.float64)
+        use_weighted_covariance = False
+    else:
+        sample_weights = np.asarray(sample_weights, dtype=np.float64).reshape(-1)
+        if sample_weights.shape[0] != latents.shape[0]:
+            raise ValueError("sample_weights must align with latents.")
+        use_weighted_covariance = True
+    fit_total = sum(
+        sample_weights[fit_indices][labels[fit_indices] == label].sum()
+        for label in class_labels)
     references = []
 
     for label in class_labels:
@@ -40,25 +52,50 @@ def fit_class_references(latents, labels, fit_indices, calibration_indices,
         calibration_mask = labels[calibration_indices] == label
         fit_values = latents[fit_indices[fit_mask]]
         calibration_values = latents[calibration_indices[calibration_mask]]
+        fit_weights = sample_weights[fit_indices[fit_mask]]
+        calibration_weights = sample_weights[
+            calibration_indices[calibration_mask]]
         if fit_values.shape[0] < min_events or calibration_values.shape[0] < min_events:
             raise ValueError(
                 f"Class {label} needs at least {min_events} fit and calibration events; "
                 f"found {fit_values.shape[0]} and {calibration_values.shape[0]}."
             )
 
-        covariance = LedoitWolf(assume_centered=False).fit(fit_values)
-        eigenvalues, eigenvectors = np.linalg.eigh(covariance.covariance_)
+        if use_weighted_covariance:
+            total_weight = max(float(fit_weights.sum()), 1e-12)
+            mean = np.sum(
+                fit_values * fit_weights[:, None], axis=0) / total_weight
+            centered = fit_values - mean
+            covariance_matrix = (
+                (centered * fit_weights[:, None]).T @ centered / total_weight
+            )
+            covariance_matrix = 0.5 * (
+                covariance_matrix + covariance_matrix.T)
+            diagonal_mean = max(
+                float(np.trace(covariance_matrix) / covariance_matrix.shape[0]),
+                1e-8)
+            covariance_matrix = (
+                (1.0 - float(shrinkage)) * covariance_matrix
+                + float(shrinkage) * np.eye(covariance_matrix.shape[0])
+                * diagonal_mean
+            )
+        else:
+            covariance = LedoitWolf(assume_centered=False).fit(fit_values)
+            mean = covariance.location_.astype(np.float64)
+            covariance_matrix = covariance.covariance_
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance_matrix)
         order = np.argsort(eigenvalues)[::-1]
         if n_components is not None:
             order = order[:min(int(n_components), fit_values.shape[1])]
         eigenvalues = np.clip(eigenvalues[order], 1e-8, None)
         eigenvectors = eigenvectors[:, order]
         whitening = eigenvectors / np.sqrt(eigenvalues)
-        mean = covariance.location_.astype(np.float64)
-
         calibrated = (calibration_values - mean) @ whitening
-        calibration_md = np.sort(np.sum(calibrated * calibrated, axis=1))
-        prior = fit_values.shape[0] / max(fit_total, 1)
+        calibration_md = np.sum(calibrated * calibrated, axis=1)
+        calibration_order = np.argsort(calibration_md)
+        calibration_md = calibration_md[calibration_order]
+        calibration_weight = calibration_weights[calibration_order]
+        prior = fit_weights.sum() / max(fit_total, 1e-12)
         references.append(ClassReference(
             label=label,
             mean=mean,
@@ -67,6 +104,7 @@ def fit_class_references(latents, labels, fit_indices, calibration_indices,
             logdet=float(np.log(eigenvalues).sum()),
             prior=float(prior),
             calibration_md=calibration_md,
+            calibration_weight=calibration_weight,
         ))
     return references
 
@@ -84,6 +122,7 @@ def save_class_references(path, references, metadata=None):
         payload[f"{prefix}_logdet"] = np.asarray(ref.logdet)
         payload[f"{prefix}_prior"] = np.asarray(ref.prior)
         payload[f"{prefix}_calibration_md"] = ref.calibration_md
+        payload[f"{prefix}_calibration_weight"] = ref.calibration_weight
     np.savez_compressed(path, **payload)
 
 
@@ -101,6 +140,11 @@ def load_class_references(path):
             logdet=float(data[f"{prefix}_logdet"]),
             prior=float(data[f"{prefix}_prior"]),
             calibration_md=data[f"{prefix}_calibration_md"],
+            calibration_weight=(
+                data[f"{prefix}_calibration_weight"]
+                if f"{prefix}_calibration_weight" in data.files
+                else np.ones_like(data[f"{prefix}_calibration_md"])
+            ),
         ))
     return references, metadata
 
@@ -122,8 +166,17 @@ def score_latents(latents, logits, references, score_mode="calibrated_union",
         whitened = (latents - ref.mean) @ ref.whitening
         md = np.sum(whitened * whitened, axis=1)
         position = np.searchsorted(ref.calibration_md, md, side="left")
-        n_greater_equal = ref.calibration_md.size - position
-        tail_probability = (n_greater_equal + 1.0) / (ref.calibration_md.size + 1.0)
+        calibration_weight = getattr(
+            ref, "calibration_weight", np.ones_like(ref.calibration_md))
+        cumulative = np.concatenate([
+            np.zeros(1, dtype=np.float64),
+            np.cumsum(calibration_weight, dtype=np.float64),
+        ])
+        n_greater_equal = cumulative[-1] - cumulative[position]
+        pseudo_weight = cumulative[-1] / max(ref.calibration_md.size, 1)
+        tail_probability = (
+            n_greater_equal + pseudo_weight
+        ) / max(cumulative[-1] + pseudo_weight, 1e-12)
         dimension = ref.whitening.shape[1]
         nll = (
             0.5 * (md + ref.logdet + dimension * np.log(2.0 * np.pi))

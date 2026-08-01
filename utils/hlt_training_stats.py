@@ -6,25 +6,36 @@ from sklearn.covariance import LedoitWolf
 from sklearn.model_selection import KFold
 from torch.utils.data import Sampler
 
+from utils.event_weights import weighted_quantile
+
 
 def soft_conditioner_profile_loss(conditioner, target, n_bins=8,
-                                  tail_weight=2.0, scale=12.0, eps=1e-8):
+                                  tail_weight=2.0, scale=12.0, eps=1e-8,
+                                  weights=None):
     """Profile flatness with differentiable conditioner-bin membership."""
     conditioner = conditioner.float().view(-1)
     target = target.float().view(-1)
+    weights = (
+        torch.ones_like(conditioner) if weights is None
+        else weights.float().view(-1).to(conditioner.device)
+    )
     if conditioner.numel() < max(4, n_bins * 2):
         zero = (conditioner.sum() + target.sum()) * 0.0
         return zero, None
     with torch.no_grad():
-        edges = torch.quantile(
-            conditioner.detach(),
-            torch.linspace(0, 1, n_bins + 1, device=conditioner.device))
+        quantiles = torch.linspace(
+            0, 1, n_bins + 1, device=conditioner.device)
+        edges = weighted_quantile(
+            conditioner.detach(), quantiles, weights.detach())
         width = (
-            torch.quantile(conditioner.detach(), 0.84)
-            - torch.quantile(conditioner.detach(), 0.16)
+            weighted_quantile(conditioner.detach(), [0.84], weights.detach())[0]
+            - weighted_quantile(conditioner.detach(), [0.16], weights.detach())[0]
         ).clamp(min=eps) / max(n_bins, 1)
-    global_mean = target.mean()
-    global_scale = target.std(unbiased=False).detach().clamp(min=eps)
+    total_weight = weights.sum().clamp(min=eps)
+    global_mean = (weights * target).sum() / total_weight
+    global_scale = torch.sqrt(
+        (weights * (target - global_mean).square()).sum() / total_weight
+    ).detach().clamp(min=eps)
     losses = []
     for i in range(n_bins):
         if i == 0:
@@ -39,8 +50,9 @@ def soft_conditioner_profile_loss(conditioner, target, n_bins=8,
             upper = torch.sigmoid(
                 scale * (edges[i + 1] - conditioner) / width)
             membership = lower * upper
-        mass = membership.sum().clamp(min=eps)
-        bin_mean = (membership * target).sum() / mass
+        weighted_membership = membership * weights
+        mass = weighted_membership.sum().clamp(min=eps)
+        bin_mean = (weighted_membership * target).sum() / mass
         rel_tail = i / max(n_bins - 1, 1)
         weight = 1.0 + tail_weight * rel_tail * rel_tail
         losses.append(
@@ -50,25 +62,36 @@ def soft_conditioner_profile_loss(conditioner, target, n_bins=8,
 
 
 def soft_copula_grid_loss(x, y, quantiles, scale=12.0,
-                          tail_focus_weight=2.0, eps=1e-6):
+                          tail_focus_weight=2.0, eps=1e-6, weights=None):
     """Normalized soft independence residuals over a quantile grid."""
     x = x.float().view(-1)
     y = y.float().view(-1)
+    weights = (
+        torch.ones_like(x) if weights is None
+        else weights.float().view(-1).to(x.device)
+    )
+    weights = weights / weights.sum().clamp(min=eps)
     quantiles = [q for q in quantiles if 0.0 < q < 1.0]
     if x.numel() < 20 or not quantiles:
         zero = (x.sum() + y.sum()) * 0.0
         return zero, None
     with torch.no_grad():
         x_scale = (
-            torch.quantile(x.detach(), 0.84)
-            - torch.quantile(x.detach(), 0.16)
+            weighted_quantile(x.detach(), [0.84], weights.detach())[0]
+            - weighted_quantile(x.detach(), [0.16], weights.detach())[0]
         ).clamp(min=eps)
         y_scale = (
-            torch.quantile(y.detach(), 0.84)
-            - torch.quantile(y.detach(), 0.16)
+            weighted_quantile(y.detach(), [0.84], weights.detach())[0]
+            - weighted_quantile(y.detach(), [0.16], weights.detach())[0]
         ).clamp(min=eps)
-        cuts_x = {q: torch.quantile(x.detach(), q) for q in quantiles}
-        cuts_y = {q: torch.quantile(y.detach(), q) for q in quantiles}
+        cuts_x = {
+            q: weighted_quantile(x.detach(), [q], weights.detach())[0]
+            for q in quantiles
+        }
+        cuts_y = {
+            q: weighted_quantile(y.detach(), [q], weights.detach())[0]
+            for q in quantiles
+        }
 
     losses = []
     residuals = []
@@ -76,9 +99,9 @@ def soft_copula_grid_loss(x, y, quantiles, scale=12.0,
         sx = torch.sigmoid(scale * (x - cuts_x[qx]) / x_scale)
         for qy in quantiles:
             sy = torch.sigmoid(scale * (y - cuts_y[qy]) / y_scale)
-            px = sx.mean()
-            py = sy.mean()
-            joint = (sx * sy).mean()
+            px = (weights * sx).sum()
+            py = (weights * sy).sum()
+            joint = (weights * sx * sy).sum()
             denominator = torch.sqrt(
                 px * (1.0 - px) * py * (1.0 - py) + eps)
             residual = (joint - px * py) / denominator
@@ -91,26 +114,27 @@ def soft_copula_grid_loss(x, y, quantiles, scale=12.0,
 
 
 class RunningQCDMDProxy:
-    """Epoch-frozen Mahalanobis reference with streaming QCD moments.
+    """Streaming Mahalanobis reference with weighted QCD moments.
 
-    Every batch in an epoch is scored against the same reference. Detached QCD
-    moments are accumulated during that epoch and become the reference only
-    after ``finalize_epoch``. This avoids batch-order dependence and prevents a
-    batch from changing the covariance used to score itself.
+    In ``ema`` mode each batch is scored before its detached moments update the
+    active reference, which tracks a moving encoder without self-scoring. The
+    legacy ``epoch`` mode keeps one frozen reference for a whole epoch.
     """
 
-    def __init__(self, momentum=1.0, eps=1e-5, shrinkage=0.05):
+    def __init__(self, momentum=0.05, eps=1e-5, shrinkage=0.05,
+                 mode="epoch"):
         if not 0.0 < momentum <= 1.0:
             raise ValueError("momentum must be in (0, 1].")
         if eps <= 0.0:
             raise ValueError("eps must be positive.")
         if not 0.0 <= shrinkage <= 1.0:
             raise ValueError("shrinkage must be in [0, 1].")
-        # momentum is retained in checkpoints for backward compatibility. New
-        # references are intentionally replaced once per epoch.
+        if mode not in {"ema", "epoch"}:
+            raise ValueError("mode must be 'ema' or 'epoch'.")
         self.momentum = float(momentum)
         self.eps = float(eps)
         self.shrinkage = float(shrinkage)
+        self.mode = mode
         self.mean = None
         self.second_moment = None
         self.updates = 0
@@ -126,13 +150,21 @@ class RunningQCDMDProxy:
         self._sum_outer = None
 
     @staticmethod
-    def _batch_sums(latent):
+    def _batch_sums(latent, weights=None):
         values = latent.detach().float()
-        return values.size(0), values.sum(dim=0), values.T @ values
+        if weights is None:
+            weights = torch.ones(
+                values.size(0), device=values.device, dtype=values.dtype)
+        weights = weights.detach().float().view(-1).to(values.device)
+        count = weights.sum()
+        total = (values * weights[:, None]).sum(dim=0)
+        total_outer = values.T @ (values * weights[:, None])
+        return count, total, total_outer
 
     @staticmethod
-    def _batch_moments(latent):
-        count, total, total_outer = RunningQCDMDProxy._batch_sums(latent)
+    def _batch_moments(latent, weights=None):
+        count, total, total_outer = RunningQCDMDProxy._batch_sums(
+            latent, weights)
         return total / count, total_outer / count
 
     def _regularized_covariance(self, mean, second_moment):
@@ -164,14 +196,33 @@ class RunningQCDMDProxy:
         whitened = centered @ whitening
         return (whitened * whitened).sum(dim=1).to(latent.dtype)
 
-    def update(self, qcd_latent):
-        """Accumulate detached moments without changing the active reference."""
+    def update(self, qcd_latent, weights=None):
+        """Update EMA moments or accumulate moments for epoch replacement."""
         if qcd_latent.size(0) < 1:
             return
-        count, total, total_outer = self._batch_sums(qcd_latent)
+        count, total, total_outer = self._batch_sums(qcd_latent, weights)
+        if float(count.item()) <= 0.0:
+            return
+        batch_mean = (total / count).cpu()
+        batch_second = (total_outer / count).cpu()
+        if self.mode == "ema":
+            if not self.ready:
+                self.mean = batch_mean
+                self.second_moment = batch_second
+            else:
+                self.mean = (
+                    (1.0 - self.momentum) * self.mean
+                    + self.momentum * batch_mean
+                )
+                self.second_moment = (
+                    (1.0 - self.momentum) * self.second_moment
+                    + self.momentum * batch_second
+                )
+            self.updates += 1
+            return
         total = total.cpu()
         total_outer = total_outer.cpu()
-        self._count += count
+        self._count += float(count.item())
         self._sum = total if self._sum is None else self._sum + total
         self._sum_outer = (
             total_outer if self._sum_outer is None
@@ -180,7 +231,9 @@ class RunningQCDMDProxy:
 
     def finalize_epoch(self):
         """Atomically replace the active reference with this epoch's moments."""
-        if self._count < 2:
+        if self.mode == "ema":
+            return False
+        if self._count <= 0.0:
             return False
         self.mean = self._sum / self._count
         self.second_moment = self._sum_outer / self._count
@@ -188,20 +241,22 @@ class RunningQCDMDProxy:
         self.begin_epoch()
         return True
 
-    def md(self, latent, qcd_mask, update=True):
+    def md(self, latent, qcd_mask, update=True, weights=None):
         qcd_count = int(qcd_mask.sum().item())
         if qcd_count < 2:
             return torch.zeros(
                 latent.size(0), device=latent.device, dtype=latent.dtype)
 
         qcd_latent = latent[qcd_mask]
+        qcd_weights = None if weights is None else weights[qcd_mask]
         if self.ready:
             scores = self._score(latent, self.mean, self.second_moment)
         else:
-            mean, second_moment = self._batch_moments(qcd_latent)
+            mean, second_moment = self._batch_moments(
+                qcd_latent, qcd_weights)
             scores = self._score(latent, mean, second_moment)
         if update:
-            self.update(qcd_latent)
+            self.update(qcd_latent, qcd_weights)
         return scores
 
     def state_dict(self):
@@ -209,6 +264,7 @@ class RunningQCDMDProxy:
             "momentum": self.momentum,
             "eps": self.eps,
             "shrinkage": self.shrinkage,
+            "mode": self.mode,
             "updates": self.updates,
             "mean": None if self.mean is None else self.mean.detach().cpu(),
             "second_moment": (
@@ -221,14 +277,30 @@ class RunningQCDMDProxy:
         self.momentum = float(state.get("momentum", 1.0))
         self.eps = float(state["eps"])
         self.shrinkage = float(state.get("shrinkage", 0.05))
+        self.mode = state.get("mode", "epoch")
         self.updates = int(state.get("updates", 0))
         self.mean = state.get("mean")
         self.second_moment = state.get("second_moment")
         self.begin_epoch()
 
 
-def cross_fitted_mahalanobis(latents, n_splits=2, seed=42):
-    """Score every row against a Ledoit-Wolf reference fit on other folds."""
+def _weighted_covariance(values, weights, shrinkage=0.05, eps=1e-8):
+    weights = np.asarray(weights, dtype=np.float64)
+    total = max(weights.sum(), eps)
+    mean = np.sum(values * weights[:, None], axis=0) / total
+    centered = values - mean
+    covariance = (centered * weights[:, None]).T @ centered / total
+    covariance = 0.5 * (covariance + covariance.T)
+    diagonal_mean = max(float(np.trace(covariance) / covariance.shape[0]), eps)
+    target = np.eye(covariance.shape[0]) * diagonal_mean
+    covariance = (1.0 - shrinkage) * covariance + shrinkage * target
+    covariance += np.eye(covariance.shape[0]) * eps
+    return mean, covariance
+
+
+def cross_fitted_mahalanobis(latents, n_splits=2, seed=42,
+                             sample_weights=None, shrinkage=0.05):
+    """Score every row against a reference fit on other folds."""
     values = np.asarray(latents, dtype=np.float64)
     if values.ndim != 2:
         raise ValueError("latents must be a two-dimensional array.")
@@ -236,13 +308,24 @@ def cross_fitted_mahalanobis(latents, n_splits=2, seed=42):
         return np.full(values.shape[0], np.nan, dtype=np.float64)
     n_splits = min(max(int(n_splits), 2), values.shape[0])
     scores = np.empty(values.shape[0], dtype=np.float64)
+    if sample_weights is not None:
+        sample_weights = np.asarray(sample_weights, dtype=np.float64).reshape(-1)
+        if sample_weights.shape[0] != values.shape[0]:
+            raise ValueError("sample_weights must align with latents.")
     splitter = KFold(n_splits=n_splits, shuffle=True, random_state=int(seed))
     for fit_idx, score_idx in splitter.split(values):
-        covariance = LedoitWolf(assume_centered=False).fit(values[fit_idx])
-        eigenvalues, eigenvectors = np.linalg.eigh(covariance.covariance_)
+        if sample_weights is None:
+            covariance = LedoitWolf(assume_centered=False).fit(values[fit_idx])
+            mean = covariance.location_
+            covariance_matrix = covariance.covariance_
+        else:
+            mean, covariance_matrix = _weighted_covariance(
+                values[fit_idx], sample_weights[fit_idx],
+                shrinkage=shrinkage)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance_matrix)
         eigenvalues = np.clip(eigenvalues, 1e-8, None)
         whitening = eigenvectors / np.sqrt(eigenvalues)
-        transformed = (values[score_idx] - covariance.location_) @ whitening
+        transformed = (values[score_idx] - mean) @ whitening
         scores[score_idx] = np.sum(transformed * transformed, axis=1)
     return scores
 

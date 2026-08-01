@@ -23,6 +23,7 @@ Clear inherited selections before every submission:
 unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP RUN_TAG
 unset WANDB_RUN_NAME WANDB_RUN_ID NURD_GLOB
 unset ABCD_SCOPE SCORE_MODE MIN_MD
+unset TRAIN_PT TEST_PT REFERENCE_PT GEN_WEIGHT_TRAIN TEST_WEIGHTS REFERENCE_WEIGHTS
 ```
 
 ## Smoke
@@ -45,8 +46,9 @@ sbatch slurm/submit_train.sbatch
 
 Defaults: 100 AE epochs, 200 NURD epochs, a 12-hour hard limit, one 80 GB A100,
 8 CPU cores, 48 GB CPU memory, and zero DataLoader workers. Training uses
-40 QCD-defined nuisance bins, a 10/20/40-bin direct critic, 25% QCD batches
-with importance correction, and cross-fitted validation MD.
+the Mequinna train sample plus generator weights, 20 weighted QCD-defined
+nuisance bins, a one-step QCD density-ratio critic, natural batches, online EMA
+QCD MD, and generator-weighted cross-fitted validation closure.
 
 Monitor:
 
@@ -72,9 +74,9 @@ PREFER_ABCD_CKPT=1 ABCD_SCOPE=qcd SCORE_MODE=qcd_md \
   sbatch slurm/submit_eval_latest.sbatch
 ```
 
-The eval job fits class references on the training split, calibrates them on
-half of the original validation split, selects thresholds on the other half,
-and reports once on the independent test file.
+The eval job fits weighted class references on the training split, selects
+weighted thresholds on the original validation split, and reports weighted
+ABCD yields with `sumw2` uncertainty once on the independent test file.
 
 Inspect:
 

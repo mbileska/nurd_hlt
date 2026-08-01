@@ -42,6 +42,7 @@ from utils.hlt_training_stats import (
     soft_conditioner_profile_loss,
     soft_copula_grid_loss,
 )
+from utils.event_weights import weighted_quantile, weighted_quantile_numpy
 
 # ── Contrastive losses ────────────────────────────────────────────────────────
 
@@ -124,15 +125,20 @@ def closure_loss_batch(var1, var2, weights, n_cuts=15, n_events_min=10, max_trie
     return torch.stack(losses).mean()
 
 
-def _proxy_md(latent, qcd_mask):
+def _proxy_md(latent, qcd_mask, weights=None):
     """Batch-level squared Mahalanobis distance from QCD centroid (whitened PCA)."""
     if qcd_mask.sum() < 2:
         return torch.zeros(latent.size(0), device=latent.device)
     with torch.no_grad():
         bkg = latent[qcd_mask].detach().float()
-        mu  = bkg.mean(0)
+        bkg_weights = (
+            torch.ones(bkg.size(0), device=bkg.device)
+            if weights is None else weights[qcd_mask].detach().float()
+        )
+        bkg_weights = bkg_weights / bkg_weights.sum().clamp(min=1e-8)
+        mu = (bkg * bkg_weights[:, None]).sum(0)
         centered = bkg - mu
-        cov = (centered.T @ centered) / bkg.shape[0]
+        cov = centered.T @ (centered * bkg_weights[:, None])
         L, V = torch.linalg.eigh(cov)
         W = V / L.clamp(min=1e-6).sqrt()
     z = (latent.float() - mu) @ W
@@ -140,10 +146,11 @@ def _proxy_md(latent, qcd_mask):
 
 
 def compute_proxy_md(latent, ref_mask, md_proxy=None, proxy_type="batch",
-                     update=True):
+                     update=True, weights=None):
     if proxy_type in {"ema", "epoch"} and md_proxy is not None:
-        return md_proxy.md(latent, ref_mask, update=update)
-    return _proxy_md(latent, ref_mask)
+        return md_proxy.md(
+            latent, ref_mask, update=update, weights=weights)
+    return _proxy_md(latent, ref_mask, weights=weights)
 
 
 def parse_float_list(value):
@@ -162,10 +169,14 @@ def parse_int_list(value):
     return [int(v) for v in str(value).replace(",", " ").split() if str(v).strip()]
 
 
-def distance_corr_loss(x, y, max_samples=512, eps=1e-8):
+def distance_corr_loss(x, y, max_samples=512, eps=1e-8, weights=None):
     """Differentiable squared distance correlation for one-dimensional tensors."""
     x = x.float().view(-1)
     y = y.float().view(-1)
+    weights = (
+        torch.ones_like(x) if weights is None
+        else weights.float().view(-1).to(x.device)
+    )
     n = x.numel()
     if n < 4:
         zero = (x.sum() + y.sum()) * 0.0
@@ -174,30 +185,51 @@ def distance_corr_loss(x, y, max_samples=512, eps=1e-8):
         idx = torch.randperm(n, device=x.device)[:max_samples]
         x = x[idx]
         y = y[idx]
+        weights = weights[idx]
+    weights = weights / weights.sum().clamp(min=eps)
     x_dist = torch.cdist(x.view(-1, 1), x.view(-1, 1), p=1)
     y_dist = torch.cdist(y.view(-1, 1), y.view(-1, 1), p=1)
-    x_centered = x_dist - x_dist.mean(dim=0, keepdim=True) - x_dist.mean(dim=1, keepdim=True) + x_dist.mean()
-    y_centered = y_dist - y_dist.mean(dim=0, keepdim=True) - y_dist.mean(dim=1, keepdim=True) + y_dist.mean()
-    dcov = (x_centered * y_centered).mean()
-    dvar_x = (x_centered * x_centered).mean()
-    dvar_y = (y_centered * y_centered).mean()
+    x_row = x_dist @ weights
+    y_row = y_dist @ weights
+    x_centered = (
+        x_dist - x_row[:, None] - x_row[None, :]
+        + weights @ x_row
+    )
+    y_centered = (
+        y_dist - y_row[:, None] - y_row[None, :]
+        + weights @ y_row
+    )
+    pair_weights = weights[:, None] * weights[None, :]
+    dcov = (pair_weights * x_centered * y_centered).sum()
+    dvar_x = (pair_weights * x_centered * x_centered).sum()
+    dvar_y = (pair_weights * y_centered * y_centered).sum()
     dcor = dcov / torch.sqrt(dvar_x * dvar_y + eps)
     dcor = dcor.clamp(min=0.0)
     return dcor, dcor.detach().item()
 
 
-def profile_flatness_loss(x, y, n_bins=8, tail_weight=2.0, eps=1e-8):
+def profile_flatness_loss(x, y, n_bins=8, tail_weight=2.0, eps=1e-8,
+                          weights=None):
     """Penalize trends in the mean MD profile versus AE loss quantile."""
     x = x.float().view(-1)
     y = y.float().view(-1)
+    weights = (
+        torch.ones_like(x) if weights is None
+        else weights.float().view(-1).to(x.device)
+    )
     if x.numel() < max(4, n_bins * 2):
         zero = (x.sum() + y.sum()) * 0.0
         return zero, None
     with torch.no_grad():
-        edges = torch.quantile(x.detach(), torch.linspace(0, 1, n_bins + 1, device=x.device))
+        edges = weighted_quantile(
+            x.detach(), torch.linspace(0, 1, n_bins + 1, device=x.device),
+            weights.detach())
         bin_ids = torch.bucketize(x.detach(), edges[1:-1])
-    global_mean = y.mean()
-    global_scale = y.std(unbiased=False).detach().clamp(min=eps)
+    total_weight = weights.sum().clamp(min=eps)
+    global_mean = (weights * y).sum() / total_weight
+    global_scale = torch.sqrt(
+        (weights * (y - global_mean).square()).sum() / total_weight
+    ).detach().clamp(min=eps)
     losses = []
     for i in range(n_bins):
         mask = bin_ids == i
@@ -205,7 +237,10 @@ def profile_flatness_loss(x, y, n_bins=8, tail_weight=2.0, eps=1e-8):
             continue
         rel_tail = i / max(n_bins - 1, 1)
         weight = 1.0 + tail_weight * rel_tail * rel_tail
-        bin_mean = y[mask].mean()
+        bin_weights = weights[mask]
+        bin_mean = (
+            bin_weights * y[mask]
+        ).sum() / bin_weights.sum().clamp(min=eps)
         losses.append(weight * ((bin_mean - global_mean) / global_scale).pow(2))
     if not losses:
         zero = (x.sum() + y.sum()) * 0.0
@@ -214,11 +249,13 @@ def profile_flatness_loss(x, y, n_bins=8, tail_weight=2.0, eps=1e-8):
     return loss, loss.detach().item()
 
 
-def closure_dependency_loss(ae_reco, proxy_md_values, args, eps=1e-8):
+def closure_dependency_loss(ae_reco, proxy_md_values, args, weights=None,
+                            eps=1e-8):
     """Direct QCD dependence loss for the two ABCD axes."""
     x = torch.log(ae_reco.float().clamp(min=eps))
     y = torch.log1p(proxy_md_values.float().clamp(min=0.0))
-    corr_loss, corr_val = closure_corr_loss(ae_reco, proxy_md_values, eps=eps)
+    corr_loss, corr_val = closure_corr_loss(
+        ae_reco, proxy_md_values, weights=weights, eps=eps)
     if args.closure_loss_type == "corr":
         return corr_loss, corr_val, {"corr": corr_val}
     if args.closure_loss_type in {"dcorr_profile", "hybrid", "tail_abcd"}:
@@ -226,17 +263,20 @@ def closure_dependency_loss(ae_reco, proxy_md_values, args, eps=1e-8):
         diag = {"corr": corr_val}
         if args.closure_loss_type in {"dcorr_profile", "hybrid"}:
             dcorr, dcorr_val = distance_corr_loss(
-                x, y, max_samples=args.closure_dcorr_max_samples, eps=eps)
+                x, y, max_samples=args.closure_dcorr_max_samples, eps=eps,
+                weights=weights)
             profile, profile_val = profile_flatness_loss(
                 x, y, n_bins=args.closure_profile_bins,
-                tail_weight=args.closure_profile_tail_weight, eps=eps)
+                tail_weight=args.closure_profile_tail_weight, eps=eps,
+                weights=weights)
             total = total + args.closure_dcorr_weight * dcorr + args.closure_profile_weight * profile
             diag.update({"dcorr": dcorr_val, "profile": profile_val})
             if args.closure_reverse_profile_weight > 0.0:
                 profile_rev, profile_rev_val = soft_conditioner_profile_loss(
                     y, x, n_bins=args.closure_profile_bins,
                     tail_weight=args.closure_profile_tail_weight,
-                    scale=args.closure_tail_scale, eps=eps)
+                    scale=args.closure_tail_scale, eps=eps,
+                    weights=weights)
                 total = total + args.closure_reverse_profile_weight * profile_rev
                 diag["profile_reverse"] = profile_rev_val
         if args.closure_loss_type in {"hybrid", "tail_abcd"} and args.closure_tail_abcd_weight > 0.0:
@@ -244,15 +284,15 @@ def closure_dependency_loss(ae_reco, proxy_md_values, args, eps=1e-8):
                 x, y, args.closure_tail_quantiles_values,
                 scale=args.closure_tail_scale,
                 tail_focus_weight=args.closure_tail_focus_weight,
-                eps=eps)
+                eps=eps, weights=weights)
             total = total + args.closure_tail_abcd_weight * tail_loss
             diag["copula_grid"] = tail_val
         return total, corr_val, diag
     raise ValueError(f"Unsupported closure_loss_type={args.closure_loss_type!r}")
 
 
-def compute_qcd_closure_loss(activations, labels, ae_reco, args, md_proxy=None,
-                             update=True):
+def compute_qcd_closure_loss(activations, labels, ae_reco, gen_weights, args,
+                             md_proxy=None, update=True):
     """Apply closure only to QCD while leaving CE/SupCon all-background."""
     qcd_mask = labels.long() == int(args.qcd_label)
     n_qcd = int(qcd_mask.sum().item())
@@ -262,33 +302,49 @@ def compute_qcd_closure_loss(activations, labels, ae_reco, args, md_proxy=None,
 
     proxy_md = compute_proxy_md(
         activations, qcd_mask, md_proxy=md_proxy,
-        proxy_type=args.md_proxy_type, update=update)
+        proxy_type=args.md_proxy_type, update=update,
+        weights=gen_weights)
+    qcd_weights = gen_weights[qcd_mask].float()
     if args.closure_loss_type == "abcd":
-        weights = torch.ones(n_qcd, device=activations.device)
+        qcd_weights = qcd_weights / qcd_weights.mean().clamp(min=1e-8)
         loss = closure_loss_batch(
-            ae_reco[qcd_mask].float(), proxy_md[qcd_mask].float(), weights)
-        corr = _safe_pearson_torch(ae_reco[qcd_mask], proxy_md[qcd_mask])
+            ae_reco[qcd_mask].float(), proxy_md[qcd_mask].float(), qcd_weights)
+        corr = _safe_pearson_torch(
+            ae_reco[qcd_mask], proxy_md[qcd_mask], qcd_weights)
         return loss, {"corr": corr}, n_qcd
 
     loss, corr, diagnostics = closure_dependency_loss(
-        ae_reco[qcd_mask], proxy_md[qcd_mask], args)
+        ae_reco[qcd_mask], proxy_md[qcd_mask], args, weights=qcd_weights)
     diagnostics["corr"] = corr
     return loss, diagnostics, n_qcd
 
 
 def abcd_grid_metrics_np(x, y, quantiles, min_count=20,
-                         min_count_fraction=0.0, tail_min_quantile=0.8):
-    """Hard-count validation proxy for ABCD stability on QCD only."""
+                         min_count_fraction=0.0, tail_min_quantile=0.8,
+                         weights=None):
+    """Generator-weighted validation proxy for ABCD stability on QCD."""
     x = np.asarray(x, dtype=np.float64).reshape(-1)
     y = np.asarray(y, dtype=np.float64).reshape(-1)
+    weights = (
+        np.ones_like(x) if weights is None
+        else np.asarray(weights, dtype=np.float64).reshape(-1)
+    )
+    if weights.shape != x.shape:
+        raise ValueError("weights must align with x and y")
     quantiles = [q for q in quantiles if 0.0 < q < 1.0]
     effective_min_count = max(
         int(min_count), int(math.ceil(float(min_count_fraction) * x.size)))
     if x.size < max(20, 4 * effective_min_count) or not quantiles:
         return {"score": float("nan"), "n_points": 0}
 
-    x_cuts = {q: np.quantile(x, q) for q in quantiles}
-    y_cuts = {q: np.quantile(y, q) for q in quantiles}
+    x_cuts = {
+        q: float(weighted_quantile_numpy(x, [q], weights)[0])
+        for q in quantiles
+    }
+    y_cuts = {
+        q: float(weighted_quantile_numpy(y, [q], weights)[0])
+        for q in quantiles
+    }
     abs_logs = []
     tail_abs_logs = []
     eps = 1e-9
@@ -296,12 +352,16 @@ def abcd_grid_metrics_np(x, y, quantiles, min_count=20,
         x_high = x > x_cuts[qx]
         for qy in quantiles:
             y_high = y > y_cuts[qy]
-            A = int(np.count_nonzero(x_high & y_high))
-            B = int(np.count_nonzero(x_high & ~y_high))
-            C = int(np.count_nonzero(~x_high & y_high))
-            D = int(np.count_nonzero(~x_high & ~y_high))
-            if min(A, B, C, D) < effective_min_count:
+            region_masks = (
+                x_high & y_high,
+                x_high & ~y_high,
+                ~x_high & y_high,
+                ~x_high & ~y_high,
+            )
+            region_counts = [int(np.count_nonzero(mask)) for mask in region_masks]
+            if min(region_counts) < effective_min_count:
                 continue
+            A, B, C, D = [float(weights[mask].sum()) for mask in region_masks]
             a_hat = B * C / max(D, eps)
             abs_log = abs(math.log((a_hat + eps) / (A + eps)))
             abs_logs.append(abs_log)
@@ -328,11 +388,32 @@ def abcd_grid_metrics_np(x, y, quantiles, min_count=20,
     }
 
 
+def weighted_corrcoef_np(x, y, weights):
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    total = weights.sum()
+    if x.size < 3 or total <= 0.0:
+        return float("nan")
+    weights = weights / total
+    x_centered = x - np.sum(weights * x)
+    y_centered = y - np.sum(weights * y)
+    denominator = math.sqrt(
+        max(np.sum(weights * x_centered * x_centered), 0.0)
+        * max(np.sum(weights * y_centered * y_centered), 0.0)
+    )
+    if denominator <= 0.0:
+        return float("nan")
+    return float(np.sum(weights * x_centered * y_centered) / denominator)
+
+
 # ── Argument parsing ──────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser(description="HLT NURD contrastive training")
 # Data
 parser.add_argument("--data",       required=True,  type=str, help="Path to .pt training file")
+parser.add_argument("--gen_weights", default=None, type=str,
+                    help="Event-aligned non-negative generator weights (.pt).")
 parser.add_argument("--ae_ckpt",    required=True,  type=str, help="Path to pre-trained AE checkpoint (.pth)")
 parser.add_argument("--val_split",  default=0.1,    type=float)
 parser.add_argument("--n_bins",     default=20,     type=int, help="Nuisance bins for AE reco loss")
@@ -363,11 +444,11 @@ parser.add_argument("--critic_restart", default=0,      type=int)
 parser.add_argument("--exact",          default=1,      type=int)
 parser.add_argument("--max_weight_ratio", default=10.0, type=float,
                     help="Clip NURD exact weights at this value after mean-normalization.")
-parser.add_argument("--qcd_batch_fraction", default=0.25, type=float,
+parser.add_argument("--qcd_batch_fraction", default=0.0, type=float,
                     help="QCD fraction in training batches; 0 disables QCD-rich sampling. "
                          "The all-background objective is importance-corrected.")
 # Contrastive loss
-parser.add_argument("--contrast_weight",default=0.02,   type=float)
+parser.add_argument("--contrast_weight",default=0.05,   type=float)
 parser.add_argument("--contrast_weight_start", default=0.15, type=float,
                     help="Optional starting contrastive weight; cosine-annealed to --contrast_weight.")
 parser.add_argument("--contrast_ramp_epochs", default=40, type=int,
@@ -395,13 +476,13 @@ parser.add_argument("--critic_schedule", default="warmup",
                     help="'warmup' trains the critic on selected batches and ramps lambda; "
                          "'per_epoch' trains it before each main epoch. 'per_batch' is kept "
                          "only to fail fast because that old block is disabled.")
-parser.add_argument("--critic_type",    default="bin_pred",
+parser.add_argument("--critic_type",    default="density_ratio",
                     choices=["bin_pred", "density_ratio"],
                     help="'density_ratio' uses the NURD shuffled-z binary critic; "
                          "'bin_pred' predicts nuisance bins directly.")
-parser.add_argument("--critic_bin_resolutions", default="10,20,40", type=str,
+parser.add_argument("--critic_bin_resolutions", default="20", type=str,
                     help="Comma-separated direct-critic bin heads. Every value must divide --n_bins.")
-parser.add_argument("--critic_penalty_type", default="prior_match",
+parser.add_argument("--critic_penalty_type", default="ratio_to_one",
                     choices=["prior_match", "ratio_to_one", "confusion",
                              "logit_ratio", "ce_gap"],
                     help="Encoder-side critic penalty. Direct bin prediction uses 'prior_match' "
@@ -429,7 +510,7 @@ parser.add_argument("--critic_lr_multiplier",     default=10.0,  type=float,
                     help="LR multiplier for the critic optimizer relative to main model LR")
 parser.add_argument("--n_critic_steps_per_batch", default=1,     type=int,
                     help="Number of gradient steps to take on the critic per selected batch")
-parser.add_argument("--closure_weight",       default=1.0,   type=float,
+parser.add_argument("--closure_weight",       default=0.5,   type=float,
                     help="Weight on closure regularization (0 = disabled).")
 parser.add_argument("--closure_scope", default="qcd",
                     choices=["qcd", "baselines", "all", "all_baselines"],
@@ -457,7 +538,7 @@ parser.add_argument("--closure_weight_start", default=0.0, type=float,
                     help="Starting closure weight; cosine-ramped to --closure_weight.")
 parser.add_argument("--closure_ramp_epochs", default=15, type=int,
                     help="Epochs over which closure weight ramps from start to final.")
-parser.add_argument("--closure_loss_type", default="hybrid",
+parser.add_argument("--closure_loss_type", default="dcorr_profile",
                     choices=["corr", "dcorr_profile", "hybrid", "tail_abcd", "abcd", "none"],
                     help="'corr' penalizes QCD log(AE)-log(MD) correlation cheaply; "
                          "'dcorr_profile' adds nonlinear distance-correlation and profile flatness; "
@@ -482,7 +563,7 @@ parser.add_argument("--closure_dcorr_max_samples", default=512, type=int,
 parser.add_argument("--closure_tail_abcd_weight", default=1.0, type=float,
                     help="Internal weight for the normalized soft copula-grid loss.")
 parser.add_argument("--closure_tail_quantiles",
-                    default="0.50,0.60,0.70,0.80,0.85,0.90,0.95", type=str,
+                    default="0.50,0.65,0.80,0.90", type=str,
                     help="Comma-separated QCD quantiles used by the soft copula grid.")
 parser.add_argument("--closure_tail_scale", default=12.0, type=float,
                     help="Sigmoid sharpness for soft high-quantile ABCD counts.")
@@ -511,10 +592,9 @@ parser.add_argument("--abcd_ckpt_smoothing_epochs", default=5, type=int,
                     help="Rolling-median window for ABCD checkpoint selection.")
 parser.add_argument("--qcd_label",            default=1,     type=int,
                     help="Label index for QCD compatibility modes.")
-parser.add_argument("--md_proxy_type", default="epoch",
+parser.add_argument("--md_proxy_type", default="ema",
                     choices=["batch", "ema", "epoch"],
-                    help="Batch-local or epoch-frozen class-whitening proxy. "
-                         "'ema' is a backward-compatible alias for 'epoch'.")
+                    help="Batch-local, online EMA, or epoch-frozen class-whitening proxy.")
 parser.add_argument("--md_ema_momentum", default=0.05, type=float,
                     help="EMA update fraction for class-whitening statistics.")
 parser.add_argument("--md_ema_eps", default=1e-5, type=float,
@@ -608,8 +688,13 @@ def record_metrics(acc, loss, top1, inputs, outputs, targets, losses):
 
 def record_rw_metrics(acc, loss, inputs, outputs, targets, losses, weights):
     num_correct = torch.max(outputs,1)[1].data == targets
-    acc.update((num_correct * weights).sum().data / weights.sum().data, inputs.size(0))
-    loss.update((losses * weights).sum().data / weights.sum().data, inputs.size(0))
+    weight_mass = float(weights.sum().item())
+    acc.update(
+        (num_correct * weights).sum().data / weights.sum().data,
+        weight_mass)
+    loss.update(
+        (losses * weights).sum().data / weights.sum().data,
+        weight_mass)
     return acc, loss
 
 def log_metrics(log, epoch, batch_time, loss, top1, acc, rw_loss=None, rw_acc=None, split=None):
@@ -675,27 +760,35 @@ def select_critic_scope(inputs, labels, nuisances, joint_indep_args):
     return inputs[mask], labels[mask], nuisances[mask], mask
 
 
-def _safe_pearson_torch(x, y):
-    corr = _pearson_corr_tensor(x, y)
+def _safe_pearson_torch(x, y, weights=None):
+    corr = _pearson_corr_tensor(x, y, weights=weights)
     return None if corr is None else corr.item()
 
 
-def _pearson_corr_tensor(x, y):
+def _pearson_corr_tensor(x, y, weights=None):
     x = x.float().view(-1)
     y = y.float().view(-1)
     if x.numel() < 3:
         return None
-    x = x - x.mean()
-    y = y - y.mean()
-    denom = torch.sqrt((x * x).mean() * (y * y).mean()).clamp(min=1e-12)
-    return (x * y).mean() / denom
+    weights = (
+        torch.ones_like(x) if weights is None
+        else weights.float().view(-1).to(x.device)
+    )
+    weights = weights / weights.sum().clamp(min=1e-12)
+    x = x - (weights * x).sum()
+    y = y - (weights * y).sum()
+    denom = torch.sqrt(
+        (weights * x * x).sum() * (weights * y * y).sum()
+    ).clamp(min=1e-12)
+    return (weights * x * y).sum() / denom
 
 
-def closure_corr_loss(ae_reco, proxy_md, eps=1e-8):
+def closure_corr_loss(ae_reco, proxy_md, weights=None, eps=1e-8):
     """Differentiable QCD correlation penalty matching the eval axes more closely."""
     corr = _pearson_corr_tensor(
         torch.log(ae_reco.float().clamp(min=eps)),
         torch.log1p(proxy_md.float().clamp(min=0.0)),
+        weights=weights,
     )
     if corr is None:
         zero = proxy_md.sum() * 0.0
@@ -832,11 +925,12 @@ def _apply_critic_weights(losses, weights, joint_indep_args):
     return (losses * weights).sum() / weights.sum().clamp(min=1e-8)
 
 
-def classification_weights(exact_weights, targets, reweight_args):
-    weights = (
+def classification_weights(exact_weights, gen_weights, targets, reweight_args):
+    nurd_weights = (
         exact_weights if reweight_args["reweight"]
         else torch.ones_like(exact_weights)
     )
+    weights = nurd_weights * gen_weights
     correction = reweight_args.get("sampling_correction")
     if correction is None:
         return weights
@@ -853,9 +947,9 @@ def train_critic(critic_model, model, train_loader, critic_criterion, critic_opt
     model.eval()
     batch_time = AverageMeter()
     end = time.time()
-    for inputs, targets, nuisances, _ae_reco, _exact_weights in train_loader:
+    for inputs, targets, nuisances, _ae_reco, _exact_weights, gen_weights in train_loader:
         inputs, targets, nuisances = inputs.to(device), targets.long().to(device), nuisances.to(device)
-        inputs_c, targets_c, nuisances_c, _scope_mask = select_critic_scope(
+        inputs_c, targets_c, nuisances_c, scope_mask = select_critic_scope(
             inputs, targets, nuisances, joint_indep_args)
         if inputs_c.size(0) == 0:
             continue
@@ -864,13 +958,9 @@ def train_critic(critic_model, model, train_loader, critic_criterion, critic_opt
         outputs, tgts, losses, _mi_proxy = compute_critic_loss_from_activations(
             activations_c, targets_c, nuisances_c, critic_model,
             critic_criterion, joint_indep_args)
-        # Closure is evaluated on the natural QCD population, so the nuisance
-        # critic must not see NURD or sampler importance weights.
-        weights = torch.ones(
-            losses.size(0) // (2 if joint_indep_args.get(
-                "critic_type") == "density_ratio" else 1),
-            device=losses.device,
-        )
+        # Follow the physical QCD measure through generator weights without
+        # mixing in NURD label/nuisance or sampler importance weights.
+        weights = gen_weights.to(device)[scope_mask]
         tensor_loss = _apply_critic_weights(losses, weights, joint_indep_args)
         critic_optimizer.zero_grad()
         tensor_loss.backward(); critic_optimizer.step()
@@ -884,9 +974,9 @@ def validate_critic(val_loader, critic_model, model, critic_criterion, epoch, lo
     critic_model.eval(); model.eval()
     loss_m = AverageMeter(); rw_acc_m = AverageMeter(); acc_m = AverageMeter()
     with torch.no_grad():
-        for inputs, targets, nuisances, _ae_reco, _exact_weights in val_loader:
+        for inputs, targets, nuisances, _ae_reco, _exact_weights, gen_weights in val_loader:
             inputs, targets, nuisances = inputs.to(device), targets.long().to(device), nuisances.to(device)
-            inputs_c, targets_c, nuisances_c, _scope_mask = select_critic_scope(
+            inputs_c, targets_c, nuisances_c, scope_mask = select_critic_scope(
                 inputs, targets, nuisances, joint_indep_args)
             if inputs_c.size(0) == 0:
                 continue
@@ -894,11 +984,7 @@ def validate_critic(val_loader, critic_model, model, critic_criterion, epoch, lo
             outputs, tgts, losses, _mi_proxy = compute_critic_loss_from_activations(
                 activations_c, targets_c, nuisances_c, critic_model,
                 critic_criterion, joint_indep_args)
-            weights = torch.ones(
-                losses.size(0) // (2 if joint_indep_args.get(
-                    "critic_type") == "density_ratio" else 1),
-                device=losses.device,
-            )
+            weights = gen_weights.to(device)[scope_mask]
             weighted_loss = _apply_critic_weights(losses, weights, joint_indep_args)
             loss_m.update(weighted_loss.item(), inputs_c.size(0))
             acc_m.update(_critic_accuracy(outputs, tgts), inputs_c.size(0))
@@ -951,12 +1037,13 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
 
     model.train()
     end = time.time()
-    for inputs, targets, nuisances, ae_reco, exact_weights in train_loader:
+    for inputs, targets, nuisances, ae_reco, exact_weights, gen_weights in train_loader:
         inputs = inputs.to(device)
         targets = targets.long().to(device)
         nuisances = nuisances.to(device)
         ae_reco = ae_reco.to(device)
         exact_weights = exact_weights.to(device)
+        gen_weights = gen_weights.to(device)
 
         # ── joint independence: one critic gradient step on this batch (interleaved) ─
         # elif joint_indep_args["joint_indep"] and joint_indep_args.get("critic_schedule") == "interleaved":
@@ -1025,8 +1112,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                 nuisances_c = nuisances[scope_mask]
                 if targets_c.size(0) > 1:
                     act_detached = activations.detach()[scope_mask]
-                    weights_c = torch.ones_like(
-                        exact_weights[scope_mask], device=device)
+                    weights_c = gen_weights[scope_mask]
                     n_steps = joint_indep_args.get("n_critic_steps_per_batch", 1)
                     for _ in range(n_steps):
                         c_out, c_targets, c_losses, _mi_proxy = compute_critic_loss_from_activations(
@@ -1055,6 +1141,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
             scope_mask = critic_scope_mask(targets, joint_indep_args)
             targets_c = targets[scope_mask]
             nuisances_c = nuisances[scope_mask]
+            gen_weights_c = gen_weights[scope_mask]
             critic_scope_frac_m.update(float(targets_c.size(0)) / max(inputs.size(0), 1), inputs.size(0))
             critic_count = max(targets_c.size(0), 1)
             
@@ -1071,8 +1158,11 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
 
                 if joint_indep_args.get("critic_type") == "density_ratio":
                     penalty = mi_proxy
-                    raw_mi_val = penalty.mean().item()
-                    critic_ce = info_losses.mean().item()
+                    raw_mi_val = (
+                        penalty * gen_weights_c
+                    ).sum().div(gen_weights_c.sum().clamp(min=1e-8)).item()
+                    critic_ce = _apply_critic_weights(
+                        info_losses, gen_weights_c, joint_indep_args).item()
                     critic_ce_m.update(critic_ce, targets_c.size(0))
                     critic_ce_ratio_m.update(
                         critic_ce / joint_indep_args["critic_chance_ce"],
@@ -1086,14 +1176,19 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                             _critic_accuracy(critic_outputs[qcd_pair_mask], critic_targets[qcd_pair_mask]),
                             int(qcd_metric_mask.sum().item()))
                     if lam > 0.0:
-                        critic_penalty_loss = penalty.mean()
+                        critic_penalty_loss = (
+                            penalty * gen_weights_c
+                        ).sum() / gen_weights_c.sum().clamp(min=1e-8)
                     info_loss_val = raw_mi_val
                 #bin pred critic
                 else:
                     penalty = mi_proxy
-                    raw_mi_val = penalty.mean().item()
+                    raw_mi_val = (
+                        penalty * gen_weights_c
+                    ).sum().div(gen_weights_c.sum().clamp(min=1e-8)).item()
                     # Match the averaged multi-head chance baseline below.
-                    critic_ce = info_losses.mean().item()
+                    critic_ce = _apply_critic_weights(
+                        info_losses, gen_weights_c, joint_indep_args).item()
                     critic_ce_m.update(critic_ce, targets_c.size(0))
                     critic_ce_ratio_m.update(
                         critic_ce / joint_indep_args["critic_chance_ce"],
@@ -1108,12 +1203,14 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                             _critic_accuracy(critic_outputs[qcd_metric_mask], nuisances_c[qcd_metric_mask]),
                             int(qcd_metric_mask.sum().item()))
                     if lam > 0.0:
-                        critic_penalty_loss = penalty.mean()
+                        critic_penalty_loss = (
+                            penalty * gen_weights_c
+                        ).sum() / gen_weights_c.sum().clamp(min=1e-8)
                     info_loss_val = raw_mi_val
 
         #nurd reweighting
         weights = classification_weights(
-            exact_weights, targets, reweight_args)
+            exact_weights, gen_weights, targets, reweight_args)
         rw_acc, rw_loss = record_rw_metrics(rw_acc, rw_loss, inputs, outputs, targets, losses_ce, weights)
         loss_nurd = (losses_ce * weights).sum() / weights.sum()
 
@@ -1137,7 +1234,8 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         closure_diag = {}
         if closure_w > 0.0 and args.closure_loss_type != "none":
             loss_closure, closure_diag, n_closure = compute_qcd_closure_loss(
-                activations, targets, ae_reco, args, md_proxy=md_proxy,
+                activations, targets, ae_reco, gen_weights, args,
+                md_proxy=md_proxy,
                 update=True)
             if n_closure > 0:
                 closure_classes_m.update(1, inputs.size(0))
@@ -1158,7 +1256,8 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
             # Warm the lagged reference while the closure coefficient ramps up.
             qcd_mask = targets.long() == int(args.qcd_label)
             if qcd_mask.sum() >= args.closure_class_min_events:
-                md_proxy.update(activations[qcd_mask])
+                md_proxy.update(
+                    activations[qcd_mask], gen_weights[qcd_mask])
 
         optimizer.zero_grad()
         tensor_loss.backward()
@@ -1233,15 +1332,17 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
     critic_ce_m = AverageMeter()
     qcd_x_chunks = []
     qcd_latent_chunks = []
+    qcd_weight_chunks = []
 
     model.eval()
     with torch.no_grad():
         end = time.time()
-        for inputs, targets, nuisances, ae_reco, exact_weights in val_loader:
+        for inputs, targets, nuisances, ae_reco, exact_weights, gen_weights in val_loader:
             inputs    = inputs.to(device)
             targets   = targets.long().to(device)
             ae_reco   = ae_reco.to(device)
             exact_weights = exact_weights.to(device)
+            gen_weights = gen_weights.to(device)
             activations, outputs = model(inputs)
             losses    = criterion(outputs, targets)
 
@@ -1249,7 +1350,7 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
             if reweight_args["reweight"]:
                 rw_acc, rw_loss = record_rw_metrics(
                     rw_acc, rw_loss, inputs, outputs, targets, losses,
-                    exact_weights)
+                    exact_weights * gen_weights)
             qcd_mask = targets.long() == int(args.qcd_label)
             if qcd_mask.sum() >= args.closure_class_min_events:
                 if joint_indep_args and joint_indep_args["joint_indep"]:
@@ -1270,6 +1371,8 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
                 qcd_x_chunks.append(x_log.cpu().numpy())
                 qcd_latent_chunks.append(
                     activations[qcd_mask].float().cpu().numpy())
+                qcd_weight_chunks.append(
+                    gen_weights[qcd_mask].float().cpu().numpy())
             batch_time.update(time.time() - end); end = time.time()
 
     val_qcd_corr = qcd_proxy_corr_m.avg if qcd_proxy_corr_m.count > 0 else float("nan")
@@ -1277,21 +1380,24 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
     if qcd_x_chunks:
         qcd_x = np.concatenate(qcd_x_chunks)
         qcd_latents = np.concatenate(qcd_latent_chunks)
+        qcd_weights = np.concatenate(qcd_weight_chunks)
         qcd_md = cross_fitted_mahalanobis(
             qcd_latents, n_splits=args.val_md_folds,
-            seed=args.manualSeed)
+            seed=args.manualSeed, sample_weights=qcd_weights,
+            shrinkage=args.md_proxy_shrinkage)
         qcd_y = np.log1p(np.clip(qcd_md, 0.0, None))
         valid = np.isfinite(qcd_x) & np.isfinite(qcd_y)
         if valid.sum() >= 3:
-            val_qcd_corr = float(np.corrcoef(
-                qcd_x[valid], qcd_y[valid])[0, 1])
+            val_qcd_corr = weighted_corrcoef_np(
+                qcd_x[valid], qcd_y[valid], qcd_weights[valid])
         val_abcd = abcd_grid_metrics_np(
             qcd_x[valid],
             qcd_y[valid],
             args.val_abcd_quantiles_values,
             min_count=args.val_abcd_min_events,
             min_count_fraction=args.val_abcd_min_region_frac,
-            tail_min_quantile=args.val_abcd_tail_min_quantile)
+            tail_min_quantile=args.val_abcd_tail_min_quantile,
+            weights=qcd_weights[valid])
     val_abcd["selection_mode"] = "cross_fitted_qcd_md_grid"
     val_abcd["md_folds"] = int(args.val_md_folds)
     log_metrics(log, epoch, batch_time, loss, top1, acc, rw_loss, rw_acc, split="Val")
@@ -1365,7 +1471,7 @@ def main():
         log.debug("Using AE normalization scaler saved in the AE checkpoint.")
     else:
         log.debug("AE checkpoint has no scaler; recomputing object normalization from --data.")
-    train_dataset, val_dataset, obj_scaler = build_hlt_datasets(
+    train_dataset, val_dataset, obj_scaler, gen_weight_metadata = build_hlt_datasets(
         args.data, ae, n_bins=args.n_bins,
         val_split=args.val_split, seed=args.manualSeed,
         max_events=args.max_events,
@@ -1374,8 +1480,10 @@ def main():
         nuisance_bin_scope=args.nuisance_bin_scope,
         qcd_label=args.qcd_label,
         baseline_labels=args.baseline_labels_values,
+        gen_weight_path=args.gen_weights,
     )
     log.debug(f"Train: {len(train_dataset)}  Val: {len(val_dataset)}")
+    log.debug(f"Generator weights: {gen_weight_metadata}")
 
     num_classes = int(train_dataset.labels.max().item()) + 1
     num_tokens  = train_dataset.features.size(1)
@@ -1505,7 +1613,8 @@ def main():
     cudnn.benchmark = True
     md_proxy = RunningQCDMDProxy(
         momentum=args.md_ema_momentum, eps=args.md_ema_eps,
-        shrinkage=args.md_proxy_shrinkage
+        shrinkage=args.md_proxy_shrinkage,
+        mode=args.md_proxy_type,
     ) if args.md_proxy_type in {"ema", "epoch"} else None
 
     def checkpoint_state(epoch):
@@ -1518,6 +1627,7 @@ def main():
             "config": vars(args),
             "nuisance_bin_edges": train_dataset.bin_edges,
             "nurd_weight_table": train_dataset.weights,
+            "gen_weight_metadata": gen_weight_metadata,
             "md_proxy_state": (
                 None if md_proxy is None else md_proxy.state_dict()),
         }
@@ -1565,13 +1675,13 @@ def main():
         effective_closure_weight = get_effective_closure_weight(epoch)
 
         #all the critic logic here (loss computation, weight updates)
-        if md_proxy is not None:
+        if md_proxy is not None and args.md_proxy_type == "epoch":
             md_proxy.begin_epoch()
         train(model, train_loader, val_loader, criterion, optimizer,
               epoch + args.reweight_epochs, log, reweight_args, joint_indep_args,
               effective_lambda, effective_contrast_weight, effective_closure_weight,
               md_proxy)
-        if md_proxy is not None:
+        if md_proxy is not None and args.md_proxy_type == "epoch":
             md_proxy.finalize_epoch()
         #runs model on validation set with no gradient updates (just forward passes)
         val_loss, val_acc, val_rw_acc, val_qcd_corr, val_abcd = validate(
