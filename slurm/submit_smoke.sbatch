@@ -72,7 +72,7 @@ python train_hlt.py \
   --critic_scope qcd \
   --critic_shuffle global \
   --critic_train_frac 1.0 \
-  --n_critic_steps_per_batch 1 \
+  --n_critic_steps_per_batch 2 \
   --baseline_labels 0,1,2,3 \
   --nuisance_bin_scope qcd \
   --n_bins 20 \
@@ -81,7 +81,7 @@ python train_hlt.py \
   --joint_indep 1 \
   --max_weight_ratio 10.0 \
   --closure_weight 0.1 \
-  --closure_loss_type dcorr_profile \
+  --closure_loss_type hybrid \
   --closure_scope qcd \
   --closure_score_mode own_class \
   --closure_class_min_events 5 \

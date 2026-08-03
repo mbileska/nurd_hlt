@@ -8,6 +8,8 @@ from utils.hlt_training_stats import (
     cross_fitted_mahalanobis,
     soft_conditioner_profile_loss,
     soft_copula_grid_loss,
+    weighted_balanced_folds,
+    weighted_resample_indices,
 )
 
 
@@ -135,6 +137,23 @@ def test_cross_fitted_mahalanobis_scores_every_event():
     assert scores.shape == (200,)
     assert np.isfinite(scores).all()
     assert (scores >= 0).all()
+
+
+def test_weighted_resampling_follows_physical_mass():
+    torch.manual_seed(12)
+    weights = torch.tensor([99.0, 1.0])
+    indices = weighted_resample_indices(weights, 5000)
+
+    assert (indices == 0).float().mean() > 0.98
+
+
+def test_weighted_folds_balance_extreme_generator_weights():
+    weights = np.array([100.0, 80.0, 60.0, 40.0] + [1.0] * 100)
+    fold_ids = weighted_balanced_folds(weights, n_splits=4, seed=5)
+    masses = np.array([weights[fold_ids == fold].sum() for fold in range(4)])
+
+    assert np.all(np.bincount(fold_ids, minlength=4) > 0)
+    assert masses.max() - masses.min() <= weights.max()
 
 
 def test_qcd_rich_sampler_composition_and_correction():

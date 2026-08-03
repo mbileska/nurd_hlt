@@ -9,6 +9,50 @@ from torch.utils.data import Sampler
 from utils.event_weights import weighted_quantile
 
 
+def weighted_resample_indices(weights, n_samples=None):
+    """Draw indices from the physical measure represented by event weights."""
+    weights = torch.as_tensor(weights).float().view(-1)
+    if weights.numel() == 0:
+        return torch.empty(0, device=weights.device, dtype=torch.long)
+    if n_samples is None:
+        n_samples = weights.numel()
+    n_samples = int(n_samples)
+    if n_samples < 1:
+        raise ValueError("n_samples must be positive.")
+    valid = torch.isfinite(weights) & (weights >= 0)
+    if not valid.all() or float(weights.sum().item()) <= 0.0:
+        raise ValueError(
+            "Weighted resampling requires finite, non-negative weights with "
+            "positive total mass."
+        )
+    probabilities = weights / weights.sum()
+    return torch.multinomial(probabilities, n_samples, replacement=True)
+
+
+def weighted_balanced_folds(weights, n_splits=2, seed=42):
+    """Assign rows to folds while balancing total generator weight."""
+    weights = np.asarray(weights, dtype=np.float64).reshape(-1)
+    if weights.size == 0:
+        return np.empty(0, dtype=np.int16)
+    if not np.isfinite(weights).all() or np.any(weights < 0):
+        raise ValueError("Fold weights must be finite and non-negative.")
+    n_splits = min(max(int(n_splits), 2), weights.size)
+    rng = np.random.default_rng(int(seed))
+    shuffled = rng.permutation(weights.size)
+    order = shuffled[np.argsort(-weights[shuffled], kind="stable")]
+    fold_mass = np.zeros(n_splits, dtype=np.float64)
+    fold_size = np.zeros(n_splits, dtype=np.int64)
+    fold_ids = np.empty(weights.size, dtype=np.int16)
+    for index in order:
+        # Size is a deterministic tie-breaker when several folds have equal mass.
+        fold = min(range(n_splits), key=lambda value: (
+            fold_mass[value], fold_size[value], value))
+        fold_ids[index] = fold
+        fold_mass[fold] += weights[index]
+        fold_size[fold] += 1
+    return fold_ids
+
+
 def soft_conditioner_profile_loss(conditioner, target, n_bins=8,
                                   tail_weight=2.0, scale=12.0, eps=1e-8,
                                   weights=None):
@@ -312,8 +356,19 @@ def cross_fitted_mahalanobis(latents, n_splits=2, seed=42,
         sample_weights = np.asarray(sample_weights, dtype=np.float64).reshape(-1)
         if sample_weights.shape[0] != values.shape[0]:
             raise ValueError("sample_weights must align with latents.")
-    splitter = KFold(n_splits=n_splits, shuffle=True, random_state=int(seed))
-    for fit_idx, score_idx in splitter.split(values):
+    if sample_weights is None:
+        splitter = KFold(
+            n_splits=n_splits, shuffle=True, random_state=int(seed))
+        splits = splitter.split(values)
+    else:
+        fold_ids = weighted_balanced_folds(
+            sample_weights, n_splits=n_splits, seed=seed)
+        all_indices = np.arange(values.shape[0])
+        splits = (
+            (all_indices[fold_ids != fold], all_indices[fold_ids == fold])
+            for fold in range(n_splits)
+        )
+    for fit_idx, score_idx in splits:
         if sample_weights is None:
             covariance = LedoitWolf(assume_centered=False).fit(values[fit_idx])
             mean = covariance.location_

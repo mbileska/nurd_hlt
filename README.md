@@ -27,6 +27,11 @@ because the primary ABCD estimate is evaluated on QCD.
   They are applied consistently to AE and NURD losses, nuisance-bin quantiles,
   NURD frequency estimates, critic/closure objectives, latent references,
   validation checkpoint selection, and final ABCD yields.
+- The campaign does not truncate the new files: 90% of every Mequinna training
+  event trains the AE/NURD models, the remaining stratified 10% selects
+  checkpoints and ABCD thresholds, and every independent test event is used
+  once for the final report. Test events never enter optimization or reference
+  fitting.
 - AE reconstruction is computed once. The train/validation split is made before
   fitting nuisance preprocessing.
 - Twenty generator-weighted AE-loss nuisance bins are fitted from training QCD only, then the same
@@ -46,28 +51,43 @@ because the primary ABCD estimate is evaluated on QCD.
 - Natural shuffled batches are used by default; QCD-rich sampling remains an
   explicit optional experiment.
 - A QCD density-ratio critic distinguishes real `(latent, AE-bin)` pairs from
-  shuffled pairs. It takes one update per selected batch and is weighted by the
-  physical generator measure, but not by NURD label/nuisance weights.
+  shuffled pairs. The v7 critic takes two inexpensive updates on reused encoder
+  activations. Its shuffled AE bins are sampled from the generator-weighted
+  nuisance marginal, so the negative examples represent the physical
+  product-of-marginals rather than the raw event distribution.
 - The encoder uses the bounded `ratio_to_one` objective, making the learned
   density ratio approach one without an unbounded adversarial CE objective.
-- Direct QCD closure regularization acts on continuous AE loss and QCD MD. It
-  combines weighted log-correlation, distance correlation, and forward profile
-  flatness. The higher-variance v5 reverse-profile/copula terms remain optional.
+- Supervised contrastive learning weights both anchors and comparison events by
+  the NURD times generator measure. Previously only anchors were weighted, so
+  the raw Mequinna class mixture still defined every contrastive denominator.
+- Direct QCD closure regularization acts on continuous AE loss and QCD MD. The
+  default restores the best-performing v3/v4 hybrid objective: weighted
+  log-correlation, distance correlation, forward/reverse profile flatness, and
+  a soft tail copula grid. The fixed-size dCorr calculation now samples from
+  the physical generator measure instead of retaining extreme weights on a
+  uniform 512-row subsample.
 - The QCD MD proxy is a real online EMA. A batch is scored against the previous
   detached reference before that batch updates the weighted moments, avoiding
   self-scoring while tracking the changing encoder.
-- Contrastive weight decreases from `0.15` to `0.05` over 40 epochs. Closure
-  weight increases from `0` to `0.5` over 15 epochs.
+- The weighted EMA update is reduced from `0.05` to `0.01`; with roughly 360
+  batches per epoch this still follows encoder evolution while averaging over
+  substantially more physical QCD statistics.
+- Contrastive weight decreases from `0.15` to `0.02` over 40 epochs. Closure
+  weight increases from `0` to `1.0` over 15 epochs, restoring the settings that
+  gave the strongest broad QCD closure before v6 weakened them.
 
 ### Selection And Evaluation
 
 - `checkpoint_main_*` is selected by validation NURD loss.
-- Validation QCD MD is two-fold cross-fitted with weighted shrinkage covariance,
-  matching final evaluation geometry while ensuring no validation event helps
-  define its own MD. Closure checkpoints use a five-epoch rolling median.
+- Validation QCD MD is two-fold cross-fitted with weighted shrinkage covariance.
+  Fold assignment balances generator-weight mass, so a few large-weight events
+  cannot make one reference fold statistically much weaker than the other.
 - `checkpoint_abcd.pth.tar` and `checkpoint_closure.pth.tar` are selected by a
   broad cross-fitted QCD MD score: p90 plus tail and median log-nonclosure,
-  subject to a validation-loss tolerance.
+  subject to validation-loss, effective-region-count, and propagated-ratio-
+  uncertainty guards. Selection starts after epoch 40 and saves the exact epoch
+  that produced the improving score; an older rolling-median implementation
+  could save a different current state than the historical score described.
 - Final threshold selection uses the untouched model-validation portion of the
   training file. The complete test file is report-only.
 - ABCD cuts use weighted quantiles. `A/B/C/D` are generator-weighted yields,
@@ -237,17 +257,16 @@ AE epochs             100
 NURD epochs           200
 nuisance bins         20 weighted quantiles, fitted on training QCD
 training batches      natural shuffled all-background batches
-critic                QCD density-ratio critic, one update per batch
+critic                weighted QCD density-ratio critic, two updates per batch
 critic penalty        bounded ratio_to_one
-closure               weighted QCD dCorr/profile vs online EMA QCD MD
-checkpoint MD         two-fold cross-fitted weighted shrinkage covariance
+closure               weighted QCD hybrid dCorr/profile/tail-copula vs EMA MD
+checkpoint MD         weight-balanced two-fold cross-fitted shrinkage covariance
 ABCD yields           generator weighted, uncertainty from sumw2
 ```
 
-The previous 150-epoch jobs finished in about 6.5 hours. Two hundred NURD
-epochs give the lower learning-rate tail more time while retaining margin under
-the 12-hour hard limit. Slurm terminates the job at 12 hours; it cannot consume
-a GPU indefinitely.
+Two hundred NURD epochs retain the completed v6 campaign length and use the
+lower learning-rate tail without increasing the 12-hour hard limit. Slurm
+terminates the job at 12 hours; it cannot consume a GPU indefinitely.
 
 Monitor:
 
@@ -273,6 +292,10 @@ CLOSURE_SCOPE=qcd
 CLOSURE_SCORE_MODE=own_class
 NURD_EPOCHS=200
 MD_PROXY_TYPE=ema
+MD_EMA_MOMENTUM=0.01
+CLOSURE_LOSS_TYPE=hybrid
+CLOSURE_WEIGHT=1.0
+CONTRAST_WEIGHT=0.02
 ```
 
 Training is complete only when the output contains `TRAINING DONE`.
@@ -308,7 +331,7 @@ optimization experiment.
 The latest-eval script defaults to:
 
 ```text
-NURD_GLOB=hlt_nurd_closure_bs4096_experimental_qcd_weighted_v6_*
+NURD_GLOB=hlt_nurd_closure_bs4096_experimental_qcd_weighted_v7_*
 PREFER_ABCD_CKPT=1
 ABCD_SCOPE=qcd
 SCORE_MODE=qcd_md
@@ -335,7 +358,7 @@ Evaluate the latest validation-loss checkpoint for comparison:
 ```bash
 unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP NURD_GLOB
 PREFER_ABCD_CKPT=0 PREFER_CLOSURE_CKPT=0 \
-  WANDB_NAME_PREFIX=experimental_qcd_weighted_v6_main \
+  WANDB_NAME_PREFIX=experimental_qcd_weighted_v7_main \
   sbatch slurm/submit_eval_latest.sbatch
 ```
 

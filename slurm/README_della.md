@@ -47,8 +47,9 @@ sbatch slurm/submit_train.sbatch
 Defaults: 100 AE epochs, 200 NURD epochs, a 12-hour hard limit, one 80 GB A100,
 8 CPU cores, 48 GB CPU memory, and zero DataLoader workers. Training uses
 the Mequinna train sample plus generator weights, 20 weighted QCD-defined
-nuisance bins, a one-step QCD density-ratio critic, natural batches, online EMA
-QCD MD, and generator-weighted cross-fitted validation closure.
+nuisance bins, a two-step physically shuffled QCD density-ratio critic, natural
+batches, the restored hybrid tail-closure objective, online EMA QCD MD, and
+generator-weighted cross-fitted validation closure.
 
 Monitor:
 
