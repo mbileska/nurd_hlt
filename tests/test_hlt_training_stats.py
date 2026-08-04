@@ -1,11 +1,19 @@
 import torch
 import numpy as np
 
-from dataset.hlt_smcocktail_dataset import _make_nurd_weights
+from dataset.hlt_smcocktail_dataset import (
+    _make_nurd_weights,
+    apply_class_balance,
+    class_balance_factors,
+    weighted_cdf_coordinate,
+)
+from models.hlt_con import HLTCritic
 from utils.hlt_training_stats import (
     QCDRichBatchSampler,
     RunningQCDMDProxy,
+    classifier_checkpoint_eligible,
     cross_fitted_mahalanobis,
+    distance_corr_loss,
     soft_conditioner_profile_loss,
     soft_copula_grid_loss,
     weighted_balanced_folds,
@@ -44,6 +52,72 @@ def test_capped_nurd_weights_preserve_generator_weighted_mean():
         generator_weights * nurd_weights
     ).sum() / generator_weights.sum()
     assert torch.isclose(physical_mean, torch.tensor(1.0), atol=1e-6)
+
+
+def test_class_balanced_physical_measure_preserves_within_class_weights():
+    labels = torch.tensor([0, 0, 1, 1, 1, 2])
+    generator_weights = torch.tensor([1.0, 3.0, 10.0, 20.0, 30.0, 7.0])
+    factors = class_balance_factors(labels, generator_weights)
+    balanced = apply_class_balance(labels, generator_weights, factors)
+    masses = torch.stack([
+        balanced[labels == label].sum() for label in labels.unique()
+    ])
+
+    assert torch.allclose(masses, masses[0].expand_as(masses), atol=1e-5)
+    assert torch.isclose(
+        balanced[1] / balanced[0],
+        generator_weights[1] / generator_weights[0])
+
+
+def test_weighted_cdf_coordinate_is_monotonic_and_uses_physical_mass():
+    reference = torch.tensor([0.0, 1.0, 2.0])
+    weights = torch.tensor([8.0, 1.0, 1.0])
+    values = torch.tensor([-1.0, 0.0, 1.0, 2.0, 3.0])
+    coordinate = weighted_cdf_coordinate(values, reference, weights)
+
+    assert torch.all(coordinate[1:] >= coordinate[:-1])
+    assert coordinate[0] == 0.0 and coordinate[-1] == 1.0
+    assert coordinate[1] > 0.35
+
+
+def test_continuous_density_ratio_critic_accepts_qcd_cdf():
+    critic = HLTCritic(
+        latent_dim=6, num_classes=4, n_bins=50,
+        critic_type="continuous_density_ratio", bin_resolutions=[50])
+    latent = torch.randn(32, 6, requires_grad=True)
+    labels = torch.ones(32, 1)
+    nuisance_cdf = torch.linspace(0.0, 1.0, 32)
+
+    output = critic(latent, labels, nuisance_cdf)
+    output.sum().backward()
+
+    assert output.shape == (32, 2)
+    assert latent.grad is not None and latent.grad.abs().sum() > 0
+
+
+def test_vector_distance_correlation_penalizes_full_latent_dependence():
+    nuisance = torch.linspace(-2.0, 2.0, 256)
+    latent = torch.stack([
+        nuisance,
+        nuisance.square(),
+        torch.sin(3.0 * nuisance),
+    ], dim=1).requires_grad_()
+
+    loss, metric = distance_corr_loss(nuisance, latent, max_samples=0)
+    loss.backward()
+
+    assert metric > 0.5
+    assert latent.grad is not None and latent.grad.abs().sum() > 0
+
+
+def test_checkpoint_gate_rejects_collapsed_classifier():
+    assert not classifier_checkpoint_eligible(0.25, 0.45)
+    assert not classifier_checkpoint_eligible(float("nan"), 0.45)
+    assert classifier_checkpoint_eligible(0.71, 0.45)
+    assert not classifier_checkpoint_eligible(
+        0.71, 0.45, [0.9, 0.0, 0.95, 0.99], 0.25)
+    assert classifier_checkpoint_eligible(
+        0.71, 0.45, [0.4, 0.7, 0.8, 0.94], 0.25)
 
 
 def test_qcd_md_proxy_tracks_full_second_moment():

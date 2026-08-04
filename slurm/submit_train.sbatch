@@ -48,7 +48,7 @@ if [[ -e checkpoints && ! -L checkpoints ]]; then
 fi
 ln -sfnT "$BASE/checkpoints" checkpoints
 
-RUN_TAG="${RUN_TAG:-experimental_qcd_weighted_v7_$(date +%Y%m%d_%H%M%S)}"
+RUN_TAG="${RUN_TAG:-experimental_qcd_continuous_v8_$(date +%Y%m%d_%H%M%S)}"
 AE_EXP="${AE_EXP:-ae_pretrain_$RUN_TAG}"
 NURD_EXP="${NURD_EXP:-hlt_nurd_closure_bs4096_$RUN_TAG}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
@@ -76,9 +76,9 @@ ABCD_CKPT_MIN_EPOCH="${ABCD_CKPT_MIN_EPOCH:-40}"
 BASELINE_LABELS="${BASELINE_LABELS:-0,1,2,3}"
 NUISANCE_BIN_SCOPE="${NUISANCE_BIN_SCOPE:-qcd}"
 CRITIC_SCOPE="${CRITIC_SCOPE:-qcd}"
-N_BINS="${N_BINS:-20}"
-CRITIC_TYPE="${CRITIC_TYPE:-density_ratio}"
-CRITIC_BIN_RESOLUTIONS="${CRITIC_BIN_RESOLUTIONS:-20}"
+N_BINS="${N_BINS:-50}"
+CRITIC_TYPE="${CRITIC_TYPE:-continuous_density_ratio}"
+CRITIC_BIN_RESOLUTIONS="${CRITIC_BIN_RESOLUTIONS:-50}"
 CRITIC_PENALTY_TYPE="${CRITIC_PENALTY_TYPE:-ratio_to_one}"
 CRITIC_SHUFFLE="${CRITIC_SHUFFLE:-global}"
 N_CRITIC_STEPS="${N_CRITIC_STEPS:-2}"
@@ -95,6 +95,11 @@ ABCD_CKPT_SMOOTHING_EPOCHS="${ABCD_CKPT_SMOOTHING_EPOCHS:-5}"
 VAL_ABCD_MIN_EFFECTIVE_EVENTS="${VAL_ABCD_MIN_EFFECTIVE_EVENTS:-20}"
 VAL_ABCD_MAX_RATIO_UNC="${VAL_ABCD_MAX_RATIO_UNC:-0.15}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
+TRAINING_MEASURE="${TRAINING_MEASURE:-class_balanced_physical}"
+LAMBDA="${LAMBDA:-0.05}"
+CLOSURE_LATENT_DCORR_WEIGHT="${CLOSURE_LATENT_DCORR_WEIGHT:-1.5}"
+MIN_VAL_BALANCED_ACC="${MIN_VAL_BALANCED_ACC:-0.55}"
+MIN_VAL_CLASS_ACC="${MIN_VAL_CLASS_ACC:-0.25}"
 AE_CKPT="${AE_CKPT:-checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth}"
 
 echo "=== Full training started: $(date) ==="
@@ -116,7 +121,9 @@ echo "CRITIC_BIN_RESOLUTIONS=$CRITIC_BIN_RESOLUTIONS"
 echo "CRITIC_PENALTY_TYPE=$CRITIC_PENALTY_TYPE"
 echo "CRITIC_SHUFFLE=$CRITIC_SHUFFLE"
 echo "N_CRITIC_STEPS=$N_CRITIC_STEPS"
+echo "LAMBDA=$LAMBDA"
 echo "N_BINS=$N_BINS"
+echo "TRAINING_MEASURE=$TRAINING_MEASURE"
 echo "QCD_BATCH_FRACTION=$QCD_BATCH_FRACTION"
 echo "NUISANCE_BIN_SCOPE=$NUISANCE_BIN_SCOPE"
 echo "CONTRAST_WEIGHT=$CONTRAST_WEIGHT"
@@ -130,6 +137,7 @@ echo "CLOSURE_SCOPE=$CLOSURE_SCOPE"
 echo "CLOSURE_CLASS_MIN_EVENTS=$CLOSURE_CLASS_MIN_EVENTS"
 echo "CLOSURE_CLASS_WEIGHTING=$CLOSURE_CLASS_WEIGHTING"
 echo "CLOSURE_SCORE_MODE=$CLOSURE_SCORE_MODE"
+echo "CLOSURE_LATENT_DCORR_WEIGHT=$CLOSURE_LATENT_DCORR_WEIGHT"
 echo "CLOSURE_REVERSE_PROFILE_WEIGHT=$CLOSURE_REVERSE_PROFILE_WEIGHT"
 echo "CLOSURE_TAIL_ABCD_WEIGHT=$CLOSURE_TAIL_ABCD_WEIGHT"
 echo "CLOSURE_TAIL_QUANTILES=$CLOSURE_TAIL_QUANTILES"
@@ -149,6 +157,8 @@ echo "VAL_MD_FOLDS=$VAL_MD_FOLDS"
 echo "ABCD_CKPT_SMOOTHING_EPOCHS=$ABCD_CKPT_SMOOTHING_EPOCHS"
 echo "VAL_ABCD_MIN_EFFECTIVE_EVENTS=$VAL_ABCD_MIN_EFFECTIVE_EVENTS"
 echo "VAL_ABCD_MAX_RATIO_UNC=$VAL_ABCD_MAX_RATIO_UNC"
+echo "MIN_VAL_BALANCED_ACC=$MIN_VAL_BALANCED_ACC"
+echo "MIN_VAL_CLASS_ACC=$MIN_VAL_CLASS_ACC"
 echo "W&B project: nurd-ood-hlt"
 echo "W&B mode: $WANDB_MODE"
 echo "Minimum GPU memory: ${MIN_GPU_MEM_GB} GiB"
@@ -184,6 +194,7 @@ echo "=== Step 2: NURD closure training ==="
 python train_hlt.py \
   --data "$TRAIN_PT" \
   --gen_weights "$GEN_WEIGHT_TRAIN" \
+  --training_measure "$TRAINING_MEASURE" \
   --ae_ckpt "$AE_CKPT" \
   --epochs "$NURD_EPOCHS" \
   --batch_size "$BATCH_SIZE" \
@@ -219,7 +230,7 @@ python train_hlt.py \
   --critic_lr_multiplier 10.0 \
   --n_critic_steps_per_batch "$N_CRITIC_STEPS" \
   --critic_scope "$CRITIC_SCOPE" \
-  --_lambda 0.01 \
+  --_lambda "$LAMBDA" \
   --no_mi_norm \
   --closure_weight "$CLOSURE_WEIGHT" \
   --closure_scope "$CLOSURE_SCOPE" \
@@ -231,6 +242,7 @@ python train_hlt.py \
   --closure_loss_type "$CLOSURE_LOSS_TYPE" \
   --closure_corr_weight 0.25 \
   --closure_dcorr_weight 1.0 \
+  --closure_latent_dcorr_weight "$CLOSURE_LATENT_DCORR_WEIGHT" \
   --closure_profile_weight 0.5 \
   --closure_reverse_profile_weight "$CLOSURE_REVERSE_PROFILE_WEIGHT" \
   --closure_profile_bins 8 \
@@ -250,6 +262,8 @@ python train_hlt.py \
   --val_abcd_max_ratio_unc "$VAL_ABCD_MAX_RATIO_UNC" \
   --val_md_folds "$VAL_MD_FOLDS" \
   --abcd_ckpt_smoothing_epochs "$ABCD_CKPT_SMOOTHING_EPOCHS" \
+  --min_val_balanced_acc "$MIN_VAL_BALANCED_ACC" \
+  --min_val_class_acc "$MIN_VAL_CLASS_ACC" \
   --md_proxy_type "$MD_PROXY_TYPE" \
   --md_ema_momentum "$MD_EMA_MOMENTUM" \
   --md_proxy_shrinkage "$MD_PROXY_SHRINKAGE" \

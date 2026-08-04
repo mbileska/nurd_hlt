@@ -614,12 +614,28 @@ def class_assignment_diagnostics(true_labels, score_products):
 
 
 def nuisance_auditor(train_latents, train_ae, test_latents, test_ae, bin_edges,
-                     seed=42):
-    """Train a fresh nonlinear QCD auditor and report on independent test QCD."""
+                     seed=42, train_weights=None, test_weights=None):
+    """Train and score a fresh QCD auditor under the physical QCD measure."""
     edges = np.asarray(bin_edges, dtype=np.float64).reshape(-1)
     train_bins = np.searchsorted(edges[1:-1], train_ae, side="right")
     test_bins = np.searchsorted(edges[1:-1], test_ae, side="right")
     classes = np.arange(len(edges) - 1)
+    train_weights = (
+        np.ones(len(train_bins), dtype=np.float64) if train_weights is None
+        else np.asarray(train_weights, dtype=np.float64).reshape(-1)
+    )
+    test_weights = (
+        np.ones(len(test_bins), dtype=np.float64) if test_weights is None
+        else np.asarray(test_weights, dtype=np.float64).reshape(-1)
+    )
+    if len(train_weights) != len(train_bins) or len(test_weights) != len(test_bins):
+        raise ValueError("Auditor weights must align with QCD events.")
+    train_weights = train_weights / train_weights.sum()
+    test_weights = test_weights / test_weights.sum()
+    rng = np.random.default_rng(seed)
+    physical_train_idx = rng.choice(
+        len(train_bins), size=len(train_bins), replace=True,
+        p=train_weights)
     auditor = make_pipeline(
         StandardScaler(),
         MLPClassifier(
@@ -635,7 +651,7 @@ def nuisance_auditor(train_latents, train_ae, test_latents, test_ae, bin_edges,
             random_state=seed,
         ),
     )
-    auditor.fit(train_latents, train_bins)
+    auditor.fit(train_latents[physical_train_idx], train_bins[physical_train_idx])
     probabilities = auditor.predict_proba(test_latents)
     aligned_probabilities = np.full(
         (len(test_bins), len(classes)), 1e-12, dtype=np.float64)
@@ -643,27 +659,34 @@ def nuisance_auditor(train_latents, train_ae, test_latents, test_ae, bin_edges,
     aligned_probabilities /= aligned_probabilities.sum(axis=1, keepdims=True)
 
     train_prior = np.bincount(
-        train_bins, minlength=len(classes)).astype(np.float64)
+        train_bins, weights=train_weights,
+        minlength=len(classes)).astype(np.float64)
     train_prior /= train_prior.sum()
     chance_probabilities = np.broadcast_to(
         train_prior, aligned_probabilities.shape)
     try:
         macro_auc = roc_auc_score(
             test_bins, aligned_probabilities, labels=classes,
-            multi_class="ovr", average="macro")
+            multi_class="ovr", average="macro",
+            sample_weight=test_weights)
     except ValueError:
         macro_auc = np.nan
     return {
         "train_n": int(len(train_bins)),
         "test_n": int(len(test_bins)),
         "n_bins": int(len(classes)),
-        "accuracy": float(np.mean(auditor.predict(test_latents) == test_bins)),
+        "measure": "generator_weighted_qcd",
+        "accuracy": float(np.sum(
+            test_weights * (auditor.predict(test_latents) == test_bins))),
         "majority_accuracy": float(np.bincount(
-            test_bins, minlength=len(classes)).max() / len(test_bins)),
+            test_bins, weights=test_weights,
+            minlength=len(classes)).max()),
         "cross_entropy": float(log_loss(
-            test_bins, aligned_probabilities, labels=classes)),
+            test_bins, aligned_probabilities, labels=classes,
+            sample_weight=test_weights)),
         "prior_cross_entropy": float(log_loss(
-            test_bins, chance_probabilities, labels=classes)),
+            test_bins, chance_probabilities, labels=classes,
+            sample_weight=test_weights)),
         "macro_ovr_auc": float(macro_auc),
         "iterations": int(auditor[-1].n_iter_),
     }
@@ -924,6 +947,8 @@ def ABCD(config):
                 axis1_qcd,
                 saved_edges,
                 seed=int(config.get("reference_split_seed", 42)),
+                train_weights=reference_weights[auditor_train_idx],
+                test_weights=weights_qcd,
             )
             auditor_diag = diagnostics["nuisance_auditor"]
             print(

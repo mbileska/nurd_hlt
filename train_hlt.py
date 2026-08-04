@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from models.hlt_autoencoder import HLTAutoencoder
 from models.hlt_con import HLTContrastiveModel, HLTCritic
@@ -38,7 +38,9 @@ from utils.common import AverageMeter, save_checkpoint, accuracy
 from utils.hlt_training_stats import (
     QCDRichBatchSampler,
     RunningQCDMDProxy,
+    classifier_checkpoint_eligible,
     cross_fitted_mahalanobis,
+    distance_corr_loss,
     soft_conditioner_profile_loss,
     soft_copula_grid_loss,
     weighted_resample_indices,
@@ -177,52 +179,6 @@ def parse_int_list(value):
     return [int(v) for v in str(value).replace(",", " ").split() if str(v).strip()]
 
 
-def distance_corr_loss(x, y, max_samples=512, eps=1e-8, weights=None):
-    """Differentiable squared distance correlation for one-dimensional tensors."""
-    x = x.float().view(-1)
-    y = y.float().view(-1)
-    has_physical_weights = weights is not None
-    weights = (
-        torch.ones_like(x) if weights is None
-        else weights.float().view(-1).to(x.device)
-    )
-    n = x.numel()
-    if n < 4:
-        zero = (x.sum() + y.sum()) * 0.0
-        return zero, None
-    if max_samples > 0 and n > max_samples:
-        if not has_physical_weights:
-            idx = torch.randperm(n, device=x.device)[:max_samples]
-        else:
-            # Uniformly taking raw rows and retaining extreme generator weights
-            # leaves only O(50) effective events for Mequinna. Sampling from the
-            # represented physical measure gives a consistent fixed-cost estimate.
-            idx = weighted_resample_indices(weights.detach(), max_samples)
-        x = x[idx]
-        y = y[idx]
-        weights = torch.ones_like(x)
-    weights = weights / weights.sum().clamp(min=eps)
-    x_dist = torch.cdist(x.view(-1, 1), x.view(-1, 1), p=1)
-    y_dist = torch.cdist(y.view(-1, 1), y.view(-1, 1), p=1)
-    x_row = x_dist @ weights
-    y_row = y_dist @ weights
-    x_centered = (
-        x_dist - x_row[:, None] - x_row[None, :]
-        + weights @ x_row
-    )
-    y_centered = (
-        y_dist - y_row[:, None] - y_row[None, :]
-        + weights @ y_row
-    )
-    pair_weights = weights[:, None] * weights[None, :]
-    dcov = (pair_weights * x_centered * y_centered).sum()
-    dvar_x = (pair_weights * x_centered * x_centered).sum()
-    dvar_y = (pair_weights * y_centered * y_centered).sum()
-    dcor = dcov / torch.sqrt(dvar_x * dvar_y + eps)
-    dcor = dcor.clamp(min=0.0)
-    return dcor, dcor.detach().item()
-
-
 def profile_flatness_loss(x, y, n_bins=8, tail_weight=2.0, eps=1e-8,
                           weights=None):
     """Penalize trends in the mean MD profile versus AE loss quantile."""
@@ -265,7 +221,7 @@ def profile_flatness_loss(x, y, n_bins=8, tail_weight=2.0, eps=1e-8,
 
 
 def closure_dependency_loss(ae_reco, proxy_md_values, args, weights=None,
-                            eps=1e-8):
+                            latent_values=None, eps=1e-8):
     """Direct QCD dependence loss for the two ABCD axes."""
     x = torch.log(ae_reco.float().clamp(min=eps))
     y = torch.log1p(proxy_md_values.float().clamp(min=0.0))
@@ -286,6 +242,29 @@ def closure_dependency_loss(ae_reco, proxy_md_values, args, weights=None,
                 weights=weights)
             total = total + args.closure_dcorr_weight * dcorr + args.closure_profile_weight * profile
             diag.update({"dcorr": dcorr_val, "profile": profile_val})
+            if latent_values is not None and args.closure_latent_dcorr_weight > 0.0:
+                latent_values = latent_values.float()
+                latent_weights = (
+                    torch.ones(latent_values.size(0), device=latent_values.device)
+                    if weights is None else weights.float().view(-1)
+                )
+                normalized_weights = latent_weights / latent_weights.sum().clamp(min=eps)
+                latent_mean = (
+                    normalized_weights[:, None] * latent_values
+                ).sum(dim=0)
+                latent_std = torch.sqrt(
+                    (normalized_weights[:, None]
+                     * (latent_values - latent_mean).square()).sum(dim=0)
+                ).clamp(min=eps)
+                standardized_latent = (
+                    latent_values - latent_mean.detach()
+                ) / latent_std.detach()
+                latent_dcorr, latent_dcorr_val = distance_corr_loss(
+                    x, standardized_latent,
+                    max_samples=args.closure_dcorr_max_samples,
+                    eps=eps, weights=weights)
+                total = total + args.closure_latent_dcorr_weight * latent_dcorr
+                diag["latent_dcorr"] = latent_dcorr_val
             if args.closure_reverse_profile_weight > 0.0:
                 profile_rev, profile_rev_val = soft_conditioner_profile_loss(
                     y, x, n_bins=args.closure_profile_bins,
@@ -329,7 +308,8 @@ def compute_qcd_closure_loss(activations, labels, ae_reco, gen_weights, args,
         return loss, {"corr": corr}, n_qcd
 
     loss, corr, diagnostics = closure_dependency_loss(
-        ae_reco[qcd_mask], proxy_md[qcd_mask], args, weights=qcd_weights)
+        ae_reco[qcd_mask], proxy_md[qcd_mask], args, weights=qcd_weights,
+        latent_values=activations[qcd_mask])
     diagnostics["corr"] = corr
     return loss, diagnostics, n_qcd
 
@@ -452,9 +432,14 @@ parser = argparse.ArgumentParser(description="HLT NURD contrastive training")
 parser.add_argument("--data",       required=True,  type=str, help="Path to .pt training file")
 parser.add_argument("--gen_weights", default=None, type=str,
                     help="Event-aligned non-negative generator weights (.pt).")
+parser.add_argument("--training_measure", default="class_balanced_physical",
+                    choices=["physical", "class_balanced_physical"],
+                    help="Class-balanced physical sampling preserves generator weights within "
+                         "each class while preventing a dominant cross section from collapsing "
+                         "the all-background classifier.")
 parser.add_argument("--ae_ckpt",    required=True,  type=str, help="Path to pre-trained AE checkpoint (.pth)")
 parser.add_argument("--val_split",  default=0.1,    type=float)
-parser.add_argument("--n_bins",     default=20,     type=int, help="Nuisance bins for AE reco loss")
+parser.add_argument("--n_bins",     default=50,     type=int, help="Nuisance bins for exact NURD weights")
 parser.add_argument("--nuisance_bin_scope", default="qcd",
                     choices=["all", "qcd", "per_class", "per_label", "baseline_per_class"],
                     help="Events used to define AE-loss quantile bins. 'per_class' defines bins "
@@ -514,11 +499,12 @@ parser.add_argument("--critic_schedule", default="warmup",
                     help="'warmup' trains the critic on selected batches and ramps lambda; "
                          "'per_epoch' trains it before each main epoch. 'per_batch' is kept "
                          "only to fail fast because that old block is disabled.")
-parser.add_argument("--critic_type",    default="density_ratio",
-                    choices=["bin_pred", "density_ratio"],
-                    help="'density_ratio' uses the NURD shuffled-z binary critic; "
+parser.add_argument("--critic_type",    default="continuous_density_ratio",
+                    choices=["bin_pred", "density_ratio", "continuous_density_ratio"],
+                    help="'density_ratio' uses binned shuffled-z; "
+                         "'continuous_density_ratio' uses the weighted QCD AE-loss CDF; "
                          "'bin_pred' predicts nuisance bins directly.")
-parser.add_argument("--critic_bin_resolutions", default="20", type=str,
+parser.add_argument("--critic_bin_resolutions", default="50", type=str,
                     help="Comma-separated direct-critic bin heads. Every value must divide --n_bins.")
 parser.add_argument("--critic_penalty_type", default="ratio_to_one",
                     choices=["prior_match", "ratio_to_one", "confusion",
@@ -588,6 +574,8 @@ parser.add_argument("--closure_corr_weight", default=0.25, type=float,
                     help="Internal weight for Pearson-correlation component of dcorr_profile closure loss.")
 parser.add_argument("--closure_dcorr_weight", default=1.0, type=float,
                     help="Internal weight for distance-correlation component of dcorr_profile closure loss.")
+parser.add_argument("--closure_latent_dcorr_weight", default=1.5, type=float,
+                    help="Weight on distance correlation between continuous AE rank and the full QCD latent.")
 parser.add_argument("--closure_profile_weight", default=0.5, type=float,
                     help="Internal weight for profile-flatness component of dcorr_profile closure loss.")
 parser.add_argument("--closure_reverse_profile_weight", default=0.5, type=float,
@@ -634,6 +622,12 @@ parser.add_argument("--abcd_ckpt_smoothing_epochs", default=5, type=int,
                     help="Rolling-median window for ABCD checkpoint selection.")
 parser.add_argument("--abcd_ckpt_min_epoch", default=20, type=int,
                     help="Do not select a closure checkpoint before this completed epoch.")
+parser.add_argument("--min_val_balanced_acc", default=0.55, type=float,
+                    help="Reject main/closure checkpoints whose physical within-class validation "
+                         "accuracy is below this threshold.")
+parser.add_argument("--min_val_class_acc", default=0.25, type=float,
+                    help="Reject checkpoints when any background class has lower physical "
+                         "validation accuracy than this threshold.")
 parser.add_argument("--qcd_label",            default=1,     type=int,
                     help="Label index for QCD compatibility modes.")
 parser.add_argument("--md_proxy_type", default="ema",
@@ -669,6 +663,9 @@ if args.critic_type == "bin_pred":
             "Every --critic_bin_resolutions value must divide --n_bins.")
 if args.qcd_batch_fraction != 0.0 and not 0.0 < args.qcd_batch_fraction < 1.0:
     raise ValueError("--qcd_batch_fraction must be 0 or lie in (0, 1).")
+if args.training_measure == "class_balanced_physical" and args.qcd_batch_fraction != 0.0:
+    raise ValueError(
+        "--qcd_batch_fraction cannot be combined with class-balanced physical sampling.")
 if (
     args.closure_scope != "qcd"
     or args.closure_score_mode != "own_class"
@@ -798,10 +795,15 @@ def critic_scope_mask(labels, joint_indep_args):
     return mask
 
 
-def select_critic_scope(inputs, labels, nuisances, joint_indep_args):
+def select_critic_scope(inputs, labels, nuisances, nuisance_cdf,
+                        joint_indep_args):
     """Return the batch subset used by the nuisance critic."""
     mask = critic_scope_mask(labels, joint_indep_args)
-    return inputs[mask], labels[mask], nuisances[mask], mask
+    nuisance_values = (
+        nuisance_cdf if joint_indep_args.get("critic_type")
+        == "continuous_density_ratio" else nuisances
+    )
+    return inputs[mask], labels[mask], nuisance_values[mask], mask
 
 
 def _safe_pearson_torch(x, y, weights=None):
@@ -908,9 +910,15 @@ def compute_critic_loss_from_activations(activations, labels, nuisances,
                                          joint_indep_args,
                                          sample_weights=None):
     y_in = _critic_label_input(labels, joint_indep_args)
-    if joint_indep_args.get("critic_type") == "density_ratio":
+    if joint_indep_args.get("critic_type") in {
+        "density_ratio", "continuous_density_ratio"
+    }:
         # NURD density-ratio trick: classify real (r,y,z) vs shuffled-z triples.
-        z = nuisances.long()
+        z = (
+            nuisances.float()
+            if joint_indep_args.get("critic_type") == "continuous_density_ratio"
+            else nuisances.long()
+        )
         pos_targets = torch.ones_like(labels, dtype=torch.long)
         neg_targets = torch.zeros_like(labels, dtype=torch.long)
         pos_out = critic_model(activations, y_in, z)
@@ -984,17 +992,31 @@ def compute_critic_loss_from_activations(activations, labels, nuisances,
 
 
 def _apply_critic_weights(losses, weights, joint_indep_args):
-    if joint_indep_args.get("critic_type") == "density_ratio":
+    if joint_indep_args.get("critic_type") in {
+        "density_ratio", "continuous_density_ratio"
+    }:
         weights = weights.repeat(2)
     return (losses * weights).sum() / weights.sum().clamp(min=1e-8)
 
 
-def classification_weights(exact_weights, gen_weights, targets, reweight_args):
+def classification_weights(exact_weights, gen_weights, targets, reweight_args,
+                           sampled_measure=False):
     nurd_weights = (
         exact_weights if reweight_args["reweight"]
         else torch.ones_like(exact_weights)
     )
-    weights = nurd_weights * gen_weights
+    if sampled_measure:
+        # WeightedRandomSampler already draws from the class-balanced physical
+        # measure. Applying generator weights again would square that measure.
+        return nurd_weights
+    base_weights = gen_weights
+    if reweight_args.get("training_measure") == "class_balanced_physical":
+        factors = reweight_args["class_balance_factors"]
+        class_factors = torch.ones_like(base_weights)
+        for label, factor in factors.items():
+            class_factors[targets.long() == int(label)] = float(factor)
+        base_weights = base_weights * class_factors
+    weights = nurd_weights * base_weights
     correction = reweight_args.get("sampling_correction")
     if correction is None:
         return weights
@@ -1011,13 +1033,19 @@ def train_critic(critic_model, model, train_loader, critic_criterion, critic_opt
     model.eval()
     batch_time = AverageMeter()
     end = time.time()
-    for inputs, targets, nuisances, _ae_reco, _exact_weights, gen_weights in train_loader:
+    for (inputs, targets, nuisances, nuisance_cdf, _ae_reco,
+         _exact_weights, gen_weights) in train_loader:
         inputs, targets, nuisances = inputs.to(device), targets.long().to(device), nuisances.to(device)
+        nuisance_cdf = nuisance_cdf.to(device)
         inputs_c, targets_c, nuisances_c, scope_mask = select_critic_scope(
-            inputs, targets, nuisances, joint_indep_args)
+            inputs, targets, nuisances, nuisance_cdf, joint_indep_args)
         if inputs_c.size(0) == 0:
             continue
-        weights = gen_weights.to(device)[scope_mask]
+        weights = (
+            torch.ones(inputs_c.size(0), device=device)
+            if reweight_args.get("sampler_represents_measure")
+            else gen_weights.to(device)[scope_mask]
+        )
         with torch.no_grad():
             activations_c, _ = model(inputs_c)
         outputs, tgts, losses, _mi_proxy = compute_critic_loss_from_activations(
@@ -1038,10 +1066,12 @@ def validate_critic(val_loader, critic_model, model, critic_criterion, epoch, lo
     critic_model.eval(); model.eval()
     loss_m = AverageMeter(); rw_acc_m = AverageMeter(); acc_m = AverageMeter()
     with torch.no_grad():
-        for inputs, targets, nuisances, _ae_reco, _exact_weights, gen_weights in val_loader:
+        for (inputs, targets, nuisances, nuisance_cdf, _ae_reco,
+             _exact_weights, gen_weights) in val_loader:
             inputs, targets, nuisances = inputs.to(device), targets.long().to(device), nuisances.to(device)
+            nuisance_cdf = nuisance_cdf.to(device)
             inputs_c, targets_c, nuisances_c, scope_mask = select_critic_scope(
-                inputs, targets, nuisances, joint_indep_args)
+                inputs, targets, nuisances, nuisance_cdf, joint_indep_args)
             if inputs_c.size(0) == 0:
                 continue
             weights = gen_weights.to(device)[scope_mask]
@@ -1084,6 +1114,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
     con_m = AverageMeter()   # contrastive
     closure_m  = AverageMeter()   # ABCD closure
     closure_dcorr_m = AverageMeter()
+    closure_latent_dcorr_m = AverageMeter()
     closure_profile_m = AverageMeter()
     closure_profile_reverse_m = AverageMeter()
     closure_copula_m = AverageMeter()
@@ -1102,10 +1133,12 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
 
     model.train()
     end = time.time()
-    for inputs, targets, nuisances, ae_reco, exact_weights, gen_weights in train_loader:
+    for (inputs, targets, nuisances, nuisance_cdf, ae_reco,
+         exact_weights, gen_weights) in train_loader:
         inputs = inputs.to(device)
         targets = targets.long().to(device)
         nuisances = nuisances.to(device)
+        nuisance_cdf = nuisance_cdf.to(device)
         ae_reco = ae_reco.to(device)
         exact_weights = exact_weights.to(device)
         gen_weights = gen_weights.to(device)
@@ -1174,10 +1207,18 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                 joint_indep_args["critic_model"].train()
                 scope_mask = critic_scope_mask(targets, joint_indep_args)
                 targets_c = targets[scope_mask]
-                nuisances_c = nuisances[scope_mask]
+                nuisances_c = (
+                    nuisance_cdf[scope_mask]
+                    if joint_indep_args.get("critic_type")
+                    == "continuous_density_ratio" else nuisances[scope_mask]
+                )
                 if targets_c.size(0) > 1:
                     act_detached = activations.detach()[scope_mask]
-                    weights_c = gen_weights[scope_mask]
+                    weights_c = (
+                        torch.ones(targets_c.size(0), device=device)
+                        if reweight_args.get("sampler_represents_measure")
+                        else gen_weights[scope_mask]
+                    )
                     n_steps = joint_indep_args.get("n_critic_steps_per_batch", 1)
                     for _ in range(n_steps):
                         c_out, c_targets, c_losses, _mi_proxy = compute_critic_loss_from_activations(
@@ -1205,8 +1246,16 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
             lam = effective_lambda if effective_lambda is not None else joint_indep_args["lambda"]
             scope_mask = critic_scope_mask(targets, joint_indep_args)
             targets_c = targets[scope_mask]
-            nuisances_c = nuisances[scope_mask]
-            gen_weights_c = gen_weights[scope_mask]
+            nuisances_c = (
+                nuisance_cdf[scope_mask]
+                if joint_indep_args.get("critic_type")
+                == "continuous_density_ratio" else nuisances[scope_mask]
+            )
+            gen_weights_c = (
+                torch.ones(targets_c.size(0), device=device)
+                if reweight_args.get("sampler_represents_measure")
+                else gen_weights[scope_mask]
+            )
             critic_scope_frac_m.update(float(targets_c.size(0)) / max(inputs.size(0), 1), inputs.size(0))
             critic_count = max(targets_c.size(0), 1)
             
@@ -1222,7 +1271,9 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                             joint_indep_args,
                             sample_weights=gen_weights_c))
 
-                if joint_indep_args.get("critic_type") == "density_ratio":
+                if joint_indep_args.get("critic_type") in {
+                    "density_ratio", "continuous_density_ratio"
+                }:
                     penalty = mi_proxy
                     raw_mi_val = (
                         penalty * gen_weights_c
@@ -1288,7 +1339,8 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
 
         #nurd reweighting
         weights = classification_weights(
-            exact_weights, gen_weights, targets, reweight_args)
+            exact_weights, gen_weights, targets, reweight_args,
+            sampled_measure=reweight_args.get("sampler_represents_measure", False))
         rw_acc, rw_loss = record_rw_metrics(rw_acc, rw_loss, inputs, outputs, targets, losses_ce, weights)
         loss_nurd = (losses_ce * weights).sum() / weights.sum()
 
@@ -1312,7 +1364,10 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         closure_diag = {}
         if closure_w > 0.0 and args.closure_loss_type != "none":
             loss_closure, closure_diag, n_closure = compute_qcd_closure_loss(
-                activations, targets, ae_reco, gen_weights, args,
+                activations, targets, ae_reco,
+                (torch.ones_like(gen_weights)
+                 if reweight_args.get("sampler_represents_measure")
+                 else gen_weights), args,
                 md_proxy=md_proxy,
                 update=True)
             if n_closure > 0:
@@ -1321,6 +1376,9 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                     closure_proxy_corr_m.update(closure_diag["corr"], n_closure)
                 if closure_diag.get("dcorr") is not None:
                     closure_dcorr_m.update(closure_diag["dcorr"], n_closure)
+                if closure_diag.get("latent_dcorr") is not None:
+                    closure_latent_dcorr_m.update(
+                        closure_diag["latent_dcorr"], n_closure)
                 if closure_diag.get("profile") is not None:
                     closure_profile_m.update(closure_diag["profile"], n_closure)
                 if closure_diag.get("profile_reverse") is not None:
@@ -1335,7 +1393,9 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
             qcd_mask = targets.long() == int(args.qcd_label)
             if qcd_mask.sum() >= args.closure_class_min_events:
                 md_proxy.update(
-                    activations[qcd_mask], gen_weights[qcd_mask])
+                    activations[qcd_mask],
+                    (None if reweight_args.get("sampler_represents_measure")
+                     else gen_weights[qcd_mask]))
 
         optimizer.zero_grad()
         tensor_loss.backward()
@@ -1360,6 +1420,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
     current_lr = optimizer.param_groups[0]["lr"]
     log.debug(f"  total={total_m.avg:.5f}  nurd={nurd_m.avg:.5f}  "
               f"con={con_m.avg:.5f}  closure={closure_m.avg:.5f}  "
+              f"latent_dcorr={closure_latent_dcorr_m.avg:.5f}  "
               f"copula={closure_copula_m.avg:.5f}  "
               f"mi={mi_m.avg:.5f}  raw_mi={raw_mi_m.avg:.5f}  "
               f"crit_acc={critic_acc_m.avg:.3f}  qcd_crit_acc={critic_qcd_acc_m.avg:.3f}  "
@@ -1374,6 +1435,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
             "Train/contrastive":      con_m.avg,
             "Train/closure":          closure_m.avg,
             "Train/closure_dcorr":    closure_dcorr_m.avg,
+            "Train/closure_latent_dcorr": closure_latent_dcorr_m.avg,
             "Train/closure_profile":  closure_profile_m.avg,
             "Train/closure_profile_reverse": closure_profile_reverse_m.avg,
             "Train/closure_copula_grid": closure_copula_m.avg,
@@ -1411,31 +1473,49 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
     qcd_x_chunks = []
     qcd_latent_chunks = []
     qcd_weight_chunks = []
+    class_correct_mass = {}
+    class_total_mass = {}
 
     model.eval()
     with torch.no_grad():
         end = time.time()
-        for inputs, targets, nuisances, ae_reco, exact_weights, gen_weights in val_loader:
+        for (inputs, targets, nuisances, nuisance_cdf, ae_reco,
+             exact_weights, gen_weights) in val_loader:
             inputs    = inputs.to(device)
             targets   = targets.long().to(device)
             ae_reco   = ae_reco.to(device)
             exact_weights = exact_weights.to(device)
             gen_weights = gen_weights.to(device)
+            nuisance_cdf = nuisance_cdf.to(device)
             activations, outputs = model(inputs)
             losses    = criterion(outputs, targets)
+
+            predictions = outputs.argmax(dim=1)
+            for label in targets.unique().tolist():
+                label = int(label)
+                mask = targets == label
+                class_total_mass[label] = class_total_mass.get(label, 0.0) + float(
+                    gen_weights[mask].sum().item())
+                class_correct_mass[label] = class_correct_mass.get(label, 0.0) + float(
+                    gen_weights[mask][predictions[mask] == label].sum().item())
 
             acc, loss, top1 = record_metrics(acc, loss, top1, inputs, outputs, targets, losses)
             if reweight_args["reweight"]:
                 rw_acc, rw_loss = record_rw_metrics(
                     rw_acc, rw_loss, inputs, outputs, targets, losses,
-                    exact_weights * gen_weights)
+                    classification_weights(
+                        exact_weights, gen_weights, targets, reweight_args,
+                        sampled_measure=False))
             qcd_mask = targets.long() == int(args.qcd_label)
             if qcd_mask.sum() >= args.closure_class_min_events:
                 if joint_indep_args and joint_indep_args["joint_indep"]:
                     critic_outputs, critic_targets, critic_losses, _ = (
                         compute_critic_loss_from_activations(
                             activations[qcd_mask], targets[qcd_mask],
-                            nuisances.to(device)[qcd_mask],
+                            (nuisance_cdf[qcd_mask]
+                             if joint_indep_args.get("critic_type")
+                             == "continuous_density_ratio"
+                             else nuisances.to(device)[qcd_mask]),
                             joint_indep_args["critic_model"],
                             joint_indep_args["critic_criterion"],
                             joint_indep_args,
@@ -1485,8 +1565,21 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
             max_ratio_unc=args.val_abcd_max_ratio_unc)
     val_abcd["selection_mode"] = "cross_fitted_qcd_md_grid"
     val_abcd["md_folds"] = int(args.val_md_folds)
+    per_class_acc = {
+        label: class_correct_mass[label] / max(class_total_mass[label], 1e-12)
+        for label in sorted(class_total_mass)
+    }
+    val_balanced_acc = (
+        float(np.mean(list(per_class_acc.values())))
+        if per_class_acc else float("nan")
+    )
+    val_min_class_acc = (
+        float(min(per_class_acc.values()))
+        if per_class_acc else float("nan")
+    )
     log_metrics(log, epoch, batch_time, loss, top1, acc, rw_loss, rw_acc, split="Val")
-    log.debug(f"  qcd_proxy_r={val_qcd_corr:.3f}  "
+    log.debug(f"  balanced_acc={val_balanced_acc:.3f}  per_class_acc={per_class_acc}  "
+              f"qcd_proxy_r={val_qcd_corr:.3f}  "
               f"proxy_abcd_score={val_abcd.get('score', float('nan')):.5f}  "
               f"proxy_abcd_median={val_abcd.get('median_abs_log_nonclosure', float('nan')):.5f}  "
               f"proxy_abcd_p90={val_abcd.get('p90_abs_log_nonclosure', float('nan')):.5f}  "
@@ -1501,6 +1594,8 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
             "Val/acc":     acc.avg,
             "Val/rw_loss": rw_loss.avg,
             "Val/rw_acc":  rw_acc.avg,
+            "Val/physical_balanced_acc": val_balanced_acc,
+            "Val/physical_min_class_acc": val_min_class_acc,
             "Val/qcd_proxy_pearson": val_qcd_corr,
             "Val/proxy_abcd_score": val_abcd.get("score", float("nan")),
             "Val/proxy_abcd_points": val_abcd.get("n_points", 0),
@@ -1516,7 +1611,8 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
             "Val/critic_ce": critic_ce_m.avg,
         }, step=epoch)
     return_loss = rw_loss.avg if reweight_args["reweight"] else loss.avg
-    return return_loss, acc.avg, rw_acc.avg, val_qcd_corr, val_abcd
+    return (return_loss, acc.avg, rw_acc.avg, val_balanced_acc,
+            val_min_class_acc, per_class_acc, val_qcd_corr, val_abcd)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1569,6 +1665,7 @@ def main():
         qcd_label=args.qcd_label,
         baseline_labels=args.baseline_labels_values,
         gen_weight_path=args.gen_weights,
+        training_measure=args.training_measure,
     )
     log.debug(f"Train: {len(train_dataset)}  Val: {len(val_dataset)}")
     log.debug(f"Generator weights: {gen_weight_metadata}")
@@ -1578,7 +1675,22 @@ def main():
 
     kwargs = {"pin_memory": False, "num_workers": args.num_workers}
     sampling_correction = None
-    if args.qcd_batch_fraction > 0.0:
+    sampler_represents_measure = (
+        args.training_measure == "class_balanced_physical")
+    if sampler_represents_measure:
+        sampler_generator = torch.Generator()
+        sampler_generator.manual_seed(args.manualSeed)
+        sampler = WeightedRandomSampler(
+            train_dataset.measure_weights.double(),
+            num_samples=len(train_dataset), replacement=True,
+            generator=sampler_generator)
+        train_loader = DataLoader(
+            train_dataset, batch_size=args.batch_size, sampler=sampler,
+            drop_last=True, **kwargs)
+        log.debug(
+            "Training sampler: class-balanced physical measure; "
+            f"class factors={train_dataset.class_balance_factors}")
+    elif args.qcd_batch_fraction > 0.0:
         batch_sampler = QCDRichBatchSampler(
             train_dataset.labels,
             batch_size=args.batch_size,
@@ -1656,6 +1768,9 @@ def main():
         "train_dataset": train_dataset,
         "val_dataset":   val_dataset,
         "sampling_correction": sampling_correction,
+        "sampler_represents_measure": sampler_represents_measure,
+        "training_measure": args.training_measure,
+        "class_balance_factors": train_dataset.class_balance_factors,
         "qcd_label": args.qcd_label,
     }
     critic_chance_ce = math.log(2)
@@ -1715,6 +1830,8 @@ def main():
             "config": vars(args),
             "nuisance_bin_edges": train_dataset.bin_edges,
             "nurd_weight_table": train_dataset.weights,
+            "training_measure": args.training_measure,
+            "class_balance_factors": train_dataset.class_balance_factors,
             "gen_weight_metadata": gen_weight_metadata,
             "md_proxy_state": (
                 None if md_proxy is None else md_proxy.state_dict()),
@@ -1772,12 +1889,22 @@ def main():
         if md_proxy is not None and args.md_proxy_type == "epoch":
             md_proxy.finalize_epoch()
         #runs model on validation set with no gradient updates (just forward passes)
-        val_loss, val_acc, val_rw_acc, val_qcd_corr, val_abcd = validate(
+        (val_loss, val_acc, val_rw_acc, val_balanced_acc,
+         val_min_class_acc, val_per_class_acc, val_qcd_corr, val_abcd) = validate(
             val_loader, model, criterion, epoch + args.reweight_epochs, log,
             reweight_args, joint_indep_args=joint_indep_args,
             md_proxy=md_proxy)
 
-        if best_loss is None or val_loss < best_loss:
+        classifier_ok = classifier_checkpoint_eligible(
+            val_balanced_acc, args.min_val_balanced_acc,
+            per_class_accuracies=val_per_class_acc.values(),
+            minimum_class_accuracy=args.min_val_class_acc)
+        if not classifier_ok:
+            log.debug(
+                "Checkpoint rejected: physical balanced/min-class accuracy "
+                f"{val_balanced_acc:.3f}/{val_min_class_acc:.3f}; required "
+                f">={args.min_val_balanced_acc:.3f}/{args.min_val_class_acc:.3f}")
+        if classifier_ok and (best_loss is None or val_loss < best_loss):
             best_loss = val_loss
             log.debug("Saving checkpoint")
             save_checkpoint(
@@ -1785,16 +1912,18 @@ def main():
             if not args.local_testing:
                 wandb.run.summary["best_val_rw_acc"] = val_rw_acc
                 wandb.run.summary["best_val_acc"]    = val_acc
+                wandb.run.summary["best_val_balanced_acc"] = val_balanced_acc
+                wandb.run.summary["best_val_min_class_acc"] = val_min_class_acc
                 wandb.run.summary["best_val_loss"]   = val_loss
 
         val_abcd_score = val_abcd.get("score", float("nan"))
         if np.isfinite(val_abcd_score):
             abcd_score_history.append(float(val_abcd_score))
             smoothed_abcd_score = float(np.median(abcd_score_history))
-            loss_ok = best_loss is None or val_loss <= args.abcd_ckpt_loss_tol * best_loss
+            loss_ok = best_loss is not None and val_loss <= args.abcd_ckpt_loss_tol * best_loss
             epoch_ready = epoch + 1 >= max(1, args.abcd_ckpt_min_epoch)
             if (
-                epoch_ready and loss_ok
+                epoch_ready and loss_ok and classifier_ok
                 and (best_abcd_score is None
                      or val_abcd_score < best_abcd_score)
             ):
@@ -1811,6 +1940,9 @@ def main():
                     "selection_rolling_median": float(smoothed_abcd_score),
                     "selection_history": list(abcd_score_history),
                     "selection_val_loss": float(val_loss),
+                    "selection_val_balanced_acc": float(val_balanced_acc),
+                    "selection_val_min_class_acc": float(val_min_class_acc),
+                    "selection_val_per_class_acc": dict(val_per_class_acc),
                     "selection_val_qcd_proxy_corr": float(val_qcd_corr),
                     "selection_val_proxy_abcd": val_abcd,
                 })
@@ -1825,6 +1957,10 @@ def main():
                     wandb.run.summary["best_val_proxy_abcd_tail"] = val_abcd.get(
                         "tail_mean_abs_log_nonclosure", float("nan"))
 
+    if best_loss is None:
+        raise RuntimeError(
+            "No checkpoint met the balanced/per-class validation accuracy "
+            "requirements; refusing to save a collapsed classifier.")
     log.debug(f"Done. Best val loss: {best_loss:.5f}")
     if not args.local_testing:
         wandb.finish()

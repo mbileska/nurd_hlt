@@ -23,10 +23,11 @@ because the primary ABCD estimate is evaluated on QCD.
 - The Mequinna release also provides event-aligned `weight_train.pt` and
   `weight_test.pt` generator weights. These are physics generator weights, not
   the NURD label/nuisance weights described below.
-- Generator weights are now required by the default Mequinna Slurm campaign.
-  They are applied consistently to AE and NURD losses, nuisance-bin quantiles,
-  NURD frequency estimates, critic/closure objectives, latent references,
-  validation checkpoint selection, and final ABCD yields.
+- Generator weights are required by the default Mequinna Slurm campaign. The
+  AE and final physics yields use the physical measure directly. NURD training
+  preserves generator weights within each class but normalizes the four class
+  masses equally, preventing the 99% QCD cross-section prior from turning the
+  classifier into an always-QCD predictor.
 - The campaign does not truncate the new files: 90% of every Mequinna training
   event trains the AE/NURD models, the remaining stratified 10% selects
   checkpoints and ABCD thresholds, and every independent test event is used
@@ -34,9 +35,10 @@ because the primary ABCD estimate is evaluated on QCD.
   fitting.
 - AE reconstruction is computed once. The train/validation split is made before
   fitting nuisance preprocessing.
-- Twenty generator-weighted AE-loss nuisance bins are fitted from training QCD only, then the same
-  edges are applied to every training and validation event. Validation data
-  cannot influence the nuisance definition.
+- Fifty generator-weighted AE-loss nuisance bins are fitted from training QCD
+  for exact NURD reweighting. A separate continuous weighted-QCD CDF coordinate
+  is used by the critic, so critic resolution is not limited by the bin count.
+  Both are fitted on training data only and reused for validation.
 - Exact NURD weights are fitted on training data only and reused unchanged for
   validation.
 - Weight clipping now preserves both the configured cap and a sample-weighted
@@ -48,24 +50,28 @@ because the primary ABCD estimate is evaluated on QCD.
 
 - All-background classifier and supervised contrastive losses are unchanged in
   scope: all four backgrounds teach the encoder their structure.
-- Natural shuffled batches are used by default; QCD-rich sampling remains an
-  explicit optional experiment.
-- A QCD density-ratio critic distinguishes real `(latent, AE-bin)` pairs from
-  shuffled pairs. The v7 critic takes two inexpensive updates on reused encoder
-  activations. Its shuffled AE bins are sampled from the generator-weighted
-  nuisance marginal, so the negative examples represent the physical
-  product-of-marginals rather than the raw event distribution.
+- A weighted sampler draws equal class mass while preserving the physical
+  generator-weight distribution within each class. The same number of events
+  and Transformer batches are processed per epoch as before.
+- A continuous QCD density-ratio critic distinguishes real
+  `(latent, weighted-AE-CDF)` pairs from shuffled pairs. Fixed Fourier features
+  expose both broad and fine nuisance structure without adding a large model.
+  The critic takes two updates on reused encoder activations.
 - The encoder uses the bounded `ratio_to_one` objective, making the learned
   density ratio approach one without an unbounded adversarial CE objective.
 - Supervised contrastive learning weights both anchors and comparison events by
-  the NURD times generator measure. Previously only anchors were weighted, so
-  the raw Mequinna class mixture still defined every contrastive denominator.
+  exact NURD weights after sampling; generator weights are not multiplied a
+  second time.
 - Direct QCD closure regularization acts on continuous AE loss and QCD MD. The
   default restores the best-performing v3/v4 hybrid objective: weighted
   log-correlation, distance correlation, forward/reverse profile flatness, and
   a soft tail copula grid. The fixed-size dCorr calculation now samples from
   the physical generator measure instead of retaining extreme weights on a
   uniform 512-row subsample.
+- A second continuous distance-correlation term acts on the full six-dimensional
+  QCD latent, not only its EMA-MD radius. This removes AE information that a
+  downstream Mahalanobis score could recover even when scalar proxy correlation
+  is small.
 - The QCD MD proxy is a real online EMA. A batch is scored against the previous
   detached reference before that batch updates the weighted moments, avoiding
   self-scoring while tracking the changing encoder.
@@ -78,7 +84,10 @@ because the primary ABCD estimate is evaluated on QCD.
 
 ### Selection And Evaluation
 
-- `checkpoint_main_*` is selected by validation NURD loss.
+- `checkpoint_main_*` is selected by class-balanced validation NURD loss.
+- No main or closure checkpoint is accepted below 55% physical balanced
+  accuracy or 25% accuracy in any individual background class. This explicitly
+  prevents both the v6/v7 always-QCD collapse and a hidden single-class collapse.
 - Validation QCD MD is two-fold cross-fitted with weighted shrinkage covariance.
   Fold assignment balances generator-weight mass, so a few large-weight events
   cannot make one reference fold statistically much weaker than the other.
@@ -100,7 +109,8 @@ because the primary ABCD estimate is evaluated on QCD.
   in every region, and at most 5% propagated ratio uncertainty. Selection uses
   five-fold and neighboring-grid stability instead of the closure of one cell.
 - Evaluation trains a fresh nonlinear nuisance auditor after freezing the
-  encoder. Its test-QCD accuracy/AUC/CE diagnose residual AE-bin information.
+  encoder. Training and metrics now follow generator-weighted QCD rather than
+  raw row counts; its test-QCD accuracy/AUC/CE diagnose residual AE information.
 - `calibrated_union`, `min_md`, and other all-background scores remain available
   as secondary studies. They are not the default QCD-closure axis.
 
@@ -255,11 +265,13 @@ CPU                   8 cores, 48 GiB RAM
 batch size            4096
 AE epochs             100
 NURD epochs           200
-nuisance bins         20 weighted quantiles, fitted on training QCD
-training batches      natural shuffled all-background batches
-critic                weighted QCD density-ratio critic, two updates per batch
+nuisance bins         50 weighted QCD quantiles for exact NURD weights
+continuous nuisance   weighted QCD AE-loss CDF in [0,1]
+training measure      equal class mass; physical generator weights within class
+critic                continuous QCD density-ratio critic, two updates per batch
 critic penalty        bounded ratio_to_one
-closure               weighted QCD hybrid dCorr/profile/tail-copula vs EMA MD
+closure               QCD hybrid axis losses plus full-latent dCorr vs EMA MD
+checkpoint guard      balanced accuracy >= 0.55 and every class >= 0.25
 checkpoint MD         weight-balanced two-fold cross-fitted shrinkage covariance
 ABCD yields           generator weighted, uncertainty from sumw2
 ```
@@ -281,21 +293,26 @@ The `.out` header should contain:
 
 ```text
 CRITIC_SCOPE=qcd
-CRITIC_TYPE=density_ratio
-CRITIC_BIN_RESOLUTIONS=20
+CRITIC_TYPE=continuous_density_ratio
+CRITIC_BIN_RESOLUTIONS=50
 CRITIC_PENALTY_TYPE=ratio_to_one
 CRITIC_SHUFFLE=global
-N_BINS=20
+LAMBDA=0.05
+N_BINS=50
+TRAINING_MEASURE=class_balanced_physical
 QCD_BATCH_FRACTION=0.0
 NUISANCE_BIN_SCOPE=qcd
 CLOSURE_SCOPE=qcd
 CLOSURE_SCORE_MODE=own_class
+CLOSURE_LATENT_DCORR_WEIGHT=1.5
 NURD_EPOCHS=200
 MD_PROXY_TYPE=ema
 MD_EMA_MOMENTUM=0.01
 CLOSURE_LOSS_TYPE=hybrid
 CLOSURE_WEIGHT=1.0
 CONTRAST_WEIGHT=0.02
+MIN_VAL_BALANCED_ACC=0.55
+MIN_VAL_CLASS_ACC=0.25
 ```
 
 Training is complete only when the output contains `TRAINING DONE`.
@@ -331,7 +348,7 @@ optimization experiment.
 The latest-eval script defaults to:
 
 ```text
-NURD_GLOB=hlt_nurd_closure_bs4096_experimental_qcd_weighted_v7_*
+NURD_GLOB=hlt_nurd_closure_bs4096_experimental_qcd_continuous_v8_*
 PREFER_ABCD_CKPT=1
 ABCD_SCOPE=qcd
 SCORE_MODE=qcd_md
@@ -358,7 +375,7 @@ Evaluate the latest validation-loss checkpoint for comparison:
 ```bash
 unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP NURD_GLOB
 PREFER_ABCD_CKPT=0 PREFER_CLOSURE_CKPT=0 \
-  WANDB_NAME_PREFIX=experimental_qcd_weighted_v7_main \
+  WANDB_NAME_PREFIX=experimental_qcd_continuous_v8_main \
   sbatch slurm/submit_eval_latest.sbatch
 ```
 

@@ -1,12 +1,14 @@
 """
 HLT SM Cocktail dataset for NURD training.
 
-The nuisance variable z is the **binned AE reconstruction loss**.
+The nuisance variable z is represented both by binned AE reconstruction loss
+for exact NURD weights and by a continuous weighted-QCD CDF coordinate for the
+adversarial critic.
 NURD exact weights w(y,z) = p(y)*p(z)/p(y,z) are pre-computed on load
 so that train_exact.py can look them up with dataset.weights[(y,z)].
 
-Dataset returns (pf_features, label, nuisance_bin, ae_reco, nurd_weight,
-generator_weight)
+Dataset returns (pf_features, label, nuisance_bin, nuisance_cdf, ae_reco,
+nurd_weight, generator_weight)
 per event.
 """
 import numpy as np
@@ -98,6 +100,70 @@ def _label_mask(labels, label_values):
     return mask
 
 
+def class_balance_factors(labels, base_weights):
+    """Scale physical event weights so every class has equal total mass."""
+    labels = torch.as_tensor(labels).long().view(-1)
+    base_weights = torch.as_tensor(base_weights).double().view(-1)
+    if labels.numel() != base_weights.numel():
+        raise ValueError("labels and base_weights must align.")
+    classes = labels.unique(sorted=True)
+    if classes.numel() < 2:
+        raise ValueError("Class-balanced training requires at least two classes.")
+    total = base_weights.sum()
+    factors = {}
+    for label in classes.tolist():
+        class_mass = base_weights[labels == int(label)].sum()
+        if float(class_mass.item()) <= 0.0:
+            raise ValueError(f"Class {label} has non-positive physical mass.")
+        factors[int(label)] = float(
+            total.item() / (classes.numel() * class_mass.item()))
+    return factors
+
+
+def apply_class_balance(labels, base_weights, factors):
+    labels = torch.as_tensor(labels).long().view(-1)
+    base_weights = torch.as_tensor(base_weights).float().view(-1)
+    result = torch.empty_like(base_weights)
+    for label in labels.unique(sorted=True).tolist():
+        if int(label) not in factors:
+            raise ValueError(f"Missing class-balance factor for label={label}.")
+        mask = labels == int(label)
+        result[mask] = base_weights[mask] * float(factors[int(label)])
+    return result
+
+
+def weighted_cdf_coordinate(values, reference_values, reference_weights):
+    """Map values to a stable [0, 1] weighted empirical CDF coordinate."""
+    values = torch.as_tensor(values).float().view(-1)
+    reference_values = torch.as_tensor(reference_values).float().view(-1)
+    reference_weights = torch.as_tensor(reference_weights).double().view(-1)
+    if reference_values.numel() != reference_weights.numel():
+        raise ValueError("reference_values and reference_weights must align.")
+    valid = (
+        torch.isfinite(reference_values)
+        & torch.isfinite(reference_weights)
+        & (reference_weights > 0)
+    )
+    if not valid.any():
+        raise ValueError("Weighted CDF reference has no positive finite mass.")
+    order = torch.argsort(reference_values[valid])
+    sorted_values = reference_values[valid][order]
+    sorted_weights = reference_weights[valid][order]
+    unique_values, inverse = torch.unique_consecutive(
+        sorted_values, return_inverse=True)
+    group_weights = torch.zeros(
+        unique_values.numel(), dtype=torch.float64)
+    group_weights.scatter_add_(0, inverse, sorted_weights)
+    cumulative = torch.cumsum(group_weights, dim=0)
+    mid_cdf = (cumulative - 0.5 * group_weights) / cumulative[-1]
+    positions = torch.searchsorted(unique_values, values).clamp(
+        max=unique_values.numel() - 1)
+    result = mid_cdf[positions].float()
+    result[values < unique_values[0]] = 0.0
+    result[values > unique_values[-1]] = 1.0
+    return result.clamp(0.0, 1.0)
+
+
 def _as_float_tensor(value):
     if torch.is_tensor(value):
         return value.detach().cpu().float()
@@ -124,21 +190,25 @@ class HLTSmCocktailDataset(Dataset):
         pf_data:       [N, max_cands, n_feats]  PF candidate features
         labels:        [N] long
         nuisances_all: [N] binned AE reconstruction-loss nuisance
+        nuisance_cdf_all: [N] continuous weighted-QCD AE-loss rank
         ae_reco_all:   [N] continuous AE reconstruction loss
         gen_weights:   [N] generator/event weights
         idx:           selected event indices for this split
         split:      "train" | "val"
     """
-    def __init__(self, pf_data, labels, nuisances_all, ae_reco_all,
+    def __init__(self, pf_data, labels, nuisances_all, nuisance_cdf_all,
+                 ae_reco_all,
                  gen_weights, idx,
                  split="train", bin_edges=None, max_weight_ratio=10.0,
-                 weight_table=None):
+                 weight_table=None, training_measure="physical",
+                 balance_factors=None):
         super().__init__()
         self.bin_edges = bin_edges
 
         self.features = pf_data
         self.labels_all = labels
         self.nuisances_all = nuisances_all
+        self.nuisance_cdf_all = nuisance_cdf_all
         self.ae_reco_all = ae_reco_all
         self.gen_weights_all = gen_weights
         self.idx = idx.long()
@@ -147,8 +217,24 @@ class HLTSmCocktailDataset(Dataset):
 
         self.labels = labels[self.idx].float()
         self.nuisances = nuisances_all[self.idx].float()
+        self.nuisance_cdf = nuisance_cdf_all[self.idx].float()
         self.ae_reco = ae_reco_all[self.idx].float()
         self.gen_weights = gen_weights[self.idx].float()
+        self.training_measure = str(training_measure)
+        if self.training_measure not in {"physical", "class_balanced_physical"}:
+            raise ValueError(
+                f"Unsupported training_measure={self.training_measure!r}")
+        if balance_factors is None:
+            balance_factors = class_balance_factors(
+                labels[self.idx], self.gen_weights)
+        self.class_balance_factors = dict(balance_factors)
+        self.class_balanced_weights = apply_class_balance(
+            labels[self.idx], self.gen_weights, self.class_balance_factors)
+        self.measure_weights = (
+            self.class_balanced_weights
+            if self.training_measure == "class_balanced_physical"
+            else self.gen_weights
+        )
 
         # ── NURD exact weights ────────────────────────────────────────────────
         labels_split = labels[self.idx]
@@ -157,7 +243,7 @@ class HLTSmCocktailDataset(Dataset):
             self.weights = _make_nurd_weights(
                 labels_split, nuisances_split,
                 max_weight_ratio=max_weight_ratio,
-                base_weights=self.gen_weights)
+                base_weights=self.measure_weights)
             weight_source = split
         else:
             self.weights = dict(weight_table)
@@ -189,12 +275,12 @@ class HLTSmCocktailDataset(Dataset):
         for (label, nuisance), value in self.weights.items():
             weight_lookup[label, nuisance] = float(value)
         self.sample_weights = weight_lookup[labels_split, nuisances_split]
-        combined = self.sample_weights * self.gen_weights
-        combined_mean = combined.sum() / self.gen_weights.sum().clamp(min=1e-8)
+        combined = self.sample_weights * self.measure_weights
+        combined_mean = combined.sum() / self.measure_weights.sum().clamp(min=1e-8)
         print(
             f"[{split}] NURD weights fit={weight_source} "
             f"groups={len(self.weights)}  "
-            f"physical_mean={combined_mean.item():.3f}  "
+            f"measure_mean={combined_mean.item():.3f}  "
             f"sample_std={self.sample_weights.std(unbiased=False).item():.3f}  "
             f"min={self.sample_weights.min().item():.3f}  "
             f"max={self.sample_weights.max().item():.3f}"
@@ -209,21 +295,22 @@ class HLTSmCocktailDataset(Dataset):
             self.features[event_idx],
             self.labels[idx],
             self.nuisances[idx],
+            self.nuisance_cdf[idx],
             self.ae_reco[idx],
             self.sample_weights[idx],
             self.gen_weights[idx],
         )
 
     def get_label_prior(self):
-        total = float(self.gen_weights.sum().item())
+        total = float(self.measure_weights.sum().item())
         counts = defaultdict(float)
-        for label, weight in zip(self.labels.tolist(), self.gen_weights.tolist()):
+        for label, weight in zip(self.labels.tolist(), self.measure_weights.tolist()):
             counts[int(label)] += float(weight)
         return {k: v / total for k, v in counts.items()}
 
     def get_nuisance_prior(self, label=None):
         nuisances = self.nuisances
-        weights = self.gen_weights
+        weights = self.measure_weights
         if label is not None:
             if isinstance(label, (list, tuple, set)):
                 label_mask = _label_mask(self.labels.long(), label)
@@ -244,7 +331,8 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
                        max_events=-1, ae_scaler=None, ae_batch_size=4096,
                        max_weight_ratio=10.0, nuisance_bin_scope="all",
                        qcd_label=1, baseline_labels=None,
-                       gen_weight_path=None):
+                       gen_weight_path=None,
+                       training_measure="physical"):
     """
     Load the HLT .pt file, pre-normalise obj features, and return
     (train_dataset, val_dataset).  Call once; pass the same bin_edges
@@ -345,13 +433,34 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
     else:
         raise ValueError(f"Unsupported nuisance_bin_scope={nuisance_bin_scope!r}")
 
+    # The continuous adversary uses the weighted QCD rank rather than a category.
+    # This removes the nuisance-resolution ceiling while retaining discrete bins
+    # for the exact p(y)p(z)/p(y,z) NURD weights.
+    train_qcd = labels[idx_tr] == int(qcd_label)
+    if not train_qcd.any():
+        raise ValueError(
+            f"Cannot build continuous QCD nuisance: no label={qcd_label} events.")
+    nuisance_cdf_all = weighted_cdf_coordinate(
+        ae_reco_all,
+        ae_reco_all[idx_tr][train_qcd],
+        gen_weights[idx_tr][train_qcd],
+    )
+    balance_factors = class_balance_factors(
+        labels[idx_tr], gen_weights[idx_tr])
+
     ds_train = HLTSmCocktailDataset(
-        pf, labels, nuisances_all, ae_reco_all, gen_weights, idx_tr,
+        pf, labels, nuisances_all, nuisance_cdf_all, ae_reco_all,
+        gen_weights, idx_tr,
         split="train", bin_edges=bin_edges,
-        max_weight_ratio=max_weight_ratio)
+        max_weight_ratio=max_weight_ratio,
+        training_measure=training_measure,
+        balance_factors=balance_factors)
     ds_val = HLTSmCocktailDataset(
-        pf, labels, nuisances_all, ae_reco_all, gen_weights, idx_val,
+        pf, labels, nuisances_all, nuisance_cdf_all, ae_reco_all,
+        gen_weights, idx_val,
         split="val", bin_edges=bin_edges,
         max_weight_ratio=max_weight_ratio,
-        weight_table=ds_train.weights)
+        weight_table=ds_train.weights,
+        training_measure=training_measure,
+        balance_factors=balance_factors)
     return ds_train, ds_val, obj_scaler, gen_weight_metadata

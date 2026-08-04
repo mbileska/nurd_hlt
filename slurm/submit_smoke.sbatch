@@ -65,9 +65,10 @@ python train_hlt.py \
   --batch_size 64 \
   --max_events 2000 \
   --local_testing 1 \
+  --training_measure class_balanced_physical \
   --critic_schedule warmup \
-  --critic_type density_ratio \
-  --critic_bin_resolutions 20 \
+  --critic_type continuous_density_ratio \
+  --critic_bin_resolutions 50 \
   --critic_penalty_type ratio_to_one \
   --critic_scope qcd \
   --critic_shuffle global \
@@ -75,19 +76,22 @@ python train_hlt.py \
   --n_critic_steps_per_batch 2 \
   --baseline_labels 0,1,2,3 \
   --nuisance_bin_scope qcd \
-  --n_bins 20 \
+  --n_bins 50 \
   --qcd_batch_fraction 0 \
   --reweight 1 \
   --joint_indep 1 \
   --max_weight_ratio 10.0 \
   --closure_weight 0.1 \
   --closure_loss_type hybrid \
+  --closure_latent_dcorr_weight 1.5 \
   --closure_scope qcd \
   --closure_score_mode own_class \
   --closure_class_min_events 5 \
   --closure_tail_quantiles 0.5,0.7,0.9 \
   --val_md_folds 2 \
   --abcd_ckpt_smoothing_epochs 1 \
+  --min_val_balanced_acc 0.0 \
+  --min_val_class_acc 0.0 \
   --md_proxy_type ema \
   --exp_name smoke_nurd \
   --project_name hlt \

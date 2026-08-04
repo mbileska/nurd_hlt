@@ -9,6 +9,25 @@ from torch.utils.data import Sampler
 from utils.event_weights import weighted_quantile
 
 
+def classifier_checkpoint_eligible(balanced_accuracy, minimum_accuracy,
+                                   per_class_accuracies=None,
+                                   minimum_class_accuracy=0.0):
+    """Reject non-finite, globally collapsed, or class-collapsed classifiers."""
+    if not (
+        np.isfinite(balanced_accuracy)
+        and float(balanced_accuracy) >= float(minimum_accuracy)
+    ):
+        return False
+    if per_class_accuracies is None:
+        return True
+    values = np.asarray(list(per_class_accuracies), dtype=np.float64)
+    return bool(
+        values.size > 0
+        and np.isfinite(values).all()
+        and float(values.min()) >= float(minimum_class_accuracy)
+    )
+
+
 def weighted_resample_indices(weights, n_samples=None):
     """Draw indices from the physical measure represented by event weights."""
     weights = torch.as_tensor(weights).float().view(-1)
@@ -27,6 +46,46 @@ def weighted_resample_indices(weights, n_samples=None):
         )
     probabilities = weights / weights.sum()
     return torch.multinomial(probabilities, n_samples, replacement=True)
+
+
+def distance_corr_loss(x, y, max_samples=512, eps=1e-8, weights=None):
+    """Differentiable squared distance correlation for scalar or vector inputs."""
+    x = x.float().view(x.size(0), -1)
+    y = y.float().view(y.size(0), -1)
+    if x.size(0) != y.size(0):
+        raise ValueError("distance-correlation inputs must have equal length.")
+    has_physical_weights = weights is not None
+    weights = (
+        torch.ones(x.size(0), device=x.device, dtype=x.dtype)
+        if weights is None else weights.float().view(-1).to(x.device)
+    )
+    n = x.size(0)
+    if n < 4:
+        zero = (x.sum() + y.sum()) * 0.0
+        return zero, None
+    if max_samples > 0 and n > max_samples:
+        if has_physical_weights:
+            idx = weighted_resample_indices(weights.detach(), max_samples)
+        else:
+            idx = torch.randperm(n, device=x.device)[:max_samples]
+        x = x[idx]
+        y = y[idx]
+        weights = torch.ones(x.size(0), device=x.device, dtype=x.dtype)
+    weights = weights / weights.sum().clamp(min=eps)
+    x_dist = torch.cdist(x, x, p=2)
+    y_dist = torch.cdist(y, y, p=2)
+    x_row = x_dist @ weights
+    y_row = y_dist @ weights
+    x_centered = (
+        x_dist - x_row[:, None] - x_row[None, :] + weights @ x_row)
+    y_centered = (
+        y_dist - y_row[:, None] - y_row[None, :] + weights @ y_row)
+    pair_weights = weights[:, None] * weights[None, :]
+    dcov = (pair_weights * x_centered * y_centered).sum()
+    dvar_x = (pair_weights * x_centered.square()).sum()
+    dvar_y = (pair_weights * y_centered.square()).sum()
+    dcor = (dcov / torch.sqrt(dvar_x * dvar_y + eps)).clamp(min=0.0)
+    return dcor, dcor.detach().item()
 
 
 def weighted_balanced_folds(weights, n_splits=2, seed=42):

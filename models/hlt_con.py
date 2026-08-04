@@ -211,8 +211,9 @@ class HLTCritic(nn.Module):
       bin_pred             : predicts nuisance bins from (latent, y). When
                              bin_resolutions contains multiple values, returns
                              one head per resolution.
-      density_ratio         : classifies real vs shuffled-z from (latent, y, z) — [B, 2]
-                              matches gabhijith's original density-ratio trick
+      density_ratio         : classifies real vs shuffled binned z
+      continuous_density_ratio: classifies real vs shuffled continuous z using
+                                fixed Fourier features on the weighted CDF rank
     """
     def __init__(self, latent_dim: int, num_classes: int, n_bins: int,
                  hidden: int = 128, critic_type: str = "bin_pred",
@@ -238,6 +239,14 @@ class HLTCritic(nn.Module):
                 nn.Linear(hidden, hidden),               nn.ReLU(),
                 nn.Linear(hidden, 2),                    # binary: real=1 / shuffled=0
             )
+        elif critic_type == "continuous_density_ratio":
+            self.fourier_harmonics = 8
+            z_features = 1 + 2 * self.fourier_harmonics
+            self.net = nn.Sequential(
+                nn.Linear(latent_dim + 16 + z_features, hidden), nn.ReLU(),
+                nn.Linear(hidden, hidden),                        nn.ReLU(),
+                nn.Linear(hidden, 2),
+            )
         else:
             self.trunk = nn.Sequential(
                 nn.Linear(latent_dim + 16, hidden), nn.ReLU(),
@@ -254,6 +263,15 @@ class HLTCritic(nn.Module):
         if self.critic_type == "density_ratio":
             z_emb = self.z_embed(z.long())                     # [B, 8]
             return self.net(torch.cat([rx, y_emb, z_emb], dim=1))
+        if self.critic_type == "continuous_density_ratio":
+            z = z.float().view(-1, 1).clamp(0.0, 1.0)
+            frequencies = torch.arange(
+                1, self.fourier_harmonics + 1,
+                device=z.device, dtype=z.dtype).view(1, -1)
+            angles = 2.0 * torch.pi * z * frequencies
+            z_features = torch.cat(
+                [z, torch.sin(angles), torch.cos(angles)], dim=1)
+            return self.net(torch.cat([rx, y_emb, z_features], dim=1))
         hidden = self.trunk(torch.cat([rx, y_emb], dim=1))
         outputs = {
             resolution: self.heads[str(resolution)](hidden)
