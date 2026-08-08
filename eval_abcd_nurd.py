@@ -29,6 +29,7 @@ from utils.event_weights import (
     load_event_weights,
     weighted_quantile_numpy,
 )
+from utils.hlt_training_stats import weighted_balanced_folds
 
 CLASS_NAMES = {0: "DY", 1: "QCD", 2: "TT", 3: "WJets"}
 CLASS_COLORS = {0: "tab:blue", 1: "tab:orange", 2: "tab:green", 3: "tab:red"}
@@ -166,15 +167,21 @@ def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500,
     min_A_effective = int(min_A)
     min_region_effective = 1
     selection_folds = max(int(selection_folds), 1)
+    total_grid_points = 0
+    region_eligible_points = 0
+    uncertainty_eligible_points = 0
+    fold_eligible_points = 0
+    minimum_ratio_unc = np.inf
     fold_ids = None
     if selection_folds > 1 and len(loss_1) >= selection_folds * 4:
-        rng = np.random.default_rng(int(selection_seed))
-        shuffled = rng.permutation(len(loss_1))
-        fold_ids = np.empty(len(loss_1), dtype=np.int16)
-        fold_ids[shuffled] = np.arange(len(loss_1)) % selection_folds
+        # Raw-row folds can put most generator-weight mass in one fold. Balance
+        # physical mass so every closure-stability fold has usable statistics.
+        fold_ids = weighted_balanced_folds(
+            weights, n_splits=selection_folds, seed=selection_seed)
     candidates = []
     for i, p1 in enumerate(percent):
         for j, p2 in enumerate(percent):
+            total_grid_points += 1
             t1, t2, A, B, C, D = abcd_counts(
                 loss_1, loss_2, p1, p2, weights=weights)
             record = abcd_record_at_thresholds(
@@ -188,12 +195,16 @@ def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500,
                 or min(A, B, C, D) < min_region_weight
             ):
                 continue
+            region_eligible_points += 1
             metrics = closure_metrics(A, B, C, D)
             nc = metrics["nonclosure"]
             score = abs(metrics["log_nonclosure"])
             if np.isfinite(nc):
                 scan_abs_nonclosure.append(abs(nc))
+            if np.isfinite(record["ratio_unc"]):
+                minimum_ratio_unc = min(minimum_ratio_unc, record["ratio_unc"])
             if np.isfinite(score) and record["ratio_unc"] <= max_ratio_unc:
+                uncertainty_eligible_points += 1
                 fold_abs_logs = []
                 if fold_ids is not None:
                     for fold in range(selection_folds):
@@ -208,6 +219,7 @@ def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500,
                     # omitting a fold with an empty or invalid ABCD region.
                     if len(fold_abs_logs) != selection_folds:
                         continue
+                fold_eligible_points += 1
                 fold_median = (
                     float(np.median(fold_abs_logs))
                     if fold_abs_logs else float(score)
@@ -264,7 +276,25 @@ def scan_abcd_grid(loss_1, loss_2, percent, min_A=50, min_D=500,
                 "min_region_weight": float(min_region_weight),
                 "max_ratio_unc": float(max_ratio_unc),
             })
-    return best, _grid_summary(scan_abs_nonclosure)
+    summary = _grid_summary(scan_abs_nonclosure)
+    total_weight_squared = float(np.square(weights).sum())
+    effective_sample_size = (
+        total_weight * total_weight / total_weight_squared
+        if total_weight_squared > 0.0 else 0.0
+    )
+    summary.update({
+        "total_grid_points": int(total_grid_points),
+        "region_eligible_points": int(region_eligible_points),
+        "uncertainty_eligible_points": int(uncertainty_eligible_points),
+        "fold_eligible_points": int(fold_eligible_points),
+        "candidate_points": int(len(candidates)),
+        "minimum_ratio_unc": (
+            float(minimum_ratio_unc) if np.isfinite(minimum_ratio_unc) else np.nan),
+        "max_ratio_unc": float(max_ratio_unc),
+        "tuning_effective_sample_size": float(effective_sample_size),
+        "selection_folds": int(selection_folds if fold_ids is not None else 1),
+    })
+    return best, summary
 
 
 def split_for_threshold_report(n_events, holdout_frac=0.5, seed=42,
@@ -1080,8 +1110,15 @@ def ABCD(config):
         selection_folds=selection_folds, selection_seed=split_seed,
         weights=weights_tune)
     if "t1" not in best_tune:
-        raise RuntimeError("No ABCD working point found on threshold-tuning split. "
-                           "Try lowering min_A/min_D or closure_holdout_frac.")
+        raise RuntimeError(
+            "No ABCD working point found on threshold-tuning split. "
+            f"Scan diagnostics: {tune_grid_summary}. "
+            "If region_eligible_points is zero, lower MIN_A_FRAC or "
+            "MIN_REGION_FRAC. If uncertainty_eligible_points is zero, raise "
+            "MAX_RATIO_UNC; this is a finite-effective-statistics limitation, "
+            "not evidence of nonclosure. If fold_eligible_points is zero, "
+            "reduce SELECTION_FOLDS."
+        )
 
     t1_opt, t2_opt = best_tune["t1"], best_tune["t2"]
     report_at_selected = abcd_record_at_thresholds(
@@ -1643,7 +1680,7 @@ if __name__ == "__main__":
                         help="Grid-index radius used for threshold-neighborhood stability.")
     parser.add_argument("--min_region_frac", type=float, default=0.01,
                         help="Minimum tuning-sample fraction required in every ABCD region.")
-    parser.add_argument("--max_ratio_unc", type=float, default=0.05,
+    parser.add_argument("--max_ratio_unc", type=float, default=0.15,
                         help="Reject tuning candidates with larger propagated ABCD ratio uncertainty.")
     parser.add_argument("--selection_folds", type=int, default=5,
                         help="Number of deterministic tuning folds used to score closure stability.")

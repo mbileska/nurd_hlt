@@ -33,3 +33,24 @@ def test_robust_abcd_selection_is_deterministic_and_fully_cross_checked():
     assert first["ratio_unc"] <= 0.10
     assert min(first[key] for key in ("A", "B", "C", "D")) >= 80
     assert summary["n_points"] > 0
+    assert summary["total_grid_points"] == len(percent) ** 2
+    assert summary["region_eligible_points"] >= summary["candidate_points"] > 0
+    assert summary["tuning_effective_sample_size"] == len(axis1)
+
+
+def test_scan_explains_an_unattainable_uncertainty_cut():
+    rng = np.random.default_rng(7)
+    axis1 = rng.normal(size=2000)
+    axis2 = rng.normal(size=2000)
+    percent = np.linspace(0.50, 0.75, 8)
+
+    best, summary = scan_abcd_grid(
+        axis1, axis2, percent,
+        min_A=20, min_D=100, min_A_frac=0.02,
+        min_region_frac=0.01, max_ratio_unc=1e-6,
+        selection_folds=5, selection_seed=42)
+
+    assert "t1" not in best
+    assert summary["region_eligible_points"] > 0
+    assert summary["uncertainty_eligible_points"] == 0
+    assert summary["minimum_ratio_unc"] > 1e-6

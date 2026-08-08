@@ -106,8 +106,11 @@ because the primary ABCD estimate is evaluated on QCD.
   score does not use empirical tail calibration. The independent test file
   remains report-only.
 - The default scan requires at least 10% of tuning QCD in region A, at least 1%
-  in every region, and at most 5% propagated ratio uncertainty. Selection uses
-  five-fold and neighboring-grid stability instead of the closure of one cell.
+  in every region, and at most 15% propagated ratio uncertainty. The looser
+  uncertainty ceiling is necessary for generator-weighted samples whose
+  effective event count is much smaller than the raw row count; uncertainty is
+  still penalized in threshold selection and reported. Five stability folds are
+  balanced by generator-weight mass rather than raw rows.
 - Evaluation trains a fresh nonlinear nuisance auditor after freezing the
   encoder. Training and metrics now follow generator-weighted QCD rather than
   raw row counts; its test-QCD accuracy/AUC/CE diagnose residual AE information.
@@ -354,7 +357,7 @@ ABCD_SCOPE=qcd
 SCORE_MODE=qcd_md
 MIN_A_FRAC=0.10
 MIN_REGION_FRAC=0.01
-MAX_RATIO_UNC=0.05
+MAX_RATIO_UNC=0.15
 SELECTION_FOLDS=5
 SELECTION_STAT_WEIGHT=0.5
 SELECTION_NEIGHBOR_WEIGHT=1.0
