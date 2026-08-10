@@ -24,7 +24,12 @@ from matplotlib.lines import Line2D
 
 from models.hlt_con import HLTContrastiveModel
 from models.hlt_autoencoder import HLTAutoencoder
-from utils.hlt_score_calibration import fit_class_references, score_latents
+from utils.hlt_score_calibration import (
+    fit_class_references,
+    fit_conditional_cdf,
+    save_conditional_cdf,
+    score_latents,
+)
 from utils.event_weights import (
     load_event_weights,
     weighted_quantile_numpy,
@@ -103,6 +108,38 @@ def closure_metrics(A, B, C, D, eps=1e-8):
 def nonclosure_A(A, B, C, D, eps=1e-8):
     metrics = closure_metrics(A, B, C, D, eps=eps)
     return metrics["nonclosure"], metrics["A_hat"]
+
+
+def closure_curve_values(axis1, axis2, weights, percent):
+    """Return efficiency, closure ratio, and propagated uncertainty arrays."""
+    total = max(float(np.asarray(weights).sum()), 1e-12)
+    values = []
+    for probability in percent:
+        t1, t2, *_ = abcd_counts(
+            axis1, axis2, probability, probability, weights=weights)
+        record = abcd_record_at_thresholds(
+            axis1, axis2, t1, t2, weights=weights)
+        values.append((
+            record["A"] / total, record["ratio"], record["ratio_unc"]))
+    values = np.asarray(values, dtype=np.float64)
+    order = np.argsort(values[:, 0])
+    return values[order, 0], values[order, 1], values[order, 2]
+
+
+def summarize_closure_curve(efficiency, ratio):
+    absolute = np.abs(ratio - 1.0)
+    summary = {
+        "median_abs_ratio_minus1": float(np.median(absolute)),
+        "p90_abs_ratio_minus1": float(np.quantile(absolute, 0.90)),
+        "min_ratio": float(np.min(ratio)),
+        "max_ratio": float(np.max(ratio)),
+    }
+    tail = efficiency <= 0.02
+    summary["tail_le_2pct_mean_ratio"] = (
+        float(np.mean(ratio[tail])) if tail.any() else np.nan)
+    summary["tail_le_2pct_median_abs_ratio_minus1"] = (
+        float(np.median(absolute[tail])) if tail.any() else np.nan)
+    return summary
 
 
 def abcd_record_at_thresholds(loss_1, loss_2, thresh_1, thresh_2,
@@ -756,10 +793,15 @@ def ABCD(config):
         "calibrated_union": "Calibrated all-background anomaly score",
         "mixture_nll": "Background-mixture negative log likelihood",
         "qcd_md": "QCD Mahalanobis distance",
+        "qcd_conditional_cdf": "AE-conditioned QCD MD tail score",
         "min_md": "Minimum class Mahalanobis distance",
         "classifier_routed": "Classifier-routed calibrated anomaly score",
         "gaussian_routed": "Gaussian-routed calibrated anomaly score",
     }[score_mode]
+    if score_mode == "qcd_conditional_cdf" and not reference_pt:
+        raise ValueError(
+            "qcd_conditional_cdf requires --reference_pt so calibration is "
+            "fitted without using the report sample.")
 
     # ── load models ───────────────────────────────────────────────────────────
     model, main_ckpt = load_nurd_model(config["ckpt"], device)
@@ -790,6 +832,9 @@ def ABCD(config):
     print(f"Axis 2 score mode: {score_mode}", flush=True)
     print(f"ABCD event scope: {abcd_scope}", flush=True)
     reference_details = {}
+    conditional_calibration = None
+    conditional_calibration_path = None
+    raw_reference_axis2 = None
     if reference_pt:
         print("Computing encoder outputs (reference)...", flush=True)
         reference_latents, reference_logits, reference_labels = embed_pf(
@@ -826,9 +871,55 @@ def ABCD(config):
                 for label in baseline_labels
             },
         }
-        reference_axis2, _reference_products = score_latents(
+        scoring_mode = (
+            "qcd_md" if score_mode == "qcd_conditional_cdf" else score_mode)
+        raw_reference_axis2, _reference_products = score_latents(
             reference_latents, reference_logits, references,
-            score_mode=score_mode, qcd_label=qcd_label)
+            score_mode=scoring_mode, qcd_label=qcd_label)
+        if score_mode == "qcd_conditional_cdf":
+            calibration_qcd = calibration_idx[
+                (reference_labels[calibration_idx] == qcd_label)
+                & np.isfinite(ae_reference[calibration_idx])
+                & (ae_reference[calibration_idx] > 0.0)
+                & np.isfinite(raw_reference_axis2[calibration_idx])
+            ]
+            conditional_calibration = fit_conditional_cdf(
+                ae_reference[calibration_qcd],
+                raw_reference_axis2[calibration_qcd],
+                weights=reference_weights[calibration_qcd],
+                n_conditioner_bins=int(config.get(
+                    "conditional_cdf_bins", 20)),
+                n_target_quantiles=int(config.get(
+                    "conditional_cdf_quantiles", 257)),
+                min_bin_events=int(config.get(
+                    "conditional_cdf_min_bin_events", 20)),
+            )
+            reference_axis2 = conditional_calibration.transform(
+                ae_reference, raw_reference_axis2)
+            conditional_calibration_path = os.path.join(
+                outdir, "conditional_cdf_calibration.npz")
+            save_conditional_cdf(
+                conditional_calibration_path, conditional_calibration,
+                metadata={
+                    "conditioner": "ae_reconstruction_loss",
+                    "target": "raw_qcd_mahalanobis_distance",
+                    "fit_source": reference_pt,
+                    "fit_split": "model_validation_calibration_qcd",
+                    "fit_n": int(len(calibration_qcd)),
+                    "qcd_label": int(qcd_label),
+                })
+            threshold_tune_source = "disjoint_after_conditional_calibration"
+            reference_details["conditional_cdf"] = {
+                "qcd_fit_n": int(len(calibration_qcd)),
+                "conditioner_bins": int(
+                    conditional_calibration.conditioner_centers.size),
+                "target_quantiles": int(
+                    conditional_calibration.cdf_probabilities.size),
+                "artifact": conditional_calibration_path,
+            }
+        else:
+            reference_axis2 = raw_reference_axis2
+        reference_details["threshold_tune_source"] = threshold_tune_source
         print(
             f"Reference splits: fit={len(fit_idx)} calibration={len(calibration_idx)} "
             f"threshold_tune={len(reference_tune_idx)}",
@@ -852,9 +943,16 @@ def ABCD(config):
         references = fit_class_references(
             latents_all, labels, fit_idx, calibration_idx, baseline_labels,
             n_components=config.get("n_pca"), sample_weights=bkg_weights)
-    con_bkg, score_products = score_latents(
+    raw_con_bkg, score_products = score_latents(
         latents_all, logits_all, references,
-        score_mode=score_mode, qcd_label=qcd_label)
+        score_mode=("qcd_md" if score_mode == "qcd_conditional_cdf"
+                    else score_mode), qcd_label=qcd_label)
+    if score_mode == "qcd_conditional_cdf":
+        con_bkg = conditional_calibration.transform(ae_bkg, raw_con_bkg)
+        score_products["raw_qcd_md"] = raw_con_bkg
+        score_products["qcd_conditional_cdf"] = con_bkg
+    else:
+        con_bkg = raw_con_bkg
     qcd_reference = next(ref for ref in references if ref.label == qcd_label)
     md_mu, md_W = qcd_reference.mean, qcd_reference.whitening
 
@@ -865,6 +963,8 @@ def ABCD(config):
     mask = np.isfinite(ae_bkg) & np.isfinite(con_bkg) & (ae_bkg > 0)
     axis1_bkg = ae_bkg[mask]
     axis2_bkg = con_bkg[mask]
+    raw_axis2_bkg = (
+        raw_con_bkg[mask] if score_mode == "qcd_conditional_cdf" else None)
     labels_masked  = labels[mask]
     weights_masked = bkg_weights[mask]
     latents_masked = latents_all[mask]
@@ -888,6 +988,10 @@ def ABCD(config):
     axis2_baselines = axis2_pca[baseline_only]
     labels_baselines = labels_masked[baseline_only]
     weights_baselines = weights_masked[baseline_only]
+    raw_axis2_qcd = (
+        raw_axis2_bkg[qcd_only] if raw_axis2_bkg is not None else None)
+    raw_axis2_baselines = (
+        raw_axis2_bkg[baseline_only] if raw_axis2_bkg is not None else None)
     print(f"QCD events for ABCD: {qcd_only.sum()}", flush=True)
     print(f"Baseline events for ABCD: {baseline_only.sum()} labels={baseline_labels}", flush=True)
 
@@ -939,6 +1043,27 @@ def ABCD(config):
         "class_assignment": class_assignment_diagnostics(
             labels_masked, masked_score_products),
     }
+    if raw_axis2_bkg is not None:
+        diagnostics["raw_qcd_md_correlations"] = {
+            "all_background": _safe_correlations(
+                axis1_bkg, raw_axis2_bkg,
+                max_points=corr_sample_size,
+                dcor_points=dcor_sample_size,
+                weights=weights_masked),
+            "all_baselines": _safe_correlations(
+                axis1_baselines, raw_axis2_baselines,
+                max_points=corr_sample_size,
+                dcor_points=dcor_sample_size,
+                weights=weights_baselines),
+            "qcd": _safe_correlations(
+                axis1_qcd, raw_axis2_qcd,
+                max_points=corr_sample_size,
+                dcor_points=dcor_sample_size,
+                weights=weights_qcd),
+        }
+        diagnostics["score_definition"]["raw_score"] = "qcd_md"
+        diagnostics["score_definition"]["conditional_calibration_artifact"] = (
+            conditional_calibration_path)
     print("Correlation diagnostics:", flush=True)
     for scope, vals in diagnostics["correlations"].items():
         print(
@@ -958,6 +1083,16 @@ def ABCD(config):
         "Corr/qcd_spearman": diagnostics["correlations"]["qcd"]["spearman"],
         "Corr/qcd_distance": diagnostics["correlations"]["qcd"]["distance_corr"],
     })
+    if raw_axis2_bkg is not None:
+        raw_corr = diagnostics["raw_qcd_md_correlations"]
+        wandb.log({
+            "RawQCDMD_Corr/all_pearson": raw_corr["all_background"]["pearson"],
+            "RawQCDMD_Corr/all_spearman": raw_corr["all_background"]["spearman"],
+            "RawQCDMD_Corr/all_distance": raw_corr["all_background"]["distance_corr"],
+            "RawQCDMD_Corr/qcd_pearson": raw_corr["qcd"]["pearson"],
+            "RawQCDMD_Corr/qcd_spearman": raw_corr["qcd"]["spearman"],
+            "RawQCDMD_Corr/qcd_distance": raw_corr["qcd"]["distance_corr"],
+        })
     if reference_pt and not config.get("skip_nuisance_auditor", False):
         saved_edges = main_ckpt.get("nuisance_bin_edges")
         if isinstance(saved_edges, dict):
@@ -1010,9 +1145,10 @@ def ABCD(config):
         sig_latents, sig_logits, _ = embed_pf(
             model, config["signal_pt"], device,
             batch_size=config.get("batch_size", 512))
-        sig_con, sig_score_products = score_latents(
+        raw_sig_con, sig_score_products = score_latents(
             sig_latents, sig_logits, references,
-            score_mode=score_mode, qcd_label=qcd_label)
+            score_mode=("qcd_md" if score_mode == "qcd_conditional_cdf"
+                        else score_mode), qcd_label=qcd_label)
 
         ae_sig = load_ae(config["ae_ckpt"], ae_scaler, device)
         sig_ae, sig_weights, signal_weight_metadata = compute_ae_scores(
@@ -1020,6 +1156,13 @@ def ABCD(config):
             batch_size=config.get("ae_batch_size", 4096),
             gen_weight_path=config.get("signal_weights"))
         del ae_sig
+
+        if score_mode == "qcd_conditional_cdf":
+            sig_con = conditional_calibration.transform(sig_ae, raw_sig_con)
+            sig_score_products["raw_qcd_md"] = raw_sig_con
+            sig_score_products["qcd_conditional_cdf"] = sig_con
+        else:
+            sig_con = raw_sig_con
 
         sig_mask = np.isfinite(sig_ae) & np.isfinite(sig_con) & (sig_ae > 0)
         sig_axis1         = sig_ae[sig_mask]
@@ -1057,12 +1200,14 @@ def ABCD(config):
         axis2_report = axis2_baselines
         labels_report = labels_baselines
         weights_report = weights_baselines
+        raw_axis2_report = raw_axis2_baselines
         scope_name = "all_baselines"
     elif abcd_scope == "qcd":
         axis1_report = axis1_qcd
         axis2_report = axis2_qcd
         labels_report = labels_masked[qcd_only]
         weights_report = weights_qcd
+        raw_axis2_report = raw_axis2_qcd
         scope_name = "qcd"
     else:
         raise ValueError(f"Unsupported abcd_scope={abcd_scope!r}")
@@ -1083,6 +1228,9 @@ def ABCD(config):
                     reference_labels[reference_candidates], baseline_labels)]
         axis1_tune = ae_reference[reference_candidates]
         axis2_tune = reference_axis2[reference_candidates]
+        raw_axis2_tune = (
+            raw_reference_axis2[reference_candidates]
+            if raw_axis2_report is not None else None)
         weights_tune = reference_weights[reference_candidates]
         closure_mode = "train_validation_to_independent_test"
     else:
@@ -1092,7 +1240,12 @@ def ABCD(config):
             strata_labels=labels_report if scope_name == "all_baselines" else None)
         axis1_tune, axis2_tune = axis1_report[tune_idx], axis2_report[tune_idx]
         weights_tune = weights_report[tune_idx]
+        raw_axis2_tune = (
+            raw_axis2_report[tune_idx]
+            if raw_axis2_report is not None else None)
         axis1_report, axis2_report = axis1_report[report_idx], axis2_report[report_idx]
+        if raw_axis2_report is not None:
+            raw_axis2_report = raw_axis2_report[report_idx]
         weights_report = weights_report[report_idx]
         labels_report = labels_report[report_idx]
     print(
@@ -1178,6 +1331,45 @@ def ABCD(config):
     }
     diagnostics["abcd_grid"] = grid_summary
     diagnostics["abcd_tune_grid"] = tune_grid_summary
+    raw_best_tune = raw_report_at_selected = raw_grid_summary = None
+    if raw_axis2_report is not None and raw_axis2_tune is not None:
+        raw_best_tune, raw_tune_grid_summary = scan_abcd_grid(
+            axis1_tune, raw_axis2_tune, percent,
+            min_A=min_A, min_D=min_D, min_A_frac=min_A_frac,
+            selection_stat_weight=selection_stat_weight,
+            selection_neighbor_weight=selection_neighbor_weight,
+            selection_neighbor_radius=selection_neighbor_radius,
+            min_region_frac=min_region_frac, max_ratio_unc=max_ratio_unc,
+            selection_folds=selection_folds, selection_seed=split_seed,
+            weights=weights_tune)
+        raw_best_report, raw_grid_summary = scan_abcd_grid(
+            axis1_report, raw_axis2_report, percent,
+            min_A=min_A, min_D=min_D, min_A_frac=min_A_frac,
+            selection_stat_weight=selection_stat_weight,
+            selection_neighbor_weight=selection_neighbor_weight,
+            selection_neighbor_radius=selection_neighbor_radius,
+            min_region_frac=min_region_frac, max_ratio_unc=max_ratio_unc,
+            selection_folds=selection_folds, selection_seed=split_seed,
+            weights=weights_report)
+        if "t1" in raw_best_tune:
+            raw_report_at_selected = abcd_record_at_thresholds(
+                axis1_report, raw_axis2_report,
+                raw_best_tune["t1"], raw_best_tune["t2"],
+                weights=weights_report)
+            raw_report_at_selected.update({
+                "p1": float(raw_best_tune["p1"]),
+                "p2": float(raw_best_tune["p2"]),
+                "selection_nonclosure": float(raw_best_tune["nonclosure"]),
+                "selection_score": float(raw_best_tune.get(
+                    "selection_score", np.nan)),
+            })
+        diagnostics["raw_qcd_md_abcd"] = {
+            "tune_best": raw_best_tune,
+            "report_at_selected": raw_report_at_selected,
+            "report_best_for_reference": raw_best_report,
+            "report_grid": raw_grid_summary,
+            "tune_grid": raw_tune_grid_summary,
+        }
     print(
         "ABCD report grid: "
         f"mean |nonclosure|={grid_summary['mean_abs_nonclosure']:.4f}, "
@@ -1214,6 +1406,19 @@ def ABCD(config):
         "ABCD/C": float(report_at_selected["C"]),
         "ABCD/D": float(report_at_selected["D"]),
     })
+    if raw_report_at_selected is not None:
+        wandb.log({
+            "RawQCDMD_ABCD/nonclosure": float(
+                raw_report_at_selected["nonclosure"]),
+            "RawQCDMD_ABCD/ratio_pred_over_true": float(
+                raw_report_at_selected["ratio"]),
+            "RawQCDMD_ABCD/grid_mean_abs_nonclosure": (
+                raw_grid_summary["mean_abs_nonclosure"]),
+            "RawQCDMD_ABCD/grid_median_abs_nonclosure": (
+                raw_grid_summary["median_abs_nonclosure"]),
+            "RawQCDMD_ABCD/grid_p90_abs_nonclosure": (
+                raw_grid_summary["p90_abs_nonclosure"]),
+        })
 
     if sig_axis1 is not None and sig_axis2 is not None:
         sig_A, sig_B, sig_C, sig_D = abcd_counts_at_thresholds(
@@ -1265,6 +1470,27 @@ def ABCD(config):
     out = os.path.join(plot_dir, "hist2d_bkg.png")
     plt.savefig(out, dpi=200, bbox_inches="tight"); plt.close()
     wandb.log({"Hists2D/bkg": wandb.Image(out)})
+
+    if raw_axis2_bkg is not None:
+        fig = plt.figure(figsize=(6, 5))
+        raw_positive = raw_axis2_bkg[raw_axis2_bkg > 0]
+        raw_ybins = np.geomspace(raw_positive.min(), raw_positive.max(), 201)
+        plt.hist2d(
+            axis1_bkg, raw_axis2_bkg, bins=[xbins, raw_ybins],
+            weights=weights_masked, norm=LogNorm())
+        plt.xscale("log"); plt.yscale("log")
+        if raw_best_tune is not None and "t1" in raw_best_tune:
+            plt.axvline(
+                raw_best_tune["t1"], color="black", linestyle="--",
+                linewidth=1.0)
+            plt.axhline(
+                raw_best_tune["t2"], color="black", linestyle="--",
+                linewidth=1.0)
+        plt.xlabel("AE reco loss"); plt.ylabel("Raw QCD Mahalanobis distance")
+        plt.title("AE vs raw QCD MD (bkg only)"); plt.colorbar(label="Counts")
+        raw_out = os.path.join(plot_dir, "hist2d_bkg_raw_qcd_md.png")
+        plt.savefig(raw_out, dpi=200, bbox_inches="tight"); plt.close()
+        wandb.log({"Hists2D/bkg_raw_qcd_md": wandb.Image(raw_out)})
 
     # combined scatter by class
     fig, ax = plt.subplots(figsize=(6, 5))
@@ -1553,6 +1779,13 @@ def ABCD(config):
         curve_summary["tail_le_2pct_mean_ratio"] = np.nan
         curve_summary["tail_le_2pct_median_abs_ratio_minus1"] = np.nan
     diagnostics["closure_curve"] = curve_summary
+    raw_effs = raw_closure_ratio = raw_closure_unc = None
+    if raw_axis2_report is not None:
+        raw_effs, raw_closure_ratio, raw_closure_unc = closure_curve_values(
+            axis1_report, raw_axis2_report, weights_report, percent)
+        raw_curve_summary = summarize_closure_curve(
+            raw_effs, raw_closure_ratio)
+        diagnostics["raw_qcd_md_abcd"]["closure_curve"] = raw_curve_summary
     wandb.log({
         "Closure/median_abs_ratio_minus1": curve_summary["median_abs_ratio_minus1"],
         "Closure/p90_abs_ratio_minus1": curve_summary["p90_abs_ratio_minus1"],
@@ -1575,6 +1808,20 @@ def ABCD(config):
     ax.plot(effs, np.full_like(effs, 0.95), linestyle="--", color="black")
     ax.plot(effs, np.full_like(effs, 1.05), linestyle="--", color="black")
     ax.plot([eff_opt], [ratio_opt], marker="o", c="red", label="Selected threshold")
+    if raw_effs is not None:
+        ax.plot(
+            raw_effs, raw_closure_ratio, color="tab:blue", linestyle="--",
+            label="Raw QCD MD independent test")
+        ax.fill_between(
+            raw_effs,
+            raw_closure_ratio - raw_closure_unc,
+            raw_closure_ratio + raw_closure_unc,
+            facecolor="tab:blue", alpha=0.18, interpolate=True)
+        if raw_report_at_selected is not None:
+            raw_eff_opt = raw_report_at_selected["A"] / max(Ntot_bkg, 1.0)
+            ax.plot(
+                [raw_eff_opt], [raw_report_at_selected["ratio"]], marker="s",
+                c="tab:blue", label="Raw MD selected threshold")
     ax.set_xlabel("Selection Efficiency (bkg A/Ntot)", fontsize=fs)
     ax.set_ylabel("Predicted Bkg. / True Bkg.",        fontsize=fs)
     ax.set_ylim([0.0, 1.5]); ax.set_xscale("log")
@@ -1692,11 +1939,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--score_mode", default="qcd_md",
         choices=[
-            "calibrated_union", "mixture_nll", "qcd_md", "min_md",
+            "calibrated_union", "mixture_nll", "qcd_md",
+            "qcd_conditional_cdf", "min_md",
             "classifier_routed", "gaussian_routed",
         ],
         help="Definition of ABCD axis 2, independent of --abcd_scope. "
-             "calibrated_union is high only when an event is atypical for every baseline.")
+             "qcd_conditional_cdf freezes a generator-weighted conditional MD "
+             "CDF on disjoint reference QCD before test evaluation.")
     parser.add_argument("--baseline_labels", default="0,1,2,3",
                         help="Comma/space-separated baseline background labels.")
     parser.add_argument("--qcd_label", type=int, default=1)
@@ -1722,6 +1971,12 @@ if __name__ == "__main__":
                              "calibrate class MD tails; the rest selects ABCD thresholds.")
     parser.add_argument("--reference_split_seed", type=int, default=42,
                         help="Seed used to reproduce the model train/validation split.")
+    parser.add_argument("--conditional_cdf_bins", type=int, default=20,
+                        help="Weighted AE quantile bins used by qcd_conditional_cdf.")
+    parser.add_argument("--conditional_cdf_quantiles", type=int, default=257,
+                        help="MD quantile-grid size per conditional calibration bin.")
+    parser.add_argument("--conditional_cdf_min_bin_events", type=int, default=20,
+                        help="Minimum unweighted QCD rows in a conditional calibration bin.")
     parser.add_argument("--wandb_run_name", default=None)
     parser.add_argument("--wandb_project",  default="AE vs. Contrastive ABCD",
                         help="W&B project to log to")

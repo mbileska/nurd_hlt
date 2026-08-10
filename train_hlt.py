@@ -440,7 +440,7 @@ parser.add_argument("--training_measure", default="class_balanced_physical",
 parser.add_argument("--ae_ckpt",    required=True,  type=str, help="Path to pre-trained AE checkpoint (.pth)")
 parser.add_argument("--val_split",  default=0.1,    type=float)
 parser.add_argument("--n_bins",     default=50,     type=int, help="Nuisance bins for exact NURD weights")
-parser.add_argument("--nuisance_bin_scope", default="qcd",
+parser.add_argument("--nuisance_bin_scope", default="all",
                     choices=["all", "qcd", "per_class", "per_label", "baseline_per_class"],
                     help="Events used to define AE-loss quantile bins. 'per_class' defines bins "
                          "separately inside each baseline class.")
@@ -448,6 +448,20 @@ parser.add_argument("--baseline_labels", default="0,1,2,3", type=str,
                     help="Comma/space-separated background labels to target for all-baseline training/eval.")
 # Training
 parser.add_argument("--epochs",         default=100,    type=int)
+parser.add_argument("--representation_epochs", default=-1, type=int,
+                    help="All-background representation epochs before QCD closure fine-tuning. "
+                         "Negative values use epochs - qcd_finetune_epochs.")
+parser.add_argument("--qcd_finetune_epochs", default=0, type=int,
+                    help="Final epochs that add the QCD closure objective while retaining the "
+                         "all-background CE, contrastive, and NURD critic objectives.")
+parser.add_argument("--finetune_lr_multiplier", default=0.25, type=float,
+                    help="Learning-rate multiplier at the start of QCD closure fine-tuning.")
+parser.add_argument("--finetune_anchor_weight", default=0.01, type=float,
+                    help="L2 penalty to the frozen end-of-representation parameters during fine-tuning.")
+parser.add_argument("--finetune_max_balanced_acc_drop", default=0.03, type=float,
+                    help="Maximum validation balanced-accuracy drop from the representation checkpoint.")
+parser.add_argument("--finetune_max_class_acc_drop", default=0.05, type=float,
+                    help="Maximum per-class validation-accuracy drop from the representation checkpoint.")
 parser.add_argument("--reweight_epochs",default=0,      type=int)
 parser.add_argument("--critic_epochs",  default=2,      type=int)
 parser.add_argument("-b","--batch_size",default=2048,   type=int)
@@ -502,7 +516,8 @@ parser.add_argument("--critic_schedule", default="warmup",
 parser.add_argument("--critic_type",    default="continuous_density_ratio",
                     choices=["bin_pred", "density_ratio", "continuous_density_ratio"],
                     help="'density_ratio' uses binned shuffled-z; "
-                         "'continuous_density_ratio' uses the weighted QCD AE-loss CDF; "
+                         "'continuous_density_ratio' uses the weighted AE-loss CDF defined "
+                         "by --nuisance_bin_scope; "
                          "'bin_pred' predicts nuisance bins directly.")
 parser.add_argument("--critic_bin_resolutions", default="50", type=str,
                     help="Comma-separated direct-critic bin heads. Every value must divide --n_bins.")
@@ -514,7 +529,7 @@ parser.add_argument("--critic_penalty_type", default="ratio_to_one",
                          "cross entropy, making the learned density ratio approach one; "
                          "'confusion' pushes real/shuffled logits to 0; "
                          "'logit_ratio' preserves the previous HLT proxy; 'ce_gap' matches the older script.")
-parser.add_argument("--critic_scope",   default="qcd",
+parser.add_argument("--critic_scope",   default="all",
                     choices=["all", "qcd", "baselines", "all_baselines"],
                     help="Which events train/apply the nuisance critic. 'all' preserves old behavior; "
                          "'qcd' targets the ABCD closure background directly; 'baselines' targets "
@@ -630,7 +645,7 @@ parser.add_argument("--min_val_class_acc", default=0.25, type=float,
                          "validation accuracy than this threshold.")
 parser.add_argument("--qcd_label",            default=1,     type=int,
                     help="Label index for QCD compatibility modes.")
-parser.add_argument("--md_proxy_type", default="ema",
+parser.add_argument("--md_proxy_type", default="epoch",
                     choices=["batch", "ema", "epoch"],
                     help="Batch-local, online EMA, or epoch-frozen class-whitening proxy.")
 parser.add_argument("--md_ema_momentum", default=0.01, type=float,
@@ -666,18 +681,23 @@ if args.qcd_batch_fraction != 0.0 and not 0.0 < args.qcd_batch_fraction < 1.0:
 if args.training_measure == "class_balanced_physical" and args.qcd_batch_fraction != 0.0:
     raise ValueError(
         "--qcd_batch_fraction cannot be combined with class-balanced physical sampling.")
-if (
-    args.closure_scope != "qcd"
-    or args.closure_score_mode != "own_class"
-    or args.critic_scope != "qcd"
-    or args.nuisance_bin_scope != "qcd"
-):
+if args.closure_scope != "qcd" or args.closure_score_mode != "own_class":
     raise ValueError(
-        "The experimental QCD-closure campaign requires "
-        "--closure_scope qcd --closure_score_mode own_class "
-        "--critic_scope qcd --nuisance_bin_scope qcd. "
-        "All-background classification and SupCon remain enabled."
+        "The staged QCD-closure campaign requires --closure_scope qcd "
+        "--closure_score_mode own_class. The NURD nuisance bins and critic "
+        "remain independently configurable and should normally use all backgrounds."
     )
+if args.qcd_finetune_epochs < 0 or args.qcd_finetune_epochs > args.epochs:
+    raise ValueError("--qcd_finetune_epochs must lie in [0, epochs].")
+if args.representation_epochs < 0:
+    args.representation_epochs = args.epochs - args.qcd_finetune_epochs
+if args.representation_epochs + args.qcd_finetune_epochs != args.epochs:
+    raise ValueError(
+        "--representation_epochs + --qcd_finetune_epochs must equal --epochs.")
+if not 0.0 < args.finetune_lr_multiplier <= 1.0:
+    raise ValueError("--finetune_lr_multiplier must lie in (0, 1].")
+if args.finetune_anchor_weight < 0.0:
+    raise ValueError("--finetune_anchor_weight must be non-negative.")
 if args.critic_schedule == "per_batch":
     raise ValueError(
         "--critic_schedule per_batch is disabled in this HLT implementation. "
@@ -743,10 +763,20 @@ def log_metrics(log, epoch, batch_time, loss, top1, acc, rw_loss=None, rw_acc=No
               + (f" RwLoss {rw_loss.avg:.4f} RwAcc {rw_acc.avg:.3f}" if rw_loss else ""))
 
 def adjust_learning_rate(optimizer, epoch):
-    lr = args.lr
+    """Use separate cosine schedules for representation and fine-tuning."""
+    if epoch < args.representation_epochs or args.qcd_finetune_epochs == 0:
+        stage_epoch = epoch
+        stage_epochs = max(args.representation_epochs, 1)
+        lr = args.lr
+    else:
+        stage_epoch = epoch - args.representation_epochs
+        stage_epochs = max(args.qcd_finetune_epochs, 1)
+        lr = args.lr * args.finetune_lr_multiplier
     if args.cosine:
         eta_min = lr * (0.1 ** 3)
-        lr = eta_min + (lr - eta_min) * (1 + math.cos(math.pi * epoch / args.epochs)) / 2
+        progress = min(float(stage_epoch) / stage_epochs, 1.0)
+        lr = eta_min + (lr - eta_min) * (
+            1 + math.cos(math.pi * progress)) / 2
     for pg in optimizer.param_groups:
         pg["lr"] = lr
 
@@ -767,13 +797,33 @@ def cosine_schedule(epoch, start, end, ramp_epochs):
 
 
 def get_effective_contrast_weight(epoch):
+    if epoch >= args.representation_epochs:
+        return args.contrast_weight
     return cosine_schedule(
         epoch, args.contrast_weight_start, args.contrast_weight, args.contrast_ramp_epochs)
 
 
 def get_effective_closure_weight(epoch):
+    if epoch < args.representation_epochs or args.qcd_finetune_epochs == 0:
+        return 0.0
+    finetune_epoch = epoch - args.representation_epochs
     return cosine_schedule(
-        epoch, args.closure_weight_start, args.closure_weight, args.closure_ramp_epochs)
+        finetune_epoch, args.closure_weight_start, args.closure_weight,
+        args.closure_ramp_epochs)
+
+
+def parameter_anchor_loss(model, anchor_parameters):
+    """Mean squared parameter drift from the representation checkpoint."""
+    if not anchor_parameters:
+        return next(model.parameters()).sum() * 0.0
+    total = next(model.parameters()).sum() * 0.0
+    count = 0
+    for name, parameter in model.named_parameters():
+        if name not in anchor_parameters or not parameter.requires_grad:
+            continue
+        total = total + (parameter - anchor_parameters[name]).square().sum()
+        count += parameter.numel()
+    return total / max(count, 1)
 
 
 def label_membership_mask(labels, label_values):
@@ -1034,18 +1084,19 @@ def train_critic(critic_model, model, train_loader, critic_criterion, critic_opt
     batch_time = AverageMeter()
     end = time.time()
     for (inputs, targets, nuisances, nuisance_cdf, _ae_reco,
-         _exact_weights, gen_weights) in train_loader:
+         exact_weights, gen_weights) in train_loader:
         inputs, targets, nuisances = inputs.to(device), targets.long().to(device), nuisances.to(device)
         nuisance_cdf = nuisance_cdf.to(device)
+        exact_weights = exact_weights.to(device)
+        gen_weights = gen_weights.to(device)
         inputs_c, targets_c, nuisances_c, scope_mask = select_critic_scope(
             inputs, targets, nuisances, nuisance_cdf, joint_indep_args)
         if inputs_c.size(0) == 0:
             continue
-        weights = (
-            torch.ones(inputs_c.size(0), device=device)
-            if reweight_args.get("sampler_represents_measure")
-            else gen_weights.to(device)[scope_mask]
-        )
+        weights = classification_weights(
+            exact_weights, gen_weights, targets, reweight_args,
+            sampled_measure=reweight_args.get(
+                "sampler_represents_measure", False))[scope_mask]
         with torch.no_grad():
             activations_c, _ = model(inputs_c)
         outputs, tgts, losses, _mi_proxy = compute_critic_loss_from_activations(
@@ -1067,14 +1118,18 @@ def validate_critic(val_loader, critic_model, model, critic_criterion, epoch, lo
     loss_m = AverageMeter(); rw_acc_m = AverageMeter(); acc_m = AverageMeter()
     with torch.no_grad():
         for (inputs, targets, nuisances, nuisance_cdf, _ae_reco,
-             _exact_weights, gen_weights) in val_loader:
+             exact_weights, gen_weights) in val_loader:
             inputs, targets, nuisances = inputs.to(device), targets.long().to(device), nuisances.to(device)
             nuisance_cdf = nuisance_cdf.to(device)
+            exact_weights = exact_weights.to(device)
+            gen_weights = gen_weights.to(device)
             inputs_c, targets_c, nuisances_c, scope_mask = select_critic_scope(
                 inputs, targets, nuisances, nuisance_cdf, joint_indep_args)
             if inputs_c.size(0) == 0:
                 continue
-            weights = gen_weights.to(device)[scope_mask]
+            weights = classification_weights(
+                exact_weights, gen_weights, targets, reweight_args,
+                sampled_measure=False)[scope_mask]
             activations_c, _ = model(inputs_c)
             outputs, tgts, losses, _mi_proxy = compute_critic_loss_from_activations(
                 activations_c, targets_c, nuisances_c, critic_model,
@@ -1102,7 +1157,7 @@ contrastive_loss_fn = SupConLoss(temperature=args.contrast_temp)
 def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
           reweight_args, joint_indep_args, effective_lambda=None,
           effective_contrast_weight=None, effective_closure_weight=None,
-          md_proxy=None):
+          md_proxy=None, anchor_parameters=None, effective_anchor_weight=0.0):
     batch_time = AverageMeter()
     acc = AverageMeter()
     loss = AverageMeter()
@@ -1130,6 +1185,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
     closure_classes_m = AverageMeter()
     weight_cv_m = AverageMeter()  # coeff. of variation of NURD weights (std/mean); 0 = uniform, >1 = heavy tails
     weight_ess_m = AverageMeter() # effective sample size fraction: ESS/N; 1.0 = no reweighting cost
+    anchor_m = AverageMeter()
 
     model.train()
     end = time.time()
@@ -1142,6 +1198,13 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         ae_reco = ae_reco.to(device)
         exact_weights = exact_weights.to(device)
         gen_weights = gen_weights.to(device)
+
+        # This is the exact nuisance-randomized training measure. The critic,
+        # encoder penalty, CE, and SupCon must all see the same measure.
+        weights = classification_weights(
+            exact_weights, gen_weights, targets, reweight_args,
+            sampled_measure=reweight_args.get(
+                "sampler_represents_measure", False))
 
         # ── joint independence: one critic gradient step on this batch (interleaved) ─
         # elif joint_indep_args["joint_indep"] and joint_indep_args.get("critic_schedule") == "interleaved":
@@ -1214,11 +1277,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                 )
                 if targets_c.size(0) > 1:
                     act_detached = activations.detach()[scope_mask]
-                    weights_c = (
-                        torch.ones(targets_c.size(0), device=device)
-                        if reweight_args.get("sampler_represents_measure")
-                        else gen_weights[scope_mask]
-                    )
+                    weights_c = weights[scope_mask]
                     n_steps = joint_indep_args.get("n_critic_steps_per_batch", 1)
                     for _ in range(n_steps):
                         c_out, c_targets, c_losses, _mi_proxy = compute_critic_loss_from_activations(
@@ -1251,11 +1310,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                 if joint_indep_args.get("critic_type")
                 == "continuous_density_ratio" else nuisances[scope_mask]
             )
-            gen_weights_c = (
-                torch.ones(targets_c.size(0), device=device)
-                if reweight_args.get("sampler_represents_measure")
-                else gen_weights[scope_mask]
-            )
+            critic_weights_c = weights[scope_mask]
             critic_scope_frac_m.update(float(targets_c.size(0)) / max(inputs.size(0), 1), inputs.size(0))
             critic_count = max(targets_c.size(0), 1)
             
@@ -1269,24 +1324,24 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                             joint_indep_args["critic_model"],
                             joint_indep_args["critic_criterion"],
                             joint_indep_args,
-                            sample_weights=gen_weights_c))
+                            sample_weights=critic_weights_c))
 
                 if joint_indep_args.get("critic_type") in {
                     "density_ratio", "continuous_density_ratio"
                 }:
                     penalty = mi_proxy
                     raw_mi_val = (
-                        penalty * gen_weights_c
-                    ).sum().div(gen_weights_c.sum().clamp(min=1e-8)).item()
+                        penalty * critic_weights_c
+                    ).sum().div(critic_weights_c.sum().clamp(min=1e-8)).item()
                     critic_ce = _apply_critic_weights(
-                        info_losses, gen_weights_c, joint_indep_args).item()
+                        info_losses, critic_weights_c, joint_indep_args).item()
                     critic_ce_m.update(critic_ce, targets_c.size(0))
                     critic_ce_ratio_m.update(
                         critic_ce / joint_indep_args["critic_chance_ce"],
                         targets_c.size(0))
                     critic_acc_m.update(
                         _critic_accuracy(
-                            critic_outputs, critic_targets, gen_weights_c),
+                            critic_outputs, critic_targets, critic_weights_c),
                         targets_c.size(0))
                     qcd_metric_mask = targets_c.long() == args.qcd_label
                     if qcd_metric_mask.any():
@@ -1296,22 +1351,22 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                             _critic_accuracy(
                                 critic_outputs[qcd_pair_mask],
                                 critic_targets[qcd_pair_mask],
-                                gen_weights_c[qcd_metric_mask]),
+                                critic_weights_c[qcd_metric_mask]),
                             int(qcd_metric_mask.sum().item()))
                     if lam > 0.0:
                         critic_penalty_loss = (
-                            penalty * gen_weights_c
-                        ).sum() / gen_weights_c.sum().clamp(min=1e-8)
+                            penalty * critic_weights_c
+                        ).sum() / critic_weights_c.sum().clamp(min=1e-8)
                     info_loss_val = raw_mi_val
                 #bin pred critic
                 else:
                     penalty = mi_proxy
                     raw_mi_val = (
-                        penalty * gen_weights_c
-                    ).sum().div(gen_weights_c.sum().clamp(min=1e-8)).item()
+                        penalty * critic_weights_c
+                    ).sum().div(critic_weights_c.sum().clamp(min=1e-8)).item()
                     # Match the averaged multi-head chance baseline below.
                     critic_ce = _apply_critic_weights(
-                        info_losses, gen_weights_c, joint_indep_args).item()
+                        info_losses, critic_weights_c, joint_indep_args).item()
                     critic_ce_m.update(critic_ce, targets_c.size(0))
                     critic_ce_ratio_m.update(
                         critic_ce / joint_indep_args["critic_chance_ce"],
@@ -1321,7 +1376,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                         targets_c.size(0))
                     critic_acc_m.update(
                         _critic_accuracy(
-                            critic_outputs, nuisances_c, gen_weights_c),
+                            critic_outputs, nuisances_c, critic_weights_c),
                         targets_c.size(0))
                     qcd_metric_mask = targets_c.long() == args.qcd_label
                     if qcd_metric_mask.any():
@@ -1329,18 +1384,15 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                             _critic_accuracy(
                                 critic_outputs[qcd_metric_mask],
                                 nuisances_c[qcd_metric_mask],
-                                gen_weights_c[qcd_metric_mask]),
+                                critic_weights_c[qcd_metric_mask]),
                             int(qcd_metric_mask.sum().item()))
                     if lam > 0.0:
                         critic_penalty_loss = (
-                            penalty * gen_weights_c
-                        ).sum() / gen_weights_c.sum().clamp(min=1e-8)
+                            penalty * critic_weights_c
+                        ).sum() / critic_weights_c.sum().clamp(min=1e-8)
                     info_loss_val = raw_mi_val
 
         #nurd reweighting
-        weights = classification_weights(
-            exact_weights, gen_weights, targets, reweight_args,
-            sampled_measure=reweight_args.get("sampler_represents_measure", False))
         rw_acc, rw_loss = record_rw_metrics(rw_acc, rw_loss, inputs, outputs, targets, losses_ce, weights)
         loss_nurd = (losses_ce * weights).sum() / weights.sum()
 
@@ -1369,7 +1421,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                  if reweight_args.get("sampler_represents_measure")
                  else gen_weights), args,
                 md_proxy=md_proxy,
-                update=True)
+                update=args.md_proxy_type == "ema")
             if n_closure > 0:
                 closure_classes_m.update(1, inputs.size(0))
                 if closure_diag.get("corr") is not None:
@@ -1388,7 +1440,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                     closure_copula_m.update(
                         closure_diag["copula_grid"], n_closure)
                 tensor_loss = tensor_loss + closure_w * loss_closure
-        elif md_proxy is not None:
+        elif md_proxy is not None and args.md_proxy_type == "ema":
             # Warm the lagged reference while the closure coefficient ramps up.
             qcd_mask = targets.long() == int(args.qcd_label)
             if qcd_mask.sum() >= args.closure_class_min_events:
@@ -1396,6 +1448,10 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                     activations[qcd_mask],
                     (None if reweight_args.get("sampler_represents_measure")
                      else gen_weights[qcd_mask]))
+
+        anchor_loss = parameter_anchor_loss(model, anchor_parameters)
+        if effective_anchor_weight > 0.0:
+            tensor_loss = tensor_loss + effective_anchor_weight * anchor_loss
 
         optimizer.zero_grad()
         tensor_loss.backward()
@@ -1410,6 +1466,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         nurd_m.update(loss_nurd.item(),         bs)
         con_m.update(loss_con.item(),           bs)
         closure_m.update(loss_closure.item(),   bs)
+        anchor_m.update(anchor_loss.item(),      bs)
         mi_m.update(info_loss_val,              critic_count)
         raw_mi_m.update(raw_mi_val,             critic_count)
         weight_cv_m.update((w_std / (w_mean + 1e-8)).item(), bs)
@@ -1426,6 +1483,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
               f"crit_acc={critic_acc_m.avg:.3f}  qcd_crit_acc={critic_qcd_acc_m.avg:.3f}  "
               f"closure_proxy_r={closure_proxy_corr_m.avg:.3f}  "
               f"closure_classes={closure_classes_m.avg:.1f}  "
+              f"anchor={anchor_m.avg:.6f}  "
               f"w_cv={weight_cv_m.avg:.3f}  w_ess={weight_ess_m.avg:.3f}  "
               f"cw={contrast_w:.3f}  clw={closure_w:.3f}  lr={current_lr:.2e}")
     if not args.local_testing:
@@ -1449,6 +1507,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
             "Train/critic_scope_frac": critic_scope_frac_m.avg,
             "Train/closure_proxy_pearson": closure_proxy_corr_m.avg,
             "Train/closure_classes":   closure_classes_m.avg,
+            "Train/anchor_loss":       anchor_m.avg,
             "Train/nurd_weight_cv":   weight_cv_m.avg,
             "Train/nurd_weight_ess":  weight_ess_m.avg,
             "Train/rw_loss":          rw_loss.avg,
@@ -1506,30 +1565,34 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
                     classification_weights(
                         exact_weights, gen_weights, targets, reweight_args,
                         sampled_measure=False))
-            qcd_mask = targets.long() == int(args.qcd_label)
-            if qcd_mask.sum() >= args.closure_class_min_events:
-                if joint_indep_args and joint_indep_args["joint_indep"]:
+            if joint_indep_args and joint_indep_args["joint_indep"]:
+                scope_mask = critic_scope_mask(targets, joint_indep_args)
+                critic_weights = classification_weights(
+                    exact_weights, gen_weights, targets, reweight_args,
+                    sampled_measure=False)[scope_mask]
+                if int(scope_mask.sum().item()) > 1:
                     critic_outputs, critic_targets, critic_losses, _ = (
                         compute_critic_loss_from_activations(
-                            activations[qcd_mask], targets[qcd_mask],
-                            (nuisance_cdf[qcd_mask]
+                            activations[scope_mask], targets[scope_mask],
+                            (nuisance_cdf[scope_mask]
                              if joint_indep_args.get("critic_type")
                              == "continuous_density_ratio"
-                             else nuisances.to(device)[qcd_mask]),
+                             else nuisances.to(device)[scope_mask]),
                             joint_indep_args["critic_model"],
                             joint_indep_args["critic_criterion"],
                             joint_indep_args,
-                            sample_weights=gen_weights[qcd_mask]))
+                            sample_weights=critic_weights))
                     critic_acc_m.update(
                         _critic_accuracy(
-                            critic_outputs, critic_targets,
-                            gen_weights[qcd_mask]),
-                        int(qcd_mask.sum().item()))
+                            critic_outputs, critic_targets, critic_weights),
+                        int(scope_mask.sum().item()))
                     critic_ce_m.update(
                         _apply_critic_weights(
-                            critic_losses, gen_weights[qcd_mask],
+                            critic_losses, critic_weights,
                             joint_indep_args).item(),
-                        int(qcd_mask.sum().item()))
+                        int(scope_mask.sum().item()))
+            qcd_mask = targets.long() == int(args.qcd_label)
+            if qcd_mask.sum() >= args.closure_class_min_events:
                 x_log = torch.log(ae_reco[qcd_mask].float().clamp(min=1e-8))
                 qcd_x_chunks.append(x_log.cpu().numpy())
                 qcd_latent_chunks.append(
@@ -1563,6 +1626,10 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
             weights=qcd_weights[valid],
             min_effective_count=args.val_abcd_min_effective_events,
             max_ratio_unc=args.val_abcd_max_ratio_unc)
+        if md_proxy is not None and args.md_proxy_type == "epoch":
+            md_proxy.replace_reference(
+                torch.from_numpy(qcd_latents),
+                torch.from_numpy(qcd_weights))
     val_abcd["selection_mode"] = "cross_fitted_qcd_md_grid"
     val_abcd["md_folds"] = int(args.val_md_folds)
     per_class_acc = {
@@ -1823,6 +1890,10 @@ def main():
     def checkpoint_state(epoch):
         return {
             "epoch": epoch + 1,
+            "training_stage": (
+                "qcd_closure_finetune"
+                if epoch >= args.representation_epochs
+                else "all_background_representation"),
             "state_dict_model": model.state_dict(),
             "state_dict_critic": (
                 None if critic_model is None else critic_model.state_dict()),
@@ -1835,14 +1906,26 @@ def main():
             "gen_weight_metadata": gen_weight_metadata,
             "md_proxy_state": (
                 None if md_proxy is None else md_proxy.state_dict()),
+            "representation_metrics": representation_metrics,
         }
 
     best_loss = None
     best_abcd_score = None
+    representation_metrics = None
+    anchor_parameters = None
+    if args.representation_epochs == 0:
+        anchor_parameters = {
+            name: parameter.detach().clone()
+            for name, parameter in model.named_parameters()
+        }
     abcd_score_history = deque(
         maxlen=max(1, args.abcd_ckpt_smoothing_epochs))
     for epoch in range(args.epochs):
-        log.debug(f"Epoch {epoch}")
+        is_finetune = epoch >= args.representation_epochs
+        stage_name = (
+            "qcd_closure_finetune" if is_finetune
+            else "all_background_representation")
+        log.debug(f"Epoch {epoch}  stage={stage_name}")
         adjust_learning_rate(optimizer, epoch)
 
         #per epoch (train critic once per epoch) THIS IS NOT USED rn (Skipped)
@@ -1880,14 +1963,12 @@ def main():
         effective_closure_weight = get_effective_closure_weight(epoch)
 
         #all the critic logic here (loss computation, weight updates)
-        if md_proxy is not None and args.md_proxy_type == "epoch":
-            md_proxy.begin_epoch()
         train(model, train_loader, val_loader, criterion, optimizer,
               epoch + args.reweight_epochs, log, reweight_args, joint_indep_args,
               effective_lambda, effective_contrast_weight, effective_closure_weight,
-              md_proxy)
-        if md_proxy is not None and args.md_proxy_type == "epoch":
-            md_proxy.finalize_epoch()
+              md_proxy, anchor_parameters=anchor_parameters,
+              effective_anchor_weight=(
+                  args.finetune_anchor_weight if is_finetune else 0.0))
         #runs model on validation set with no gradient updates (just forward passes)
         (val_loss, val_acc, val_rw_acc, val_balanced_acc,
          val_min_class_acc, val_per_class_acc, val_qcd_corr, val_abcd) = validate(
@@ -1895,15 +1976,30 @@ def main():
             reweight_args, joint_indep_args=joint_indep_args,
             md_proxy=md_proxy)
 
-        classifier_ok = classifier_checkpoint_eligible(
+        absolute_classifier_ok = classifier_checkpoint_eligible(
             val_balanced_acc, args.min_val_balanced_acc,
             per_class_accuracies=val_per_class_acc.values(),
             minimum_class_accuracy=args.min_val_class_acc)
+        relative_classifier_ok = True
+        if is_finetune and representation_metrics is not None:
+            relative_classifier_ok = (
+                val_balanced_acc
+                >= representation_metrics["balanced_acc"]
+                - args.finetune_max_balanced_acc_drop
+                and all(
+                    val_per_class_acc.get(label, -np.inf)
+                    >= baseline - args.finetune_max_class_acc_drop
+                    for label, baseline
+                    in representation_metrics["per_class_acc"].items()
+                )
+            )
+        classifier_ok = absolute_classifier_ok and relative_classifier_ok
         if not classifier_ok:
             log.debug(
                 "Checkpoint rejected: physical balanced/min-class accuracy "
                 f"{val_balanced_acc:.3f}/{val_min_class_acc:.3f}; required "
-                f">={args.min_val_balanced_acc:.3f}/{args.min_val_class_acc:.3f}")
+                f">={args.min_val_balanced_acc:.3f}/{args.min_val_class_acc:.3f}; "
+                f"representation-preservation={relative_classifier_ok}")
         if classifier_ok and (best_loss is None or val_loss < best_loss):
             best_loss = val_loss
             log.debug("Saving checkpoint")
@@ -1921,7 +2017,11 @@ def main():
             abcd_score_history.append(float(val_abcd_score))
             smoothed_abcd_score = float(np.median(abcd_score_history))
             loss_ok = best_loss is not None and val_loss <= args.abcd_ckpt_loss_tol * best_loss
-            epoch_ready = epoch + 1 >= max(1, args.abcd_ckpt_min_epoch)
+            epoch_ready = (
+                is_finetune
+                and epoch + 1 >= max(
+                    args.representation_epochs + 1,
+                    args.abcd_ckpt_min_epoch))
             if (
                 epoch_ready and loss_ok and classifier_ok
                 and (best_abcd_score is None
@@ -1956,6 +2056,36 @@ def main():
                         "p90_abs_log_nonclosure", float("nan"))
                     wandb.run.summary["best_val_proxy_abcd_tail"] = val_abcd.get(
                         "tail_mean_abs_log_nonclosure", float("nan"))
+
+        if epoch + 1 == args.representation_epochs:
+            representation_metrics = {
+                "epoch": int(epoch + 1),
+                "balanced_acc": float(val_balanced_acc),
+                "min_class_acc": float(val_min_class_acc),
+                "per_class_acc": dict(val_per_class_acc),
+                "val_loss": float(val_loss),
+                "val_qcd_proxy_corr": float(val_qcd_corr),
+                "val_proxy_abcd": val_abcd,
+            }
+            if args.qcd_finetune_epochs > 0 and not absolute_classifier_ok:
+                raise RuntimeError(
+                    "The all-background representation failed the physical "
+                    "balanced/per-class accuracy requirements; refusing to "
+                    "spend the remaining allocation on QCD fine-tuning."
+                )
+            anchor_parameters = {
+                name: parameter.detach().clone()
+                for name, parameter in model.named_parameters()
+            }
+            state = checkpoint_state(epoch)
+            log.debug(
+                "Saving end-of-representation checkpoint before QCD fine-tuning")
+            save_checkpoint(args, state, epoch + 1, name="representation")
+            if not args.local_testing:
+                wandb.run.summary["representation_val_balanced_acc"] = (
+                    val_balanced_acc)
+                wandb.run.summary["representation_val_min_class_acc"] = (
+                    val_min_class_acc)
 
     if best_loss is None:
         raise RuntimeError(

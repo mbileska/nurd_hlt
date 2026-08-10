@@ -164,6 +164,20 @@ def test_qcd_md_proxy_reference_is_frozen_for_the_epoch():
     assert torch.allclose(restored.second_moment, proxy.second_moment.cpu())
 
 
+def test_qcd_md_proxy_can_replace_reference_from_frozen_validation():
+    proxy = RunningQCDMDProxy(momentum=0.5, eps=1e-6, mode="epoch")
+    reference = torch.tensor([
+        [0.0, 0.0], [0.0, 4.0], [2.0, 0.0], [2.0, 4.0],
+    ])
+    weights = torch.tensor([1.0, 1.0, 3.0, 3.0])
+
+    assert proxy.replace_reference(reference, weights)
+    assert torch.allclose(proxy.mean, torch.tensor([1.5, 2.0]))
+    before = proxy.mean.clone()
+    proxy.md(reference + 10.0, torch.ones(4, dtype=torch.bool), update=False)
+    assert torch.allclose(proxy.mean, before)
+
+
 def test_qcd_md_proxy_ema_scores_before_tracking_current_batch():
     proxy = RunningQCDMDProxy(momentum=0.5, eps=1e-6, mode="ema")
     initial = torch.tensor([

@@ -6,6 +6,8 @@ import json
 import numpy as np
 from sklearn.covariance import LedoitWolf
 
+from utils.event_weights import weighted_quantile_numpy
+
 
 @dataclass
 class ClassReference:
@@ -17,6 +19,173 @@ class ClassReference:
     prior: float
     calibration_md: np.ndarray
     calibration_weight: np.ndarray
+
+
+@dataclass
+class ConditionalCDFCalibration:
+    """Frozen weighted estimate of ``P(MD <= m | AE=x)``.
+
+    The conditioner is binned by weighted quantiles.  Within each bin, a dense
+    weighted quantile grid estimates the conditional MD CDF; neighboring bins
+    are linearly interpolated to avoid discontinuities at AE-bin boundaries.
+    """
+
+    conditioner_edges: np.ndarray
+    conditioner_centers: np.ndarray
+    cdf_probabilities: np.ndarray
+    target_quantiles: np.ndarray
+    tail_floors: np.ndarray
+    log_conditioner: bool = True
+
+    def transform(self, conditioner, target):
+        conditioner = np.asarray(conditioner, dtype=np.float64).reshape(-1)
+        target = np.asarray(target, dtype=np.float64).reshape(-1)
+        if conditioner.shape != target.shape:
+            raise ValueError("conditioner and target must have the same shape.")
+        x = np.log(np.clip(conditioner, 1e-12, None)) if self.log_conditioner else conditioner
+        if self.conditioner_centers.size == 1:
+            lower = upper = np.zeros(x.size, dtype=np.int64)
+            fraction = np.zeros(x.size, dtype=np.float64)
+        else:
+            upper = np.searchsorted(self.conditioner_centers, x, side="right")
+            upper = np.clip(upper, 1, self.conditioner_centers.size - 1)
+            lower = upper - 1
+            below = x <= self.conditioner_centers[0]
+            above = x >= self.conditioner_centers[-1]
+            lower[below] = upper[below] = 0
+            lower[above] = upper[above] = self.conditioner_centers.size - 1
+            span = self.conditioner_centers[upper] - self.conditioner_centers[lower]
+            fraction = np.divide(
+                x - self.conditioner_centers[lower], span,
+                out=np.zeros_like(x), where=np.abs(span) > 1e-12)
+            fraction = np.clip(fraction, 0.0, 1.0)
+
+        cdf_lower = np.empty(x.size, dtype=np.float64)
+        cdf_upper = np.empty(x.size, dtype=np.float64)
+        for bin_id in np.unique(lower):
+            mask = lower == bin_id
+            cdf_lower[mask] = _cdf_from_quantile_grid(
+                target[mask], self.target_quantiles[bin_id],
+                self.cdf_probabilities)
+        for bin_id in np.unique(upper):
+            mask = upper == bin_id
+            cdf_upper[mask] = _cdf_from_quantile_grid(
+                target[mask], self.target_quantiles[bin_id],
+                self.cdf_probabilities)
+        cdf = cdf_lower + fraction * (cdf_upper - cdf_lower)
+        floor = (
+            self.tail_floors[lower]
+            + fraction * (self.tail_floors[upper] - self.tail_floors[lower])
+        )
+        # A small lower CDF floor keeps the resulting anomaly score positive so
+        # existing logarithmic plots remain well-defined.
+        cdf = np.clip(cdf, floor, 1.0 - floor)
+        tail_probability = np.clip(1.0 - cdf, floor, 1.0)
+        return -np.log(tail_probability)
+
+
+def _cdf_from_quantile_grid(values, target_quantiles, probabilities):
+    """Invert a quantile grid while handling repeated target values."""
+    target_quantiles = np.asarray(target_quantiles, dtype=np.float64)
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    unique_target, first = np.unique(target_quantiles, return_index=True)
+    if unique_target.size == 1:
+        return np.where(values < unique_target[0], 0.0, 1.0)
+    # For a plateau, use the largest associated CDF probability.
+    last = np.r_[first[1:] - 1, target_quantiles.size - 1]
+    unique_probability = probabilities[last]
+    return np.interp(
+        values, unique_target, unique_probability,
+        left=probabilities[0], right=probabilities[-1])
+
+
+def fit_conditional_cdf(conditioner, target, weights=None,
+                        n_conditioner_bins=20, n_target_quantiles=257,
+                        min_bin_events=20, log_conditioner=True):
+    """Fit a weighted conditional MD CDF on a background-only calibration set."""
+    conditioner = np.asarray(conditioner, dtype=np.float64).reshape(-1)
+    target = np.asarray(target, dtype=np.float64).reshape(-1)
+    if weights is None:
+        weights = np.ones_like(conditioner)
+    weights = np.asarray(weights, dtype=np.float64).reshape(-1)
+    if not (conditioner.shape == target.shape == weights.shape):
+        raise ValueError("conditioner, target, and weights must align.")
+    valid = (
+        np.isfinite(conditioner) & np.isfinite(target) & np.isfinite(weights)
+        & (conditioner > 0.0) & (target >= 0.0) & (weights > 0.0)
+    )
+    conditioner = conditioner[valid]
+    target = target[valid]
+    weights = weights[valid]
+    if conditioner.size < max(2 * min_bin_events, 40):
+        raise ValueError("Too few valid events to fit a conditional CDF calibration.")
+    x = np.log(conditioner) if log_conditioner else conditioner
+
+    requested_bins = min(int(n_conditioner_bins), conditioner.size // min_bin_events)
+    requested_bins = max(requested_bins, 1)
+    while requested_bins > 1:
+        edges = weighted_quantile_numpy(
+            x, np.linspace(0.0, 1.0, requested_bins + 1), weights)
+        bin_ids = np.searchsorted(edges[1:-1], x, side="right")
+        counts = np.bincount(bin_ids, minlength=requested_bins)
+        if counts.min() >= min_bin_events and np.all(np.diff(edges) > 0.0):
+            break
+        requested_bins -= 1
+    edges = weighted_quantile_numpy(
+        x, np.linspace(0.0, 1.0, requested_bins + 1), weights)
+    bin_ids = np.searchsorted(edges[1:-1], x, side="right")
+    probabilities = np.linspace(0.0, 1.0, int(n_target_quantiles))
+    target_quantiles = []
+    centers = []
+    tail_floors = []
+    for bin_id in range(requested_bins):
+        mask = bin_ids == bin_id
+        local_weights = weights[mask]
+        if mask.sum() < min_bin_events or local_weights.sum() <= 0.0:
+            raise ValueError(
+                f"Conditional CDF bin {bin_id} has only {int(mask.sum())} events.")
+        target_quantiles.append(weighted_quantile_numpy(
+            target[mask], probabilities, local_weights))
+        centers.append(float(weighted_quantile_numpy(
+            x[mask], [0.5], local_weights)[0]))
+        effective = local_weights.sum() ** 2 / np.maximum(
+            np.square(local_weights).sum(), 1e-12)
+        tail_floors.append(0.5 / max(effective + 1.0, 2.0))
+    return ConditionalCDFCalibration(
+        conditioner_edges=np.asarray(edges, dtype=np.float64),
+        conditioner_centers=np.asarray(centers, dtype=np.float64),
+        cdf_probabilities=probabilities,
+        target_quantiles=np.asarray(target_quantiles, dtype=np.float64),
+        tail_floors=np.asarray(tail_floors, dtype=np.float64),
+        log_conditioner=bool(log_conditioner),
+    )
+
+
+def save_conditional_cdf(path, calibration, metadata=None):
+    np.savez_compressed(
+        path,
+        conditioner_edges=calibration.conditioner_edges,
+        conditioner_centers=calibration.conditioner_centers,
+        cdf_probabilities=calibration.cdf_probabilities,
+        target_quantiles=calibration.target_quantiles,
+        tail_floors=calibration.tail_floors,
+        log_conditioner=np.asarray(int(calibration.log_conditioner)),
+        metadata=np.asarray(json.dumps(metadata or {}, sort_keys=True)),
+    )
+
+
+def load_conditional_cdf(path):
+    data = np.load(path, allow_pickle=False)
+    calibration = ConditionalCDFCalibration(
+        conditioner_edges=data["conditioner_edges"],
+        conditioner_centers=data["conditioner_centers"],
+        cdf_probabilities=data["cdf_probabilities"],
+        target_quantiles=data["target_quantiles"],
+        tail_floors=data["tail_floors"],
+        log_conditioner=bool(int(data["log_conditioner"])),
+    )
+    metadata = json.loads(str(data["metadata"].item()))
+    return calibration, metadata
 
 
 def _softmax(values, axis=1):

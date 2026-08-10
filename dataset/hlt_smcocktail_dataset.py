@@ -2,8 +2,8 @@
 HLT SM Cocktail dataset for NURD training.
 
 The nuisance variable z is represented both by binned AE reconstruction loss
-for exact NURD weights and by a continuous weighted-QCD CDF coordinate for the
-adversarial critic.
+for exact NURD weights and by a continuous weighted AE-loss rank for the
+adversarial critic. Both coordinates use the configured nuisance population.
 NURD exact weights w(y,z) = p(y)*p(z)/p(y,z) are pre-computed on load
 so that train_exact.py can look them up with dataset.weights[(y,z)].
 
@@ -190,7 +190,7 @@ class HLTSmCocktailDataset(Dataset):
         pf_data:       [N, max_cands, n_feats]  PF candidate features
         labels:        [N] long
         nuisances_all: [N] binned AE reconstruction-loss nuisance
-        nuisance_cdf_all: [N] continuous weighted-QCD AE-loss rank
+        nuisance_cdf_all: [N] continuous weighted AE-loss rank
         ae_reco_all:   [N] continuous AE reconstruction loss
         gen_weights:   [N] generator/event weights
         idx:           selected event indices for this split
@@ -433,18 +433,27 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
     else:
         raise ValueError(f"Unsupported nuisance_bin_scope={nuisance_bin_scope!r}")
 
-    # The continuous adversary uses the weighted QCD rank rather than a category.
-    # This removes the nuisance-resolution ceiling while retaining discrete bins
-    # for the exact p(y)p(z)/p(y,z) NURD weights.
-    train_qcd = labels[idx_tr] == int(qcd_label)
-    if not train_qcd.any():
-        raise ValueError(
-            f"Cannot build continuous QCD nuisance: no label={qcd_label} events.")
-    nuisance_cdf_all = weighted_cdf_coordinate(
-        ae_reco_all,
-        ae_reco_all[idx_tr][train_qcd],
-        gen_weights[idx_tr][train_qcd],
-    )
+    # The continuous adversary removes the finite-bin resolution ceiling. Its
+    # reference population must match the discrete nuisance definition.
+    if nuisance_bin_scope == "qcd":
+        rank_mask = labels[idx_tr] == int(qcd_label)
+        if not rank_mask.any():
+            raise ValueError(
+                f"Cannot build continuous QCD nuisance: no label={qcd_label} events.")
+        nuisance_cdf_all = weighted_cdf_coordinate(
+            ae_reco_all, ae_reco_all[idx_tr][rank_mask],
+            gen_weights[idx_tr][rank_mask])
+    elif nuisance_bin_scope == "all":
+        nuisance_cdf_all = weighted_cdf_coordinate(
+            ae_reco_all, ae_reco_all[idx_tr], gen_weights[idx_tr])
+    else:
+        nuisance_cdf_all = torch.empty_like(ae_reco_all)
+        for label in sorted(int(v) for v in torch.unique(labels).tolist()):
+            train_mask = labels[idx_tr] == label
+            full_mask = labels == label
+            nuisance_cdf_all[full_mask] = weighted_cdf_coordinate(
+                ae_reco_all[full_mask], ae_reco_all[idx_tr][train_mask],
+                gen_weights[idx_tr][train_mask])
     balance_factors = class_balance_factors(
         labels[idx_tr], gen_weights[idx_tr])
 

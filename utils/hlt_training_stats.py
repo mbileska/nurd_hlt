@@ -332,6 +332,24 @@ class RunningQCDMDProxy:
             else self._sum_outer + total_outer
         )
 
+    def replace_reference(self, qcd_latent, weights=None):
+        """Replace the active moments from one frozen model evaluation.
+
+        This is used after validation so every batch in the next epoch sees one
+        fixed global QCD reference rather than statistics accumulated while the
+        encoder itself is changing.
+        """
+        if qcd_latent.size(0) < 2:
+            return False
+        count, total, total_outer = self._batch_sums(qcd_latent, weights)
+        if float(count.item()) <= 0.0:
+            return False
+        self.mean = (total / count).cpu()
+        self.second_moment = (total_outer / count).cpu()
+        self.updates += 1
+        self.begin_epoch()
+        return True
+
     def finalize_epoch(self):
         """Atomically replace the active reference with this epoch's moments."""
         if self.mode == "ema":
