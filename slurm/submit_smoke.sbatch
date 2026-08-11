@@ -50,7 +50,7 @@ python train_ae.py \
   --data "$TRAIN_PT" \
   --gen_weights "$GEN_WEIGHT_TRAIN" \
   --epochs 1 \
-  --batch_size 64 \
+  --batch_size 128 \
   --max_events 2000 \
   --local_testing 1 \
   --exp_name smoke_ae \
@@ -62,7 +62,9 @@ python train_hlt.py \
   --gen_weights "$GEN_WEIGHT_TRAIN" \
   --ae_ckpt checkpoints/hlt/hlt/smoke_ae/checkpoint_ae.pth \
   --epochs 1 \
-  --batch_size 64 \
+  --representation_epochs 0 \
+  --qcd_finetune_epochs 1 \
+  --batch_size 128 \
   --max_events 2000 \
   --local_testing 1 \
   --training_measure class_balanced_physical \
@@ -70,20 +72,28 @@ python train_hlt.py \
   --critic_type continuous_density_ratio \
   --critic_bin_resolutions 50 \
   --critic_penalty_type ratio_to_one \
-  --critic_scope qcd \
-  --critic_shuffle global \
+  --critic_scope all \
+  --critic_shuffle within_label \
   --critic_train_frac 1.0 \
   --n_critic_steps_per_batch 2 \
   --baseline_labels 0,1,2,3 \
-  --nuisance_bin_scope qcd \
+  --nuisance_bin_scope all \
+  --critic_nuisance_cdf_scope per_class \
   --n_bins 50 \
   --qcd_batch_fraction 0 \
   --reweight 1 \
   --joint_indep 1 \
+  --qcd_physical_critic 1 \
+  --qcd_critic_steps_per_batch 2 \
   --max_weight_ratio 10.0 \
   --closure_weight 0.1 \
+  --closure_weight_start 0.1 \
+  --closure_ramp_epochs 0 \
   --closure_loss_type hybrid \
   --closure_latent_dcorr_weight 1.5 \
+  --closure_cdf_weight 2.0 \
+  --closure_cdf_bins 3 \
+  --closure_cdf_quantiles 0.25,0.5,0.75,0.9 \
   --closure_scope qcd \
   --closure_score_mode own_class \
   --closure_class_min_events 5 \
@@ -92,7 +102,10 @@ python train_hlt.py \
   --abcd_ckpt_smoothing_epochs 1 \
   --min_val_balanced_acc 0.0 \
   --min_val_class_acc 0.0 \
-  --md_proxy_type ema \
+  --md_proxy_type epoch \
+  --md_reference_max_events 100 \
+  --md_reference_batch_size 64 \
+  --auditor_interval 0 \
   --exp_name smoke_nurd \
   --project_name hlt \
   --manualSeed 42

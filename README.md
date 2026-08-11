@@ -3,9 +3,8 @@
 This branch trains a two-axis HLT anomaly detector:
 
 - Axis 1: object-feature autoencoder reconstruction loss.
-- Axis 2 for the primary closure result: a frozen conditional-CDF transform of
-  QCD-referenced, whitened Mahalanobis distance from the PF-candidate encoder.
-  Raw QCD MD is saved and evaluated beside the transformed score.
+- Axis 2 for the primary closure result: raw QCD-referenced, whitened
+  Mahalanobis distance from the PF-candidate encoder.
 - Learned backgrounds: `DY=0`, `QCD=1`, `TT=2`, and `WJets=3`.
 - Primary report: ABCD closure on independent QCD test events.
 
@@ -38,8 +37,9 @@ closure objective and primary ABCD report are QCD-scoped.
   fitting nuisance preprocessing.
 - Fifty generator-weighted AE-loss nuisance bins are fitted from all training
   backgrounds for exact NURD reweighting, matching the original global NURD
-  factorization. A separate continuous all-background weighted CDF coordinate
-  is used by the critic, so critic resolution is not limited by bin count.
+  factorization. A separate continuous per-class weighted CDF coordinate is
+  used by the critics, so critic resolution is not limited by bin count and
+  class-dependent AE marginals cannot dominate the critic.
   Both are fitted on training data only and reused for validation.
 - Exact NURD weights are fitted on training data only and reused unchanged for
   validation.
@@ -57,7 +57,13 @@ closure objective and primary ABCD report are QCD-scoped.
   and Transformer batches are processed per epoch as before.
 - A continuous all-background density-ratio critic distinguishes real
   `(latent, class, weighted-AE-CDF)` tuples from shuffled-nuisance tuples. It
-  takes two updates on reused encoder activations.
+  takes two updates on reused encoder activations. Nuisance is shuffled within
+  each class, preserving `p(AE | class)` and testing latent-AE dependence rather
+  than the immutable class-AE relation.
+- A second continuous critic uses only QCD and the physical generator-weighted
+  measure. It directly enforces `latent independent of AE | QCD`, while the
+  all-background NURD critic continues to enforce its randomized-measure
+  objective.
 - The critic and encoder-side critic penalty now use the exact NURD weights.
   The prior class-balanced sampler previously caused them to use unit weights,
   so critic confusion did not certify independence under the randomized NURD
@@ -77,12 +83,17 @@ closure objective and primary ABCD report are QCD-scoped.
   QCD latent, not only its EMA-MD radius. This removes AE information that a
   downstream Mahalanobis score could recover even when scalar proxy correlation
   is small.
+- Conditional-CDF matching now constrains the entire raw-MD survival
+  distribution across ten AE-rank slices at six MD quantiles through `0.95`.
+  This targets width and tail changes that mean-profile and correlation losses
+  can miss.
 - Training is explicitly staged. The first 140 epochs learn an all-background
   representation with global NURD. The final 40 epochs retain those objectives
   and add QCD closure regularization at a lower learning rate.
-- QCD closure batches use one epoch-frozen MD reference produced by the prior
-  frozen validation pass. This replaces statistics accumulated while the
-  encoder was changing and aligns the proxy more closely with evaluation.
+- QCD closure batches use one epoch-frozen MD reference refreshed from a fixed
+  50,000-event training-QCD subset. Validation is read-only and is scored
+  against that training reference, matching final raw-MD evaluation without
+  validation leakage.
 - Fine-tuning includes a small parameter anchor to the representation
   checkpoint. Closure checkpoints are rejected if balanced accuracy drops by
   more than 3 percentage points or any class drops by more than 5 points.
@@ -95,11 +106,10 @@ closure objective and primary ABCD report are QCD-scoped.
 - No main or closure checkpoint is accepted below 55% physical balanced
   accuracy or 25% accuracy in any individual background class. This explicitly
   prevents both the v6/v7 always-QCD collapse and a hidden single-class collapse.
-- Validation QCD MD is two-fold cross-fitted with weighted shrinkage covariance.
-  Fold assignment balances generator-weight mass, so a few large-weight events
-  cannot make one reference fold statistically much weaker than the other.
+- Validation QCD MD uses the frozen weighted-shrinkage reference fitted on the
+  fixed training-QCD subset. It is the same raw score family used at evaluation.
 - `checkpoint_abcd.pth.tar` and `checkpoint_closure.pth.tar` are selected by a
-  broad cross-fitted QCD MD score: p90 plus tail and median log-nonclosure,
+  broad raw QCD MD score: p90 plus tail and median log-nonclosure,
   subject to validation-loss, effective-region-count, and propagated-ratio-
   uncertainty guards. Selection starts after epoch 40 and saves the exact epoch
   that produced the improving score; an older rolling-median implementation
@@ -109,15 +119,13 @@ closure objective and primary ABCD report are QCD-scoped.
 - ABCD cuts use weighted quantiles. `A/B/C/D` are generator-weighted yields,
   ratio uncertainty uses per-region `sumw2`, and raw event-count minima are
   retained as a guard against a few high-weight events.
-- The primary `qcd_conditional_cdf` evaluation divides untouched training-file
-  validation events into disjoint calibration and threshold-tuning halves. The
-  calibration half fits weighted QCD `P(MD <= m | AE=x)`; the transform is then
-  frozen, thresholds are selected on the other half, and the independent test
-  file is report-only. This targets residual nonlinear/heteroscedastic closure
-  without fitting the report sample.
-- Evaluation saves `conditional_cdf_calibration.npz`, calibrated and raw event
-  scores, raw and calibrated correlations/grids, and an overlaid raw closure
-  curve. `SCORE_MODE=qcd_md` remains the untransformed apples-to-apples check.
+- The primary evaluation is `ABCD_SCOPE=qcd SCORE_MODE=qcd_md`. Thresholds are
+  selected on untouched model-validation QCD and reported once on independent
+  test QCD.
+- `SCORE_MODE=qcd_conditional_cdf` remains available only as a diagnostic upper
+  bound on correctable dependence. Because that score explicitly uses AE in a
+  post-training transform, it must not be quoted as evidence that NURD itself
+  learned a decorrelated latent or raw MD.
 - The default scan requires at least 10% of tuning QCD in region A, at least 1%
   in every region, and at most 15% propagated ratio uncertainty. The looser
   uncertainty ceiling is necessary for generator-weighted samples whose
@@ -127,6 +135,9 @@ closure objective and primary ABCD report are QCD-scoped.
 - Evaluation trains a fresh nonlinear nuisance auditor after freezing the
   encoder. Training and metrics now follow generator-weighted QCD rather than
   raw row counts; its test-QCD accuracy/AUC/CE diagnose residual AE information.
+- A capped 30,000-event version of the same auditor runs every 20 training
+  epochs. It is diagnostic only; raw-MD grid closure and classifier guards
+  select checkpoints.
 - `calibrated_union`, `min_md`, and other all-background scores remain available
   as secondary studies. They are not the default QCD-closure axis.
 
@@ -243,6 +254,10 @@ unset PREFER_ABCD_CKPT PREFER_CLOSURE_CKPT
 unset TRAIN_PT TEST_PT REFERENCE_PT GEN_WEIGHT_TRAIN TEST_WEIGHTS REFERENCE_WEIGHTS
 unset REPRESENTATION_EPOCHS QCD_FINETUNE_EPOCHS FINETUNE_LR_MULTIPLIER
 unset FINETUNE_ANCHOR_WEIGHT CONDITIONAL_CDF_BINS CONDITIONAL_CDF_QUANTILES
+unset CRITIC_SHUFFLE CRITIC_NUISANCE_CDF_SCOPE QCD_PHYSICAL_CRITIC
+unset QCD_CRITIC_LAMBDA QCD_CRITIC_STEPS CLOSURE_CDF_WEIGHT
+unset CLOSURE_CDF_BINS CLOSURE_CDF_QUANTILES MD_REFERENCE_MAX_EVENTS
+unset MD_REFERENCE_BATCH_SIZE MD_REFERENCE_REFRESH_EPOCHS AUDITOR_INTERVAL
 ```
 
 ## Smoke Test
@@ -273,6 +288,9 @@ Submit the default campaign:
 ```bash
 unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP RUN_TAG NURD_GLOB
 unset WANDB_RUN_NAME WANDB_RUN_ID
+unset CRITIC_SHUFFLE CRITIC_NUISANCE_CDF_SCOPE QCD_PHYSICAL_CRITIC
+unset QCD_CRITIC_LAMBDA QCD_CRITIC_STEPS CLOSURE_CDF_WEIGHT
+unset CLOSURE_CDF_BINS CLOSURE_CDF_QUANTILES
 sbatch slurm/submit_train.sbatch
 ```
 
@@ -286,14 +304,16 @@ batch size            4096
 AE epochs             100
 NURD epochs           180: 140 representation + 40 QCD fine-tune
 nuisance bins         50 weighted all-background quantiles for exact NURD weights
-continuous nuisance   weighted all-background AE-loss CDF in [0,1]
+continuous nuisance   weighted per-class AE-loss CDF in [0,1]
 training measure      equal class mass; physical generator weights within class
-critic                continuous global density-ratio critic, exact NURD weighted
+NURD critic           all-background, exact-NURD weighted, within-class shuffle
+QCD critic            continuous physical-QCD density-ratio critic
 critic penalty        bounded ratio_to_one
-closure               QCD hybrid losses vs prior-validation frozen MD reference
+closure               raw QCD MD dCorr/profile/CDF/copula losses
+MD reference          fixed 50k training-QCD subset, refreshed every epoch
 fine-tune guard        parameter anchor plus relative balanced/per-class accuracy gates
 checkpoint guard      balanced accuracy >= 0.55 and every class >= 0.25
-checkpoint MD         weight-balanced two-fold cross-fitted shrinkage covariance
+checkpoint MD         raw validation QCD MD against frozen training reference
 ABCD yields           generator weighted, uncertainty from sumw2
 ```
 
@@ -316,21 +336,30 @@ CRITIC_SCOPE=all
 CRITIC_TYPE=continuous_density_ratio
 CRITIC_BIN_RESOLUTIONS=50
 CRITIC_PENALTY_TYPE=ratio_to_one
-CRITIC_SHUFFLE=global
+CRITIC_SHUFFLE=within_label
+QCD_PHYSICAL_CRITIC=1
+QCD_CRITIC_LAMBDA=0.20
+QCD_CRITIC_STEPS=3
 LAMBDA=0.05
 N_BINS=50
 TRAINING_MEASURE=class_balanced_physical
 QCD_BATCH_FRACTION=0.0
 NUISANCE_BIN_SCOPE=all
+CRITIC_NUISANCE_CDF_SCOPE=per_class
 CLOSURE_SCOPE=qcd
 CLOSURE_SCORE_MODE=own_class
 CLOSURE_LATENT_DCORR_WEIGHT=1.5
+CLOSURE_CDF_WEIGHT=2.0
+CLOSURE_CDF_BINS=10
+CLOSURE_CDF_QUANTILES=0.10,0.25,0.50,0.75,0.90,0.95
 NURD_EPOCHS=180
 REPRESENTATION_EPOCHS=140
 QCD_FINETUNE_EPOCHS=40
 FINETUNE_LR_MULTIPLIER=0.25
 FINETUNE_ANCHOR_WEIGHT=0.01
 MD_PROXY_TYPE=epoch
+MD_REFERENCE_MAX_EVENTS=50000
+MD_REFERENCE_REFRESH_EPOCHS=1
 CLOSURE_LOSS_TYPE=hybrid
 CLOSURE_WEIGHT=0.5
 CONTRAST_WEIGHT=0.02
@@ -372,12 +401,10 @@ optimization experiment.
 The latest-eval script defaults to:
 
 ```text
-NURD_GLOB=hlt_nurd_closure_bs4096_experimental_global_nurd_calibrated_v9_*
+NURD_GLOB=hlt_nurd_closure_bs4096_experimental_intrinsic_raw_md_v10_*
 PREFER_ABCD_CKPT=1
 ABCD_SCOPE=qcd
-SCORE_MODE=qcd_conditional_cdf
-CONDITIONAL_CDF_BINS=20
-CONDITIONAL_CDF_QUANTILES=257
+SCORE_MODE=qcd_md
 MIN_A_FRAC=0.10
 MIN_REGION_FRAC=0.01
 MAX_RATIO_UNC=0.15
@@ -401,7 +428,8 @@ Evaluate the latest validation-loss checkpoint for comparison:
 ```bash
 unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP NURD_GLOB
 PREFER_ABCD_CKPT=0 PREFER_CLOSURE_CKPT=0 \
-  WANDB_NAME_PREFIX=experimental_global_nurd_calibrated_v9_main \
+  WANDB_NAME_PREFIX=experimental_intrinsic_raw_md_v10_main \
+  SCORE_MODE=qcd_md \
   sbatch slurm/submit_eval_latest.sbatch
 ```
 
@@ -446,20 +474,20 @@ AE_EXP=<exact_ae_exp>
 
 CKPT=$BASE/checkpoints/hlt/hlt/$NURD_EXP/checkpoint_abcd.pth.tar
 AE_CKPT=$BASE/checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth
-OUTDIR=$BASE/outputs/manual_${NURD_EXP}_qcd_conditional_cdf
+OUTDIR=$BASE/outputs/manual_${NURD_EXP}_raw_qcd_md
 
 CKPT="$CKPT" AE_CKPT="$AE_CKPT" OUTDIR="$OUTDIR" \
-ABCD_SCOPE=qcd SCORE_MODE=qcd_conditional_cdf \
+ABCD_SCOPE=qcd SCORE_MODE=qcd_md \
   sbatch slurm/submit_eval_latest.sbatch
 ```
 
-Run the raw legacy QCD-MD axis on the same checkpoint:
+Run the conditional calibration diagnostic on the same checkpoint:
 
 ```bash
 CKPT="$CKPT" AE_CKPT="$AE_CKPT" \
-OUTDIR=$BASE/outputs/manual_${NURD_EXP}_raw_qcd_md \
-ABCD_SCOPE=qcd SCORE_MODE=qcd_md \
-WANDB_NAME_PREFIX=raw_qcd_md \
+OUTDIR=$BASE/outputs/manual_${NURD_EXP}_conditional_diagnostic \
+ABCD_SCOPE=qcd SCORE_MODE=qcd_conditional_cdf \
+WANDB_NAME_PREFIX=conditional_diagnostic \
   sbatch slurm/submit_eval_latest.sbatch
 ```
 
@@ -492,9 +520,10 @@ ABCD_SCOPE=all_baselines SCORE_MODE=calibrated_union \
   sbatch slurm/submit_eval_latest.sbatch
 ```
 
-These are secondary questions. Quote the leakage-safe
-`ABCD_SCOPE=qcd SCORE_MODE=qcd_conditional_cdf` result for the primary campaign,
-and always report `SCORE_MODE=qcd_md` beside it as the raw model comparison.
+These are secondary questions. Quote
+`ABCD_SCOPE=qcd SCORE_MODE=qcd_md` for the primary intrinsic-closure campaign.
+Conditional calibration may be reported only as a diagnostic and must remain
+clearly separated from raw-model closure.
 
 ## W&B
 

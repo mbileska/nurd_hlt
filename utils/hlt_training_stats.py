@@ -216,6 +216,85 @@ def soft_copula_grid_loss(x, y, quantiles, scale=12.0,
     return loss, torch.stack(residuals).mean().item()
 
 
+def conditional_cdf_loss(conditioner, target, n_bins=10,
+                         target_quantiles=(0.10, 0.25, 0.50, 0.75, 0.90, 0.95),
+                         scale=12.0, tail_focus_weight=2.0, eps=1e-6,
+                         weights=None):
+    """Match the complete target distribution across conditioner quantiles.
+
+    The conditioner bins are detached because AE loss is fixed. Gradients flow
+    through soft target survival probabilities at several global target
+    quantiles. Independence requires each conditional survival probability to
+    equal its global value; unlike a mean-profile loss, this also constrains the
+    width and tails of the raw MD distribution.
+    """
+    conditioner = conditioner.float().view(-1)
+    target = target.float().view(-1)
+    weights = (
+        torch.ones_like(conditioner) if weights is None
+        else weights.float().view(-1).to(conditioner.device)
+    )
+    target_quantiles = [
+        float(q) for q in target_quantiles if 0.0 < float(q) < 1.0
+    ]
+    if (
+        conditioner.numel() < max(20, int(n_bins) * 4)
+        or int(n_bins) < 2
+        or not target_quantiles
+    ):
+        zero = (conditioner.sum() + target.sum()) * 0.0
+        return zero, None
+
+    normalized_weights = weights / weights.sum().clamp(min=eps)
+    with torch.no_grad():
+        conditioner_edges = weighted_quantile(
+            conditioner.detach(),
+            torch.linspace(0, 1, int(n_bins) + 1,
+                           device=conditioner.device),
+            weights.detach())
+        conditioner_bins = torch.bucketize(
+            conditioner.detach(), conditioner_edges[1:-1])
+        target_cuts = weighted_quantile(
+            target.detach(), target_quantiles, weights.detach())
+        target_scale = (
+            weighted_quantile(
+                target.detach(), [0.84], weights.detach())[0]
+            - weighted_quantile(
+                target.detach(), [0.16], weights.detach())[0]
+        ).clamp(min=eps)
+
+    losses = []
+    residuals = []
+    for quantile, cut in zip(target_quantiles, target_cuts):
+        survival = torch.sigmoid(scale * (target - cut) / target_scale)
+        global_survival = (normalized_weights * survival).sum()
+        variance_scale = torch.sqrt(
+            global_survival * (1.0 - global_survival) + eps)
+        target_tail = max(0.0, (quantile - 0.5) / 0.5)
+        for bin_index in range(int(n_bins)):
+            mask = conditioner_bins == bin_index
+            if int(mask.sum().item()) < 3:
+                continue
+            local_weights = weights[mask]
+            local_survival = (
+                local_weights * survival[mask]
+            ).sum() / local_weights.sum().clamp(min=eps)
+            residual = (local_survival - global_survival) / variance_scale
+            conditioner_tail = bin_index / max(int(n_bins) - 1, 1)
+            tail = max(target_tail, conditioner_tail)
+            loss_weight = 1.0 + tail_focus_weight * tail * tail
+            losses.append(loss_weight * residual.square())
+            residuals.append(residual.detach().abs())
+
+    if not losses:
+        zero = (conditioner.sum() + target.sum()) * 0.0
+        return zero, None
+    return (
+        torch.stack(losses).mean(),
+        torch.stack(residuals).mean().item(),
+    )
+
+
 class RunningQCDMDProxy:
     """Streaming Mahalanobis reference with weighted QCD moments.
 
@@ -299,6 +378,12 @@ class RunningQCDMDProxy:
         whitened = centered @ whitening
         return (whitened * whitened).sum(dim=1).to(latent.dtype)
 
+    def score(self, latent):
+        """Score latent rows against the active frozen training reference."""
+        if not self.ready:
+            raise RuntimeError("The QCD MD reference has not been fitted.")
+        return self._score(latent, self.mean, self.second_moment)
+
     def update(self, qcd_latent, weights=None):
         """Update EMA moments or accumulate moments for epoch replacement."""
         if qcd_latent.size(0) < 1:
@@ -335,9 +420,8 @@ class RunningQCDMDProxy:
     def replace_reference(self, qcd_latent, weights=None):
         """Replace the active moments from one frozen model evaluation.
 
-        This is used after validation so every batch in the next epoch sees one
-        fixed global QCD reference rather than statistics accumulated while the
-        encoder itself is changing.
+        Every training batch then sees one fixed global QCD reference rather
+        than statistics accumulated while the encoder itself is changing.
         """
         if qcd_latent.size(0) < 2:
             return False

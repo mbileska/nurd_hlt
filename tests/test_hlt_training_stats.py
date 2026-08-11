@@ -12,6 +12,7 @@ from utils.hlt_training_stats import (
     QCDRichBatchSampler,
     RunningQCDMDProxy,
     classifier_checkpoint_eligible,
+    conditional_cdf_loss,
     cross_fitted_mahalanobis,
     distance_corr_loss,
     soft_conditioner_profile_loss,
@@ -164,7 +165,7 @@ def test_qcd_md_proxy_reference_is_frozen_for_the_epoch():
     assert torch.allclose(restored.second_moment, proxy.second_moment.cpu())
 
 
-def test_qcd_md_proxy_can_replace_reference_from_frozen_validation():
+def test_qcd_md_proxy_can_replace_reference_from_frozen_training_subset():
     proxy = RunningQCDMDProxy(momentum=0.5, eps=1e-6, mode="epoch")
     reference = torch.tensor([
         [0.0, 0.0], [0.0, 4.0], [2.0, 0.0], [2.0, 4.0],
@@ -176,6 +177,21 @@ def test_qcd_md_proxy_can_replace_reference_from_frozen_validation():
     before = proxy.mean.clone()
     proxy.md(reference + 10.0, torch.ones(4, dtype=torch.bool), update=False)
     assert torch.allclose(proxy.mean, before)
+
+
+def test_qcd_md_proxy_public_score_uses_frozen_reference():
+    proxy = RunningQCDMDProxy(eps=1e-6, mode="epoch")
+    reference = torch.tensor([
+        [0.0, 0.0], [0.0, 2.0], [2.0, 0.0], [2.0, 2.0],
+    ])
+    assert proxy.replace_reference(reference)
+
+    values = reference + 3.0
+    direct = proxy.score(values)
+    through_md = proxy.md(
+        values, torch.ones(values.size(0), dtype=torch.bool), update=False)
+
+    assert torch.allclose(direct, through_md)
 
 
 def test_qcd_md_proxy_ema_scores_before_tracking_current_batch():
@@ -215,6 +231,24 @@ def test_copula_grid_has_gradients_for_both_axes():
     assert metric > 0
     assert x.grad is not None and x.grad.abs().sum() > 0
     assert y.grad is not None and y.grad.abs().sum() > 0
+
+
+def test_conditional_cdf_loss_detects_distribution_shift_and_has_gradient():
+    conditioner = torch.linspace(0.0, 1.0, 400)
+    dependent = (
+        2.5 * conditioner + 0.15 * torch.sin(31.0 * conditioner)
+    ).requires_grad_()
+    independent = dependent.detach()[torch.randperm(dependent.numel())]
+
+    dependent_loss, dependent_metric = conditional_cdf_loss(
+        conditioner, dependent, n_bins=10)
+    independent_loss, _ = conditional_cdf_loss(
+        conditioner, independent, n_bins=10)
+    dependent_loss.backward()
+
+    assert dependent_metric > 0.1
+    assert dependent_loss > independent_loss
+    assert dependent.grad is not None and dependent.grad.abs().sum() > 0
 
 
 def test_cross_fitted_mahalanobis_scores_every_event():

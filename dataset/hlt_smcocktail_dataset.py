@@ -330,6 +330,7 @@ class HLTSmCocktailDataset(Dataset):
 def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
                        max_events=-1, ae_scaler=None, ae_batch_size=4096,
                        max_weight_ratio=10.0, nuisance_bin_scope="all",
+                       critic_nuisance_cdf_scope="match_bins",
                        qcd_label=1, baseline_labels=None,
                        gen_weight_path=None,
                        training_measure="physical"):
@@ -434,8 +435,14 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
         raise ValueError(f"Unsupported nuisance_bin_scope={nuisance_bin_scope!r}")
 
     # The continuous adversary removes the finite-bin resolution ceiling. Its
-    # reference population must match the discrete nuisance definition.
-    if nuisance_bin_scope == "qcd":
+    # coordinate may be class-conditional even when the discrete bins used by
+    # exact NURD weights are global. This keeps the two objectives distinct.
+    cdf_scope = (
+        nuisance_bin_scope
+        if critic_nuisance_cdf_scope == "match_bins"
+        else critic_nuisance_cdf_scope
+    )
+    if cdf_scope == "qcd":
         rank_mask = labels[idx_tr] == int(qcd_label)
         if not rank_mask.any():
             raise ValueError(
@@ -443,10 +450,10 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
         nuisance_cdf_all = weighted_cdf_coordinate(
             ae_reco_all, ae_reco_all[idx_tr][rank_mask],
             gen_weights[idx_tr][rank_mask])
-    elif nuisance_bin_scope == "all":
+    elif cdf_scope == "all":
         nuisance_cdf_all = weighted_cdf_coordinate(
             ae_reco_all, ae_reco_all[idx_tr], gen_weights[idx_tr])
-    else:
+    elif cdf_scope in {"per_class", "per_label"}:
         nuisance_cdf_all = torch.empty_like(ae_reco_all)
         for label in sorted(int(v) for v in torch.unique(labels).tolist()):
             train_mask = labels[idx_tr] == label
@@ -454,6 +461,9 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
             nuisance_cdf_all[full_mask] = weighted_cdf_coordinate(
                 ae_reco_all[full_mask], ae_reco_all[idx_tr][train_mask],
                 gen_weights[idx_tr][train_mask])
+    else:
+        raise ValueError(
+            f"Unsupported critic_nuisance_cdf_scope={critic_nuisance_cdf_scope!r}")
     balance_factors = class_balance_factors(
         labels[idx_tr], gen_weights[idx_tr])
 

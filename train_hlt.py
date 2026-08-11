@@ -6,7 +6,7 @@ objective and a memory-safe interleaved density-ratio critic:
 
   * HLTSmCocktailDataset  — PF candidate data; AE reco loss as nuisance z
   * HLTContrastiveModel   — Roy's Linformer encoder + projector + classifier
-  * HLTCritic             — predicts nuisance bin from (latent, y)
+  * HLTCritic             — tests latent/AE dependence under NURD and QCD measures
   * Contrastive loss      — SupCon / InfoNCE on top of NURD-weighted CE
 
 Usage
@@ -29,16 +29,18 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.backends.cudnn as cudnn
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
 from models.hlt_autoencoder import HLTAutoencoder
 from models.hlt_con import HLTContrastiveModel, HLTCritic
 from dataset.hlt_smcocktail_dataset import build_hlt_datasets
+from utils.hlt_auditor import nuisance_auditor
 from utils.common import AverageMeter, save_checkpoint, accuracy
 from utils.hlt_training_stats import (
     QCDRichBatchSampler,
     RunningQCDMDProxy,
     classifier_checkpoint_eligible,
+    conditional_cdf_loss,
     cross_fitted_mahalanobis,
     distance_corr_loss,
     soft_conditioner_profile_loss,
@@ -221,9 +223,12 @@ def profile_flatness_loss(x, y, n_bins=8, tail_weight=2.0, eps=1e-8,
 
 
 def closure_dependency_loss(ae_reco, proxy_md_values, args, weights=None,
-                            latent_values=None, eps=1e-8):
+                            latent_values=None, ae_rank=None, eps=1e-8):
     """Direct QCD dependence loss for the two ABCD axes."""
-    x = torch.log(ae_reco.float().clamp(min=eps))
+    x = (
+        torch.log(ae_reco.float().clamp(min=eps))
+        if ae_rank is None else ae_rank.float().clamp(0.0, 1.0)
+    )
     y = torch.log1p(proxy_md_values.float().clamp(min=0.0))
     corr_loss, corr_val = closure_corr_loss(
         ae_reco, proxy_md_values, weights=weights, eps=eps)
@@ -273,6 +278,16 @@ def closure_dependency_loss(ae_reco, proxy_md_values, args, weights=None,
                     weights=weights)
                 total = total + args.closure_reverse_profile_weight * profile_rev
                 diag["profile_reverse"] = profile_rev_val
+            if args.closure_cdf_weight > 0.0:
+                cdf, cdf_val = conditional_cdf_loss(
+                    x, y,
+                    n_bins=args.closure_cdf_bins,
+                    target_quantiles=args.closure_cdf_quantiles_values,
+                    scale=args.closure_tail_scale,
+                    tail_focus_weight=args.closure_profile_tail_weight,
+                    eps=eps, weights=weights)
+                total = total + args.closure_cdf_weight * cdf
+                diag["conditional_cdf"] = cdf_val
         if args.closure_loss_type in {"hybrid", "tail_abcd"} and args.closure_tail_abcd_weight > 0.0:
             tail_loss, tail_val = soft_copula_grid_loss(
                 x, y, args.closure_tail_quantiles_values,
@@ -286,7 +301,7 @@ def closure_dependency_loss(ae_reco, proxy_md_values, args, weights=None,
 
 
 def compute_qcd_closure_loss(activations, labels, ae_reco, gen_weights, args,
-                             md_proxy=None, update=True):
+                             nuisance_cdf=None, md_proxy=None, update=True):
     """Apply closure only to QCD while leaving CE/SupCon all-background."""
     qcd_mask = labels.long() == int(args.qcd_label)
     n_qcd = int(qcd_mask.sum().item())
@@ -309,7 +324,8 @@ def compute_qcd_closure_loss(activations, labels, ae_reco, gen_weights, args,
 
     loss, corr, diagnostics = closure_dependency_loss(
         ae_reco[qcd_mask], proxy_md[qcd_mask], args, weights=qcd_weights,
-        latent_values=activations[qcd_mask])
+        latent_values=activations[qcd_mask],
+        ae_rank=(None if nuisance_cdf is None else nuisance_cdf[qcd_mask]))
     diagnostics["corr"] = corr
     return loss, diagnostics, n_qcd
 
@@ -444,6 +460,11 @@ parser.add_argument("--nuisance_bin_scope", default="all",
                     choices=["all", "qcd", "per_class", "per_label", "baseline_per_class"],
                     help="Events used to define AE-loss quantile bins. 'per_class' defines bins "
                          "separately inside each baseline class.")
+parser.add_argument("--critic_nuisance_cdf_scope", default="per_class",
+                    choices=["match_bins", "all", "qcd", "per_class", "per_label"],
+                    help="Reference population for the continuous AE-rank critic input. "
+                         "Per-class ranks pair with within-class shuffling while leaving "
+                         "the exact NURD weight bins global.")
 parser.add_argument("--baseline_labels", default="0,1,2,3", type=str,
                     help="Comma/space-separated background labels to target for all-baseline training/eval.")
 # Training
@@ -517,7 +538,7 @@ parser.add_argument("--critic_type",    default="continuous_density_ratio",
                     choices=["bin_pred", "density_ratio", "continuous_density_ratio"],
                     help="'density_ratio' uses binned shuffled-z; "
                          "'continuous_density_ratio' uses the weighted AE-loss CDF defined "
-                         "by --nuisance_bin_scope; "
+                         "by --critic_nuisance_cdf_scope; "
                          "'bin_pred' predicts nuisance bins directly.")
 parser.add_argument("--critic_bin_resolutions", default="50", type=str,
                     help="Comma-separated direct-critic bin heads. Every value must divide --n_bins.")
@@ -534,7 +555,7 @@ parser.add_argument("--critic_scope",   default="all",
                     help="Which events train/apply the nuisance critic. 'all' preserves old behavior; "
                          "'qcd' targets the ABCD closure background directly; 'baselines' targets "
                          "--baseline_labels.")
-parser.add_argument("--critic_shuffle", default="global",
+parser.add_argument("--critic_shuffle", default="within_label",
                     choices=["within_label", "global"],
                     help="For density-ratio critics, shuffle nuisance bins within labels to test "
                          "r ⟂ z conditional on class instead of learning class/nuisance priors.")
@@ -549,6 +570,15 @@ parser.add_argument("--critic_lr_multiplier",     default=10.0,  type=float,
                     help="LR multiplier for the critic optimizer relative to main model LR")
 parser.add_argument("--n_critic_steps_per_batch", default=2,     type=int,
                     help="Number of gradient steps to take on the critic per selected batch")
+parser.add_argument("--qcd_physical_critic", default=1, type=int,
+                    help="Train a second continuous critic on physically weighted QCD to "
+                         "enforce latent independence in the closure measure.")
+parser.add_argument("--qcd_critic_lambda", default=0.20, type=float,
+                    help="Encoder penalty for the physical-QCD independence critic.")
+parser.add_argument("--qcd_critic_warmup_epochs", default=7, type=int)
+parser.add_argument("--qcd_critic_ramp_epochs", default=10, type=int)
+parser.add_argument("--qcd_critic_steps_per_batch", default=3, type=int)
+parser.add_argument("--qcd_critic_lr_multiplier", default=10.0, type=float)
 parser.add_argument("--closure_weight",       default=1.0,   type=float,
                     help="Weight on closure regularization (0 = disabled).")
 parser.add_argument("--closure_scope", default="qcd",
@@ -595,6 +625,13 @@ parser.add_argument("--closure_profile_weight", default=0.5, type=float,
                     help="Internal weight for profile-flatness component of dcorr_profile closure loss.")
 parser.add_argument("--closure_reverse_profile_weight", default=0.5, type=float,
                     help="Internal weight for reverse profile-flatness, AE mean versus MD quantile bins.")
+parser.add_argument("--closure_cdf_weight", default=2.0, type=float,
+                    help="Weight on full conditional raw-MD CDF matching across AE-rank slices.")
+parser.add_argument("--closure_cdf_bins", default=10, type=int,
+                    help="Number of weighted AE-rank slices used by conditional CDF matching.")
+parser.add_argument("--closure_cdf_quantiles",
+                    default="0.10,0.25,0.50,0.75,0.90,0.95", type=str,
+                    help="Raw-MD quantiles whose survival probabilities must match across AE slices.")
 parser.add_argument("--closure_profile_bins", default=8, type=int,
                     help="Number of AE quantile bins for profile-flatness closure loss.")
 parser.add_argument("--closure_profile_tail_weight", default=2.0, type=float,
@@ -654,6 +691,18 @@ parser.add_argument("--md_ema_eps", default=1e-5, type=float,
                     help="Diagonal regularization for epoch-frozen covariance whitening.")
 parser.add_argument("--md_proxy_shrinkage", default=0.05, type=float,
                     help="Diagonal shrinkage for the epoch-frozen training MD reference.")
+parser.add_argument("--md_reference_max_events", default=50000, type=int,
+                    help="Maximum fixed training-QCD events used to refresh the raw-MD reference.")
+parser.add_argument("--md_reference_batch_size", default=1024, type=int,
+                    help="No-gradient batch size for refreshing the training-QCD MD reference.")
+parser.add_argument("--md_reference_refresh_epochs", default=1, type=int,
+                    help="Refresh the frozen training-QCD MD reference every N epochs.")
+parser.add_argument("--auditor_interval", default=20, type=int,
+                    help="Run a fresh nonlinear QCD latent auditor every N epochs; 0 disables it.")
+parser.add_argument("--auditor_max_events", default=30000, type=int,
+                    help="Maximum validation-QCD events used by a periodic auditor.")
+parser.add_argument("--auditor_bins", default=10, type=int)
+parser.add_argument("--auditor_max_iter", default=50, type=int)
 parser.add_argument("--no_mi_norm",           action="store_true",
                     help="Skip per-batch normalization of MI penalty (divide by batch mean). "
                          "Without this, lambda is effectively rescaled by ~1/raw_mi, making "
@@ -666,6 +715,7 @@ print(f"Unknown args: {unknown}")
 args.baseline_labels_values = parse_int_list(args.baseline_labels)
 args.critic_bin_resolutions_values = parse_int_list(args.critic_bin_resolutions)
 args.closure_tail_quantiles_values = parse_float_list(args.closure_tail_quantiles)
+args.closure_cdf_quantiles_values = parse_float_list(args.closure_cdf_quantiles)
 args.val_abcd_quantiles_values = parse_float_list(args.val_abcd_quantiles)
 if not args.baseline_labels_values:
     raise ValueError("--baseline_labels must contain at least one integer label.")
@@ -681,6 +731,24 @@ if args.qcd_batch_fraction != 0.0 and not 0.0 < args.qcd_batch_fraction < 1.0:
 if args.training_measure == "class_balanced_physical" and args.qcd_batch_fraction != 0.0:
     raise ValueError(
         "--qcd_batch_fraction cannot be combined with class-balanced physical sampling.")
+if args.qcd_physical_critic not in {0, 1}:
+    raise ValueError("--qcd_physical_critic must be 0 or 1.")
+if args.qcd_critic_lambda < 0.0:
+    raise ValueError("--qcd_critic_lambda must be non-negative.")
+if args.qcd_critic_steps_per_batch < 1:
+    raise ValueError("--qcd_critic_steps_per_batch must be positive.")
+if args.closure_cdf_bins < 2:
+    raise ValueError("--closure_cdf_bins must be at least 2.")
+if not args.closure_cdf_quantiles_values:
+    raise ValueError("--closure_cdf_quantiles must contain at least one quantile.")
+if args.md_reference_max_events < 2:
+    raise ValueError("--md_reference_max_events must be at least 2.")
+if args.md_reference_batch_size < 1 or args.md_reference_refresh_epochs < 1:
+    raise ValueError("MD reference batch size and refresh interval must be positive.")
+if args.auditor_interval < 0 or args.auditor_max_events < 100:
+    raise ValueError("Auditor interval must be non-negative and max events at least 100.")
+if args.auditor_bins < 2 or args.auditor_max_iter < 1:
+    raise ValueError("Auditor bins and max iterations must be positive.")
 if args.closure_scope != "qcd" or args.closure_score_mode != "own_class":
     raise ValueError(
         "The staged QCD-closure campaign requires --closure_scope qcd "
@@ -787,6 +855,18 @@ def get_effective_lambda(epoch):
         return 0.0
     ramp_progress = min(1.0, (epoch - args.critic_warmup_epochs) / max(args.critic_ramp_epochs, 1))
     return args._lambda * (1 - math.cos(math.pi * ramp_progress)) / 2
+
+
+def get_effective_qcd_critic_lambda(epoch):
+    """Ramp the physical-QCD adversary independently of the NURD critic."""
+    if not args.qcd_physical_critic or epoch < args.qcd_critic_warmup_epochs:
+        return 0.0
+    progress = min(
+        1.0,
+        (epoch - args.qcd_critic_warmup_epochs)
+        / max(args.qcd_critic_ramp_epochs, 1),
+    )
+    return args.qcd_critic_lambda * (1 - math.cos(math.pi * progress)) / 2
 
 
 def cosine_schedule(epoch, start, end, ramp_epochs):
@@ -1155,7 +1235,8 @@ def validate_critic(val_loader, critic_model, model, critic_criterion, epoch, lo
 contrastive_loss_fn = SupConLoss(temperature=args.contrast_temp)
 
 def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
-          reweight_args, joint_indep_args, effective_lambda=None,
+          reweight_args, joint_indep_args, qcd_indep_args=None,
+          effective_lambda=None, effective_qcd_lambda=0.0,
           effective_contrast_weight=None, effective_closure_weight=None,
           md_proxy=None, anchor_parameters=None, effective_anchor_weight=0.0):
     batch_time = AverageMeter()
@@ -1172,6 +1253,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
     closure_latent_dcorr_m = AverageMeter()
     closure_profile_m = AverageMeter()
     closure_profile_reverse_m = AverageMeter()
+    closure_conditional_cdf_m = AverageMeter()
     closure_copula_m = AverageMeter()
     mi_m = AverageMeter()  # weighted encoder-side independence penalty
     raw_mi_m = AverageMeter()  # unweighted encoder-side independence penalty
@@ -1180,6 +1262,9 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
     critic_prior_kl_m = AverageMeter()  # KL(prior || predicted nuisance distribution)
     critic_acc_m = AverageMeter()  # nuisance-bin accuracy of the current critic
     critic_qcd_acc_m = AverageMeter()  # same, restricted to QCD when available
+    qcd_physical_critic_acc_m = AverageMeter()
+    qcd_physical_critic_ce_m = AverageMeter()
+    qcd_physical_penalty_m = AverageMeter()
     critic_scope_frac_m = AverageMeter()
     closure_proxy_corr_m = AverageMeter()
     closure_classes_m = AverageMeter()
@@ -1205,6 +1290,11 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
             exact_weights, gen_weights, targets, reweight_args,
             sampled_measure=reweight_args.get(
                 "sampler_represents_measure", False))
+        physical_weights = (
+            torch.ones_like(gen_weights)
+            if reweight_args.get("sampler_represents_measure", False)
+            else gen_weights
+        )
 
         # ── joint independence: one critic gradient step on this batch (interleaved) ─
         # elif joint_indep_args["joint_indep"] and joint_indep_args.get("critic_schedule") == "interleaved":
@@ -1291,6 +1381,32 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                         joint_indep_args["critic_optimizer"].step()
                 joint_indep_args["critic_model"] = freeze_model(joint_indep_args["critic_model"])
                 joint_indep_args["critic_model"].eval()
+
+        if qcd_indep_args and qcd_indep_args["joint_indep"]:
+            qcd_mask = critic_scope_mask(targets, qcd_indep_args)
+            if int(qcd_mask.sum().item()) > 1:
+                qcd_indep_args["critic_model"] = unfreeze_model(
+                    qcd_indep_args["critic_model"])
+                qcd_indep_args["critic_model"].train()
+                qcd_activations = activations.detach()[qcd_mask]
+                qcd_targets = targets[qcd_mask]
+                qcd_nuisance = nuisance_cdf[qcd_mask]
+                qcd_weights = physical_weights[qcd_mask]
+                for _ in range(qcd_indep_args["n_critic_steps_per_batch"]):
+                    qcd_outputs, qcd_targets_binary, qcd_losses, _ = (
+                        compute_critic_loss_from_activations(
+                            qcd_activations, qcd_targets, qcd_nuisance,
+                            qcd_indep_args["critic_model"],
+                            qcd_indep_args["critic_criterion"],
+                            qcd_indep_args, sample_weights=qcd_weights))
+                    qcd_critic_loss = _apply_critic_weights(
+                        qcd_losses, qcd_weights, qcd_indep_args)
+                    qcd_indep_args["critic_optimizer"].zero_grad()
+                    qcd_critic_loss.backward()
+                    qcd_indep_args["critic_optimizer"].step()
+                qcd_indep_args["critic_model"] = freeze_model(
+                    qcd_indep_args["critic_model"])
+                qcd_indep_args["critic_model"].eval()
 
         acc, loss, top1 = record_metrics(acc, loss, top1, inputs, outputs, targets, losses_ce)
 
@@ -1392,6 +1508,39 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                         ).sum() / critic_weights_c.sum().clamp(min=1e-8)
                     info_loss_val = raw_mi_val
 
+        qcd_physical_penalty = activations.sum() * 0.0
+        if qcd_indep_args and qcd_indep_args["joint_indep"]:
+            qcd_mask = critic_scope_mask(targets, qcd_indep_args)
+            if int(qcd_mask.sum().item()) > 1:
+                qcd_weights = physical_weights[qcd_mask]
+                with (
+                    torch.enable_grad()
+                    if effective_qcd_lambda > 0.0 else torch.no_grad()
+                ):
+                    qcd_outputs, qcd_binary_targets, qcd_losses, qcd_mi_proxy = (
+                        compute_critic_loss_from_activations(
+                            (activations[qcd_mask]
+                             if effective_qcd_lambda > 0.0
+                             else activations.detach()[qcd_mask]),
+                            targets[qcd_mask], nuisance_cdf[qcd_mask],
+                            qcd_indep_args["critic_model"],
+                            qcd_indep_args["critic_criterion"],
+                            qcd_indep_args, sample_weights=qcd_weights))
+                qcd_ce = _apply_critic_weights(
+                    qcd_losses, qcd_weights, qcd_indep_args)
+                qcd_physical_penalty = (
+                    qcd_mi_proxy * qcd_weights
+                ).sum() / qcd_weights.sum().clamp(min=1e-8)
+                qcd_physical_critic_ce_m.update(
+                    qcd_ce.item(), int(qcd_mask.sum().item()))
+                qcd_physical_critic_acc_m.update(
+                    _critic_accuracy(
+                        qcd_outputs, qcd_binary_targets, qcd_weights),
+                    int(qcd_mask.sum().item()))
+                qcd_physical_penalty_m.update(
+                    qcd_physical_penalty.detach().item(),
+                    int(qcd_mask.sum().item()))
+
         #nurd reweighting
         rw_acc, rw_loss = record_rw_metrics(rw_acc, rw_loss, inputs, outputs, targets, losses_ce, weights)
         loss_nurd = (losses_ce * weights).sum() / weights.sum()
@@ -1406,6 +1555,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
             + contrast_w * loss_con
             + (lam * critic_penalty_loss if joint_indep_args["joint_indep"]
                else 0.0)
+            + effective_qcd_lambda * qcd_physical_penalty
         )
 
         # The model still learns every background through CE and SupCon. Closure
@@ -1417,9 +1567,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
         if closure_w > 0.0 and args.closure_loss_type != "none":
             loss_closure, closure_diag, n_closure = compute_qcd_closure_loss(
                 activations, targets, ae_reco,
-                (torch.ones_like(gen_weights)
-                 if reweight_args.get("sampler_represents_measure")
-                 else gen_weights), args,
+                physical_weights, args, nuisance_cdf=nuisance_cdf,
                 md_proxy=md_proxy,
                 update=args.md_proxy_type == "ema")
             if n_closure > 0:
@@ -1436,6 +1584,9 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                 if closure_diag.get("profile_reverse") is not None:
                     closure_profile_reverse_m.update(
                         closure_diag["profile_reverse"], n_closure)
+                if closure_diag.get("conditional_cdf") is not None:
+                    closure_conditional_cdf_m.update(
+                        closure_diag["conditional_cdf"], n_closure)
                 if closure_diag.get("copula_grid") is not None:
                     closure_copula_m.update(
                         closure_diag["copula_grid"], n_closure)
@@ -1478,13 +1629,17 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
     log.debug(f"  total={total_m.avg:.5f}  nurd={nurd_m.avg:.5f}  "
               f"con={con_m.avg:.5f}  closure={closure_m.avg:.5f}  "
               f"latent_dcorr={closure_latent_dcorr_m.avg:.5f}  "
+              f"conditional_cdf={closure_conditional_cdf_m.avg:.5f}  "
               f"copula={closure_copula_m.avg:.5f}  "
               f"mi={mi_m.avg:.5f}  raw_mi={raw_mi_m.avg:.5f}  "
               f"crit_acc={critic_acc_m.avg:.3f}  qcd_crit_acc={critic_qcd_acc_m.avg:.3f}  "
+              f"qcd_phys_crit_acc={qcd_physical_critic_acc_m.avg:.3f}  "
+              f"qcd_phys_penalty={qcd_physical_penalty_m.avg:.5f}  "
               f"closure_proxy_r={closure_proxy_corr_m.avg:.3f}  "
               f"closure_classes={closure_classes_m.avg:.1f}  "
               f"anchor={anchor_m.avg:.6f}  "
               f"w_cv={weight_cv_m.avg:.3f}  w_ess={weight_ess_m.avg:.3f}  "
+              f"qcd_lam={effective_qcd_lambda:.3f}  "
               f"cw={contrast_w:.3f}  clw={closure_w:.3f}  lr={current_lr:.2e}")
     if not args.local_testing:
         wandb.log({
@@ -1496,6 +1651,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
             "Train/closure_latent_dcorr": closure_latent_dcorr_m.avg,
             "Train/closure_profile":  closure_profile_m.avg,
             "Train/closure_profile_reverse": closure_profile_reverse_m.avg,
+            "Train/closure_conditional_cdf": closure_conditional_cdf_m.avg,
             "Train/closure_copula_grid": closure_copula_m.avg,
             "Train/mi_penalty":       mi_m.avg,
             "Train/raw_mi_penalty":   raw_mi_m.avg,
@@ -1505,6 +1661,9 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
             "Train/critic_acc":       critic_acc_m.avg,
             "Train/critic_qcd_acc":   critic_qcd_acc_m.avg,
             "Train/critic_scope_frac": critic_scope_frac_m.avg,
+            "Train/qcd_physical_critic_acc": qcd_physical_critic_acc_m.avg,
+            "Train/qcd_physical_critic_ce": qcd_physical_critic_ce_m.avg,
+            "Train/qcd_physical_critic_penalty": qcd_physical_penalty_m.avg,
             "Train/closure_proxy_pearson": closure_proxy_corr_m.avg,
             "Train/closure_classes":   closure_classes_m.avg,
             "Train/anchor_loss":       anchor_m.avg,
@@ -1516,6 +1675,7 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
             "Train/prec1":            top1.avg,
             "LR":                     current_lr,
             "Train/effective_lambda": effective_lambda if effective_lambda is not None else args._lambda,
+            "Train/effective_qcd_critic_lambda": effective_qcd_lambda,
             "Train/effective_contrast_weight": contrast_w,
             "Train/effective_closure_weight": closure_w,
         }, step=epoch)
@@ -1530,6 +1690,7 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
     critic_acc_m = AverageMeter()
     critic_ce_m = AverageMeter()
     qcd_x_chunks = []
+    qcd_rank_chunks = []
     qcd_latent_chunks = []
     qcd_weight_chunks = []
     class_correct_mass = {}
@@ -1595,6 +1756,8 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
             if qcd_mask.sum() >= args.closure_class_min_events:
                 x_log = torch.log(ae_reco[qcd_mask].float().clamp(min=1e-8))
                 qcd_x_chunks.append(x_log.cpu().numpy())
+                qcd_rank_chunks.append(
+                    nuisance_cdf[qcd_mask].float().cpu().numpy())
                 qcd_latent_chunks.append(
                     activations[qcd_mask].float().cpu().numpy())
                 qcd_weight_chunks.append(
@@ -1607,10 +1770,16 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
         qcd_x = np.concatenate(qcd_x_chunks)
         qcd_latents = np.concatenate(qcd_latent_chunks)
         qcd_weights = np.concatenate(qcd_weight_chunks)
-        qcd_md = cross_fitted_mahalanobis(
-            qcd_latents, n_splits=args.val_md_folds,
-            seed=args.manualSeed, sample_weights=qcd_weights,
-            shrinkage=args.md_proxy_shrinkage)
+        if md_proxy is not None and md_proxy.ready:
+            qcd_md = md_proxy.score(
+                torch.from_numpy(qcd_latents)).detach().cpu().numpy()
+            val_abcd_selection_mode = "frozen_training_qcd_reference_grid"
+        else:
+            qcd_md = cross_fitted_mahalanobis(
+                qcd_latents, n_splits=args.val_md_folds,
+                seed=args.manualSeed, sample_weights=qcd_weights,
+                shrinkage=args.md_proxy_shrinkage)
+            val_abcd_selection_mode = "cross_fitted_qcd_md_grid"
         qcd_y = np.log1p(np.clip(qcd_md, 0.0, None))
         valid = np.isfinite(qcd_x) & np.isfinite(qcd_y)
         if valid.sum() >= 3:
@@ -1626,12 +1795,46 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
             weights=qcd_weights[valid],
             min_effective_count=args.val_abcd_min_effective_events,
             max_ratio_unc=args.val_abcd_max_ratio_unc)
-        if md_proxy is not None and args.md_proxy_type == "epoch":
-            md_proxy.replace_reference(
-                torch.from_numpy(qcd_latents),
-                torch.from_numpy(qcd_weights))
-    val_abcd["selection_mode"] = "cross_fitted_qcd_md_grid"
-    val_abcd["md_folds"] = int(args.val_md_folds)
+    val_abcd["selection_mode"] = (
+        val_abcd_selection_mode
+        if qcd_x_chunks else "unavailable")
+    val_abcd["md_folds"] = (
+        0 if val_abcd["selection_mode"] == "frozen_training_qcd_reference_grid"
+        else int(args.val_md_folds))
+    val_auditor = None
+    completed_epoch = int(epoch + 1)
+    audit_now = (
+        args.auditor_interval > 0
+        and (
+            completed_epoch % args.auditor_interval == 0
+            or completed_epoch in {
+                int(args.representation_epochs), int(args.epochs)}
+        )
+        and bool(qcd_latent_chunks)
+    )
+    if audit_now:
+        qcd_rank = np.concatenate(qcd_rank_chunks)
+        rng = np.random.default_rng(args.manualSeed + completed_epoch)
+        selected = rng.permutation(len(qcd_rank))[
+            :min(len(qcd_rank), args.auditor_max_events)]
+        midpoint = len(selected) // 2
+        if midpoint >= args.auditor_bins * 2:
+            train_idx, test_idx = selected[:midpoint], selected[midpoint:]
+            val_auditor = nuisance_auditor(
+                qcd_latents[train_idx], qcd_rank[train_idx],
+                qcd_latents[test_idx], qcd_rank[test_idx],
+                np.linspace(0.0, 1.0, args.auditor_bins + 1),
+                seed=args.manualSeed + completed_epoch,
+                train_weights=qcd_weights[train_idx],
+                test_weights=qcd_weights[test_idx],
+                max_iter=args.auditor_max_iter)
+            log.debug(
+                "  frozen_qcd_auditor: "
+                f"auc={val_auditor['macro_ovr_auc']:.4f} "
+                f"acc={val_auditor['accuracy']:.4f} "
+                f"majority={val_auditor['majority_accuracy']:.4f} "
+                f"ce={val_auditor['cross_entropy']:.4f} "
+                f"prior_ce={val_auditor['prior_cross_entropy']:.4f}")
     per_class_acc = {
         label: class_correct_mass[label] / max(class_total_mass[label], 1e-12)
         for label in sorted(class_total_mass)
@@ -1676,10 +1879,47 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
                 "median_ratio_unc", float("nan")),
             "Val/critic_acc": critic_acc_m.avg,
             "Val/critic_ce": critic_ce_m.avg,
+            "Val/frozen_qcd_auditor_auc": (
+                float("nan") if val_auditor is None
+                else val_auditor["macro_ovr_auc"]),
+            "Val/frozen_qcd_auditor_ce": (
+                float("nan") if val_auditor is None
+                else val_auditor["cross_entropy"]),
         }, step=epoch)
     return_loss = rw_loss.avg if reweight_args["reweight"] else loss.avg
     return (return_loss, acc.avg, rw_acc.avg, val_balanced_acc,
             val_min_class_acc, per_class_acc, val_qcd_corr, val_abcd)
+
+
+def refresh_training_qcd_reference(model, reference_loader, md_proxy, log):
+    """Fit the frozen raw-MD reference using only a fixed training-QCD subset."""
+    if md_proxy is None or reference_loader is None:
+        return 0
+    was_training = model.training
+    model.eval()
+    latent_chunks = []
+    weight_chunks = []
+    with torch.no_grad():
+        for (inputs, targets, _nuisances, _nuisance_cdf, _ae_reco,
+             _exact_weights, gen_weights) in reference_loader:
+            qcd_mask = targets.long() == int(args.qcd_label)
+            if not qcd_mask.any():
+                continue
+            activations, _ = model(inputs[qcd_mask].to(device))
+            latent_chunks.append(activations.float().cpu())
+            weight_chunks.append(gen_weights[qcd_mask].float().cpu())
+    if was_training:
+        model.train()
+    if not latent_chunks:
+        raise RuntimeError("The training-QCD MD reference loader is empty.")
+    latents = torch.cat(latent_chunks)
+    weights = torch.cat(weight_chunks)
+    if not md_proxy.replace_reference(latents, weights):
+        raise RuntimeError("Failed to fit the training-QCD MD reference.")
+    log.debug(
+        f"Refreshed frozen training-QCD MD reference: n={latents.size(0)} "
+        f"weight_sum={weights.sum().item():.3f}")
+    return int(latents.size(0))
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -1729,6 +1969,7 @@ def main():
         ae_scaler=ae_scaler,
         max_weight_ratio=args.max_weight_ratio,
         nuisance_bin_scope=args.nuisance_bin_scope,
+        critic_nuisance_cdf_scope=args.critic_nuisance_cdf_scope,
         qcd_label=args.qcd_label,
         baseline_labels=args.baseline_labels_values,
         gen_weight_path=args.gen_weights,
@@ -1782,6 +2023,30 @@ def main():
             drop_last=True, **kwargs)
     val_loader   = DataLoader(val_dataset,   batch_size=args.batch_size, shuffle=False,
                               drop_last=False, **kwargs)
+    qcd_reference_positions = torch.nonzero(
+        train_dataset.labels.long() == int(args.qcd_label),
+        as_tuple=False).view(-1)
+    if qcd_reference_positions.numel() < 2:
+        raise RuntimeError(
+            f"Training split has fewer than two QCD label={args.qcd_label} events.")
+    reference_generator = torch.Generator()
+    reference_generator.manual_seed(args.manualSeed + 1701)
+    reference_order = torch.randperm(
+        qcd_reference_positions.numel(), generator=reference_generator)
+    reference_count = min(
+        int(args.md_reference_max_events),
+        int(qcd_reference_positions.numel()))
+    qcd_reference_subset = Subset(
+        train_dataset,
+        qcd_reference_positions[reference_order[:reference_count]].tolist())
+    qcd_reference_loader = DataLoader(
+        qcd_reference_subset,
+        batch_size=args.md_reference_batch_size,
+        shuffle=False, drop_last=False,
+        pin_memory=False, num_workers=0)
+    log.debug(
+        "Training-only QCD MD reference: "
+        f"n={reference_count} refresh_every={args.md_reference_refresh_epochs} epochs")
 
     #nuisance prior is marginal probability of each bin (used to normalize critic loss)
     label_prior    = train_dataset.get_label_prior()
@@ -1828,6 +2093,17 @@ def main():
     if critic_model is not None:
         critic_model = freeze_model(critic_model)
         critic_model.eval()
+    qcd_critic_model = (
+        HLTCritic(
+            args.latent_dim, num_classes, args.n_bins,
+            critic_type="continuous_density_ratio",
+            bin_resolutions=[args.n_bins],
+        ).to(device)
+        if args.qcd_physical_critic else None
+    )
+    if qcd_critic_model is not None:
+        qcd_critic_model = freeze_model(qcd_critic_model)
+        qcd_critic_model.eval()
 
     reweight_args = {
         "reweight":      args.reweight,
@@ -1879,6 +2155,29 @@ def main():
                              else None),
         "n_critic_steps_per_batch": args.n_critic_steps_per_batch,
     }
+    qcd_indep_args = None
+    if qcd_critic_model is not None:
+        qcd_indep_args = {
+            "joint_indep": 1,
+            "critic_model": qcd_critic_model,
+            "marginal_indep": 0,
+            "critic_type": "continuous_density_ratio",
+            "critic_penalty_type": "ratio_to_one",
+            "critic_scope": "qcd",
+            "critic_shuffle": "within_label",
+            "qcd_label": args.qcd_label,
+            "baseline_labels": args.baseline_labels_values,
+            "n_bins": args.n_bins,
+            "critic_bin_resolutions": [args.n_bins],
+            "critic_chance_ce": math.log(2),
+            "critic_criterion": nn.CrossEntropyLoss(
+                reduction="none").to(device),
+            "critic_optimizer": torch.optim.Adam(
+                qcd_critic_model.parameters(),
+                lr=args.lr * args.qcd_critic_lr_multiplier,
+                weight_decay=args.weight_decay),
+            "n_critic_steps_per_batch": args.qcd_critic_steps_per_batch,
+        }
 
     cudnn.benchmark = True
     md_proxy = RunningQCDMDProxy(
@@ -1897,6 +2196,9 @@ def main():
             "state_dict_model": model.state_dict(),
             "state_dict_critic": (
                 None if critic_model is None else critic_model.state_dict()),
+            "state_dict_qcd_physical_critic": (
+                None if qcd_critic_model is None
+                else qcd_critic_model.state_dict()),
             "ae_scaler": obj_scaler,
             "config": vars(args),
             "nuisance_bin_edges": train_dataset.bin_edges,
@@ -1920,6 +2222,11 @@ def main():
         }
     abcd_score_history = deque(
         maxlen=max(1, args.abcd_ckpt_smoothing_epochs))
+    if md_proxy is not None and args.md_proxy_type == "epoch":
+        # Bootstrap epoch 0. Subsequent refreshes happen after each training
+        # epoch so validation and checkpoint selection score the current model.
+        refresh_training_qcd_reference(
+            model, qcd_reference_loader, md_proxy, log)
     for epoch in range(args.epochs):
         is_finetune = epoch >= args.representation_epochs
         stage_name = (
@@ -1959,16 +2266,25 @@ def main():
 
         #ramp lambda
         effective_lambda = get_effective_lambda(epoch) if args.critic_schedule == "warmup" else None
+        effective_qcd_lambda = get_effective_qcd_critic_lambda(epoch)
         effective_contrast_weight = get_effective_contrast_weight(epoch)
         effective_closure_weight = get_effective_closure_weight(epoch)
 
         #all the critic logic here (loss computation, weight updates)
         train(model, train_loader, val_loader, criterion, optimizer,
               epoch + args.reweight_epochs, log, reweight_args, joint_indep_args,
-              effective_lambda, effective_contrast_weight, effective_closure_weight,
+              qcd_indep_args, effective_lambda, effective_qcd_lambda,
+              effective_contrast_weight, effective_closure_weight,
               md_proxy, anchor_parameters=anchor_parameters,
               effective_anchor_weight=(
                   args.finetune_anchor_weight if is_finetune else 0.0))
+        if (
+            md_proxy is not None
+            and args.md_proxy_type == "epoch"
+            and (epoch + 1) % args.md_reference_refresh_epochs == 0
+        ):
+            refresh_training_qcd_reference(
+                model, qcd_reference_loader, md_proxy, log)
         #runs model on validation set with no gradient updates (just forward passes)
         (val_loss, val_acc, val_rw_acc, val_balanced_acc,
          val_min_class_acc, val_per_class_acc, val_qcd_corr, val_abcd) = validate(
@@ -2027,14 +2343,14 @@ def main():
                 and (best_abcd_score is None
                      or val_abcd_score < best_abcd_score)
             ):
-                # Save the exact epoch whose cross-fitted score improved. The old
+                # Save the exact epoch whose raw frozen-reference score improved. The old
                 # rolling-median decision could attach a good historical median
                 # to a worse current model state.
                 best_abcd_score = float(val_abcd_score)
                 state = checkpoint_state(epoch)
                 state.update({
                     "selection_metric": (
-                        "cross_fitted_weighted_val_qcd_md_grid_score"),
+                        "frozen_training_reference_weighted_val_raw_qcd_md_grid_score"),
                     "selection_value": float(val_abcd_score),
                     "selection_raw_value": float(val_abcd_score),
                     "selection_rolling_median": float(smoothed_abcd_score),
