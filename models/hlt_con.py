@@ -8,7 +8,6 @@ We return:      activations = encoder latent  [B, latent_dim]
 The contrastive loss (InfoNCE / SupCon) is computed outside using
 model.get_embeddings(activations).
 """
-from typing import Union
 import math
 import torch
 import torch.nn as nn
@@ -209,14 +208,28 @@ class HLTContrastiveModel(nn.Module):
 class HLTCritic(nn.Module):
     """
     Two modes:
-      bin_pred             : predicts nuisance bin from (latent, y) — [B, n_bins]
+      bin_pred             : predicts nuisance bins from (latent, y). When
+                             bin_resolutions contains multiple values, returns
+                             one head per resolution.
       density_ratio         : classifies real vs shuffled-z from (latent, y, z) — [B, 2]
                               matches gabhijith's original density-ratio trick
     """
     def __init__(self, latent_dim: int, num_classes: int, n_bins: int,
-                 hidden: int = 128, critic_type: str = "bin_pred"):
+                 hidden: int = 128, critic_type: str = "bin_pred",
+                 bin_resolutions=None):
         super().__init__()
         self.critic_type  = critic_type
+        self.n_bins = int(n_bins)
+        self.bin_resolutions = sorted(set(
+            int(value) for value in (bin_resolutions or [n_bins])
+        ))
+        if not self.bin_resolutions or self.bin_resolutions[-1] != self.n_bins:
+            raise ValueError(
+                "bin_resolutions must include n_bins as the finest head.")
+        if any(value < 2 or self.n_bins % value != 0
+               for value in self.bin_resolutions):
+            raise ValueError(
+                "Every critic bin resolution must divide n_bins exactly.")
         self.label_embed  = nn.Embedding(num_classes, 16)
         if critic_type == "density_ratio":
             self.z_embed = nn.Embedding(n_bins, 8)
@@ -226,11 +239,14 @@ class HLTCritic(nn.Module):
                 nn.Linear(hidden, 2),                    # binary: real=1 / shuffled=0
             )
         else:
-            self.net = nn.Sequential(
+            self.trunk = nn.Sequential(
                 nn.Linear(latent_dim + 16, hidden), nn.ReLU(),
                 nn.Linear(hidden, hidden),          nn.ReLU(),
-                nn.Linear(hidden, n_bins),
             )
+            self.heads = nn.ModuleDict({
+                str(resolution): nn.Linear(hidden, resolution)
+                for resolution in self.bin_resolutions
+            })
 
     def forward(self, rx: torch.Tensor, y: torch.Tensor,
                 z: torch.Tensor = None) -> torch.Tensor:
@@ -238,4 +254,11 @@ class HLTCritic(nn.Module):
         if self.critic_type == "density_ratio":
             z_emb = self.z_embed(z.long())                     # [B, 8]
             return self.net(torch.cat([rx, y_emb, z_emb], dim=1))
-        return self.net(torch.cat([rx, y_emb], dim=1))
+        hidden = self.trunk(torch.cat([rx, y_emb], dim=1))
+        outputs = {
+            resolution: self.heads[str(resolution)](hidden)
+            for resolution in self.bin_resolutions
+        }
+        if len(outputs) == 1:
+            return outputs[self.bin_resolutions[0]]
+        return outputs

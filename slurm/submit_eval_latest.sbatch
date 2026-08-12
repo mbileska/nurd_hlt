@@ -17,7 +17,12 @@ set -u
 
 BASE="${BASE:-/scratch/gpfs/IOJALVO/mb7126/nurd_hlt}"
 CODE_DIR="${CODE_DIR:-/home/mb7126/nurd_hlt}"
-TEST_PT="${TEST_PT:-$BASE/data/hlt_smcocktail_test.pt}"
+MEQUINNA_DIR="${MEQUINNA_DIR:-$BASE/data/mequinna_1M_noZB}"
+TEST_PT="${TEST_PT:-$MEQUINNA_DIR/hlt_smcocktail_mequinna_test.pt}"
+REFERENCE_PT="${REFERENCE_PT:-$MEQUINNA_DIR/hlt_smcocktail_mequinna_train.pt}"
+TEST_WEIGHTS="${TEST_WEIGHTS:-$MEQUINNA_DIR/weight_test.pt}"
+REFERENCE_WEIGHTS="${REFERENCE_WEIGHTS:-$MEQUINNA_DIR/weight_train.pt}"
+SIGNAL_WEIGHTS="${SIGNAL_WEIGHTS:-}"
 SIGNAL_PT="${SIGNAL_PT:-$BASE/data/hlt_signal_TpTp.pt}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-256}"
 AE_BATCH_SIZE="${AE_BATCH_SIZE:-4096}"
@@ -26,11 +31,24 @@ CORR_SAMPLE_SIZE="${CORR_SAMPLE_SIZE:-50000}"
 DCOR_SAMPLE_SIZE="${DCOR_SAMPLE_SIZE:-2000}"
 CLOSURE_HOLDOUT_FRAC="${CLOSURE_HOLDOUT_FRAC:-0.5}"
 CLOSURE_SPLIT_SEED="${CLOSURE_SPLIT_SEED:-42}"
-NURD_GLOB="${NURD_GLOB:-hlt_nurd_closure_bs4096_*}"
-WANDB_NAME_PREFIX="${WANDB_NAME_PREFIX:-optimized}"
+NURD_GLOB="${NURD_GLOB:-hlt_nurd_closure_bs4096_qcd_weighted_v4_transfer_v11_*}"
+WANDB_NAME_PREFIX="${WANDB_NAME_PREFIX:-qcd_weighted_v4_transfer_v11_eval}"
 SYNC_WANDB="${SYNC_WANDB:-0}"
-PREFER_ABCD_CKPT="${PREFER_ABCD_CKPT:-0}"
+PREFER_ABCD_CKPT="${PREFER_ABCD_CKPT:-1}"
 PREFER_CLOSURE_CKPT="${PREFER_CLOSURE_CKPT:-0}"
+BASELINE_LABELS="${BASELINE_LABELS:-0,1,2,3}"
+ABCD_SCOPE="${ABCD_SCOPE:-qcd}"
+SCORE_MODE="${SCORE_MODE:-qcd_md}"
+MIN_MD="${MIN_MD:-0}"
+MIN_A="${MIN_A:-50}"
+MIN_A_FRAC="${MIN_A_FRAC:-0.10}"
+MIN_D="${MIN_D:-500}"
+MIN_REGION_FRAC="${MIN_REGION_FRAC:-0.01}"
+MAX_RATIO_UNC="${MAX_RATIO_UNC:-0.15}"
+SELECTION_FOLDS="${SELECTION_FOLDS:-5}"
+SELECTION_STAT_WEIGHT="${SELECTION_STAT_WEIGHT:-0.5}"
+SELECTION_NEIGHBOR_WEIGHT="${SELECTION_NEIGHBOR_WEIGHT:-1.0}"
+SELECTION_NEIGHBOR_RADIUS="${SELECTION_NEIGHBOR_RADIUS:-1}"
 SCAN_PERCENT_MIN="${SCAN_PERCENT_MIN:-0.50}"
 SCAN_PERCENT_MAX="${SCAN_PERCENT_MAX:-0.98}"
 SCAN_PERCENT_STEPS="${SCAN_PERCENT_STEPS:-48}"
@@ -108,7 +126,8 @@ if [[ ! -f "$AE_CKPT" ]]; then
   exit 2
 fi
 
-SAFE_PREFIX="$(echo "$WANDB_NAME_PREFIX" | tr -c 'A-Za-z0-9_-' '_')"
+SAFE_PREFIX="$(printf '%s' "${WANDB_NAME_PREFIX}_${ABCD_SCOPE}_${SCORE_MODE}" \
+  | tr -c 'A-Za-z0-9_-' '_')"
 RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
 WANDB_RUN_NAME="${WANDB_RUN_NAME:-${SAFE_PREFIX}_${NURD_EXP}_ckpt_${CKPT_TAG}_abcd}"
 WANDB_RUN_ID="${WANDB_RUN_ID:-eval_${CKPT_TAG}_${RUN_STAMP}}"
@@ -118,10 +137,23 @@ if [[ ! -f "$TEST_PT" ]]; then
   echo "ERROR: test sample not found: $TEST_PT"
   exit 2
 fi
+if [[ ! -f "$REFERENCE_PT" ]]; then
+  echo "ERROR: training reference sample not found: $REFERENCE_PT"
+  exit 2
+fi
+if [[ ! -f "$TEST_WEIGHTS" || ! -f "$REFERENCE_WEIGHTS" ]]; then
+  echo "ERROR: generator-weight files are missing."
+  echo "TEST_WEIGHTS=$TEST_WEIGHTS"
+  echo "REFERENCE_WEIGHTS=$REFERENCE_WEIGHTS"
+  exit 2
+fi
 
 SIGNAL_ARGS=()
 if [[ -n "${SIGNAL_PT:-}" && -f "$SIGNAL_PT" ]]; then
   SIGNAL_ARGS=(--signal_pt "$SIGNAL_PT")
+  if [[ -n "$SIGNAL_WEIGHTS" && -f "$SIGNAL_WEIGHTS" ]]; then
+    SIGNAL_ARGS+=(--signal_weights "$SIGNAL_WEIGHTS")
+  fi
 fi
 
 EXTRA_ARGS=()
@@ -133,6 +165,9 @@ if [[ "${SKIP_PCA_MD_PLOTS:-0}" == "1" ]]; then
 fi
 if [[ "${SKIP_EMBEDDING_PCA:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--skip_embedding_pca)
+fi
+if [[ "${SKIP_NUISANCE_AUDITOR:-0}" == "1" ]]; then
+  EXTRA_ARGS+=(--skip_nuisance_auditor)
 fi
 if [[ -n "$CLOSURE_CURVE_XMIN" ]]; then
   EXTRA_ARGS+=(--closure_curve_xmin "$CLOSURE_CURVE_XMIN")
@@ -150,6 +185,9 @@ echo "CKPT: $CKPT"
 echo "NURD_EXP: $NURD_EXP"
 echo "CKPT_TAG: $CKPT_TAG"
 echo "TEST_PT: $TEST_PT"
+echo "REFERENCE_PT: $REFERENCE_PT"
+echo "TEST_WEIGHTS: $TEST_WEIGHTS"
+echo "REFERENCE_WEIGHTS: $REFERENCE_WEIGHTS"
 echo "SIGNAL_PT: ${SIGNAL_PT:-}"
 echo "EVAL_BATCH_SIZE: $EVAL_BATCH_SIZE"
 echo "AE_BATCH_SIZE: $AE_BATCH_SIZE"
@@ -158,6 +196,19 @@ echo "CORR_SAMPLE_SIZE: $CORR_SAMPLE_SIZE"
 echo "DCOR_SAMPLE_SIZE: $DCOR_SAMPLE_SIZE"
 echo "CLOSURE_HOLDOUT_FRAC: $CLOSURE_HOLDOUT_FRAC"
 echo "CLOSURE_SPLIT_SEED: $CLOSURE_SPLIT_SEED"
+echo "BASELINE_LABELS: $BASELINE_LABELS"
+echo "ABCD_SCOPE: $ABCD_SCOPE"
+echo "SCORE_MODE: $SCORE_MODE"
+echo "MIN_MD: $MIN_MD"
+echo "MIN_A: $MIN_A"
+echo "MIN_A_FRAC: $MIN_A_FRAC"
+echo "MIN_D: $MIN_D"
+echo "MIN_REGION_FRAC: $MIN_REGION_FRAC"
+echo "MAX_RATIO_UNC: $MAX_RATIO_UNC"
+echo "SELECTION_FOLDS: $SELECTION_FOLDS"
+echo "SELECTION_STAT_WEIGHT: $SELECTION_STAT_WEIGHT"
+echo "SELECTION_NEIGHBOR_WEIGHT: $SELECTION_NEIGHBOR_WEIGHT"
+echo "SELECTION_NEIGHBOR_RADIUS: $SELECTION_NEIGHBOR_RADIUS"
 echo "SCAN_PERCENT_MIN: $SCAN_PERCENT_MIN"
 echo "SCAN_PERCENT_MAX: $SCAN_PERCENT_MAX"
 echo "SCAN_PERCENT_STEPS: $SCAN_PERCENT_STEPS"
@@ -181,6 +232,9 @@ python eval_abcd_nurd.py \
   --ckpt "$CKPT" \
   --ae_ckpt "$AE_CKPT" \
   --test_pt "$TEST_PT" \
+  --test_weights "$TEST_WEIGHTS" \
+  --reference_pt "$REFERENCE_PT" \
+  --reference_weights "$REFERENCE_WEIGHTS" \
   "${SIGNAL_ARGS[@]}" \
   --outdir "$OUTDIR" \
   --wandb_project nurd-ood-hlt \
@@ -191,6 +245,18 @@ python eval_abcd_nurd.py \
   --ae_batch_size "$AE_BATCH_SIZE" \
   --corr_sample_size "$CORR_SAMPLE_SIZE" \
   --dcor_sample_size "$DCOR_SAMPLE_SIZE" \
+  --baseline_labels "$BASELINE_LABELS" \
+  --abcd_scope "$ABCD_SCOPE" \
+  --score_mode "$SCORE_MODE" \
+  --min_A "$MIN_A" \
+  --min_A_frac "$MIN_A_FRAC" \
+  --min_D "$MIN_D" \
+  --min_region_frac "$MIN_REGION_FRAC" \
+  --max_ratio_unc "$MAX_RATIO_UNC" \
+  --selection_folds "$SELECTION_FOLDS" \
+  --selection_stat_weight "$SELECTION_STAT_WEIGHT" \
+  --selection_neighbor_weight "$SELECTION_NEIGHBOR_WEIGHT" \
+  --selection_neighbor_radius "$SELECTION_NEIGHBOR_RADIUS" \
   --scan_percent_min "$SCAN_PERCENT_MIN" \
   --scan_percent_max "$SCAN_PERCENT_MAX" \
   --scan_percent_steps "$SCAN_PERCENT_STEPS" \

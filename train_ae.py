@@ -23,11 +23,14 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 
 from models.hlt_autoencoder import HLTAutoencoder
+from utils.event_weights import load_event_weights, weighted_mean_and_std
 
 # ── Args ──────────────────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser(description="Pre-train HLT AE")
 parser.add_argument("--data",       required=True,  type=str)
+parser.add_argument("--gen_weights", default=None, type=str,
+                    help="Event-aligned non-negative generator weights (.pt).")
 parser.add_argument("--epochs",     default=100,    type=int)
 parser.add_argument("-b","--batch_size", default=2048, type=int)
 parser.add_argument("--lr",         default=1e-3,   type=float)
@@ -75,31 +78,53 @@ log.addHandler(fh)
 log.debug(f"Loading {args.data}")
 raw = torch.load(args.data, map_location="cpu")
 obj = raw["obj"]
+labels = raw["label"].long()
+gen_weights, gen_weight_metadata = load_event_weights(
+    args.gen_weights, raw, max_events=args.max_events)
 if args.max_events > 0:
     obj = obj[:args.max_events]
+    labels = labels[:args.max_events]
 del raw
 
-# flatten first 4 features per candidate: [N, n_cands, 4] → [N, n_cands*4]
-obj_flat = obj[:, :, :4].reshape(obj.shape[0], -1).float().numpy()
+# flatten first 4 features per candidate: [N, n_cands, 4] -> [N, n_cands*4]
+obj_flat = torch.nan_to_num(
+    obj[:, :, :4].reshape(obj.shape[0], -1).float(),
+    nan=0.0, posinf=0.0, neginf=0.0)
 del obj
-
-mu  = obj_flat.mean(axis=0).astype(np.float32)
-std = obj_flat.std(axis=0).astype(np.float32)
-std = np.where(std < 1e-8, 1.0, std)
-obj_norm = torch.from_numpy((obj_flat - mu) / std)
-del obj_flat
-n_features = obj_norm.shape[1]
-log.debug(f"AE input: {obj_norm.shape}  ({n_features} features)")
 
 # ── Train / val split ─────────────────────────────────────────────────────────
 
-idx = np.arange(len(obj_norm))
-idx_tr, idx_val = train_test_split(idx, test_size=args.val_split, random_state=args.manualSeed)
-obj_tr  = obj_norm[torch.tensor(idx_tr)]
-obj_val = obj_norm[torch.tensor(idx_val)]
+idx = np.arange(len(obj_flat))
+idx_tr, idx_val = train_test_split(
+    idx, test_size=args.val_split, random_state=args.manualSeed,
+    stratify=labels.numpy())
+idx_tr = torch.as_tensor(idx_tr, dtype=torch.long)
+idx_val = torch.as_tensor(idx_val, dtype=torch.long)
 
-dl_tr  = DataLoader(TensorDataset(obj_tr),  batch_size=args.batch_size, shuffle=True,  drop_last=False)
-dl_val = DataLoader(TensorDataset(obj_val), batch_size=args.batch_size, shuffle=False, drop_last=False)
+# Fit the AE scaler on the weighted training split only. This avoids both
+# validation leakage and a mismatch between the physical training objective and
+# the normalization saved for NURD/evaluation.
+mu, std = weighted_mean_and_std(
+    obj_flat[idx_tr], gen_weights[idx_tr], dim=0)
+std = torch.where(std < 1e-8, torch.ones_like(std), std)
+obj_norm = (obj_flat - mu.view(1, -1)) / std.view(1, -1)
+del obj_flat
+n_features = obj_norm.shape[1]
+log.debug(f"AE input: {obj_norm.shape}  ({n_features} features)")
+log.debug(f"Generator weights: {gen_weight_metadata}")
+
+obj_tr = obj_norm[idx_tr]
+obj_val = obj_norm[idx_val]
+w_tr = gen_weights[idx_tr]
+w_val = gen_weights[idx_val]
+del obj_norm, labels
+
+dl_tr = DataLoader(
+    TensorDataset(obj_tr, w_tr), batch_size=args.batch_size,
+    shuffle=True, drop_last=False)
+dl_val = DataLoader(
+    TensorDataset(obj_val, w_val), batch_size=args.batch_size,
+    shuffle=False, drop_last=False)
 
 # ── Build AE ──────────────────────────────────────────────────────────────────
 
@@ -114,7 +139,7 @@ ae_config = {
 ae = HLTAutoencoder(ae_config).to(device)
 log.debug(f"AE: latent={args.latent_dim}  enc={args.enc_nodes}  dec={dec_nodes}")
 
-mse    = nn.MSELoss()
+mse = nn.MSELoss(reduction="none")
 optim  = torch.optim.Adam(ae.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 n_steps = args.epochs * len(dl_tr)
 
@@ -134,26 +159,34 @@ ckpt_path = os.path.join(directory, "checkpoint_ae.pth")
 
 for epoch in range(args.epochs):
     ae.train()
-    tr_loss = 0.0
-    for (batch,) in dl_tr:
+    tr_numerator = 0.0
+    tr_denominator = 0.0
+    for batch, batch_weights in dl_tr:
         batch = batch.to(device)
+        batch_weights = batch_weights.to(device)
         optim.zero_grad()
         recon, _ = ae(batch)
-        loss = mse(recon, batch)
+        losses = mse(recon, batch).mean(dim=1)
+        loss = (losses * batch_weights).sum() / batch_weights.sum().clamp(min=1e-8)
         loss.backward()
         optim.step()
         scheduler.step()
-        tr_loss += loss.item() * batch.size(0)
-    tr_loss /= len(dl_tr.dataset)
+        tr_numerator += float((losses.detach() * batch_weights).sum().item())
+        tr_denominator += float(batch_weights.sum().item())
+    tr_loss = tr_numerator / max(tr_denominator, 1e-12)
 
     ae.eval()
-    val_loss = 0.0
+    val_numerator = 0.0
+    val_denominator = 0.0
     with torch.no_grad():
-        for (batch,) in dl_val:
+        for batch, batch_weights in dl_val:
             batch = batch.to(device)
+            batch_weights = batch_weights.to(device)
             recon, _ = ae(batch)
-            val_loss += mse(recon, batch).item() * batch.size(0)
-    val_loss /= len(dl_val.dataset)
+            losses = mse(recon, batch).mean(dim=1)
+            val_numerator += float((losses * batch_weights).sum().item())
+            val_denominator += float(batch_weights.sum().item())
+    val_loss = val_numerator / max(val_denominator, 1e-12)
 
     log.debug(f"Epoch {epoch+1}/{args.epochs}  train={tr_loss:.6f}  val={val_loss:.6f}  lr={scheduler.get_last_lr()[0]:.2e}")
     if not args.local_testing:
@@ -166,9 +199,10 @@ for epoch in range(args.epochs):
             "ae":        ae.state_dict(),
             "ae_config": ae_config,
             "ae_scaler": {
-                "mu":  torch.from_numpy(mu),
-                "std": torch.from_numpy(std),
+                "mu": mu.cpu(),
+                "std": std.cpu(),
             },
+            "gen_weight_metadata": gen_weight_metadata,
             "epoch": epoch + 1,
         }, ckpt_path)
         log.debug(f"  → saved best checkpoint ({ckpt_path})")

@@ -1,18 +1,20 @@
 method: grid
 metric:
-  goal: maximize
-  name: Val/rw_acc
+  goal: minimize
+  name: Val/proxy_abcd_score
 parameters:
   # data
   n_bins:
-    values: [10]
+    values: [40]
   nuisance_bin_scope:
     values: [qcd]
+  baseline_labels:
+    values: ["0,1,2,3"]
   val_split:
     values: [0.1]
   # training
   epochs:
-    values: [150]
+    values: [200]
   critic_epochs:
     values: [2]
   batch_size:
@@ -35,23 +37,37 @@ parameters:
   critic_schedule:
     values: [warmup]
   critic_type:
-    values: [density_ratio]
+    values: [bin_pred]
+  critic_bin_resolutions:
+    values: ["10,20,40"]
   critic_penalty_type:
-    values: [confusion]
+    values: [prior_match]
   critic_scope:
     values: [qcd]
+  critic_shuffle:
+    values: [global]
+  critic_train_frac:
+    values: [1.0]
   n_critic_steps_per_batch:
     values: [2]
+  qcd_batch_fraction:
+    values: [0.25]
   max_weight_ratio:
     values: [10.0]
   closure_loss_type:
     values: [hybrid]
+  closure_scope:
+    values: [qcd]
+  closure_class_min_events:
+    values: [20]
+  closure_score_mode:
+    values: [own_class]
   closure_weight:
     values: [1.0]
   closure_weight_start:
     values: [0.0]
   closure_ramp_epochs:
-    values: [20]
+    values: [15]
   closure_corr_weight:
     values: [0.25]
   closure_dcorr_weight:
@@ -60,6 +76,10 @@ parameters:
     values: [0.5]
   closure_reverse_profile_weight:
     values: [0.5]
+  closure_physical_resample:
+    values: [1]
+  closure_resample_size:
+    values: [1024]
   closure_profile_bins:
     values: [8]
   closure_profile_tail_weight:
@@ -69,7 +89,7 @@ parameters:
   closure_tail_abcd_weight:
     values: [1.0]
   closure_tail_quantiles:
-    values: ["0.50,0.65,0.80,0.90"]
+    values: ["0.50,0.60,0.70,0.80,0.85,0.90,0.95"]
   closure_tail_scale:
     values: [12.0]
   closure_tail_min_events:
@@ -82,17 +102,25 @@ parameters:
     values: ["0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.85,0.90,0.92"]
   val_abcd_min_events:
     values: [20]
+  val_abcd_min_region_frac:
+    values: [0.005]
   md_proxy_type:
-    values: [ema]
+    values: [epoch]
   md_ema_momentum:
     values: [0.05]
+  md_proxy_shrinkage:
+    values: [0.05]
+  val_md_folds:
+    values: [2]
+  abcd_ckpt_smoothing_epochs:
+    values: [5]
   # contrastive
   contrast_weight:
     values: [0.02]
   contrast_weight_start:
     values: [0.15]
   contrast_ramp_epochs:
-    values: [50]
+    values: [40]
   contrast_temp:
     values: [0.05]
   # model architecture
