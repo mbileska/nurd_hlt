@@ -264,6 +264,11 @@ python train_hlt.py \
   --project_name hlt \
   --manualSeed 42
 
+if ! compgen -G "checkpoints/hlt/hlt/$NURD_EXP/checkpoint_main_*.pth.tar" > /dev/null; then
+  echo "ERROR: NURD training returned without writing a main checkpoint: $NURD_EXP" >&2
+  exit 3
+fi
+
 echo "=== Training outputs ==="
 ls -lh "checkpoints/hlt/hlt/$AE_EXP/"
 ls -lh "checkpoints/hlt/hlt/$NURD_EXP/"

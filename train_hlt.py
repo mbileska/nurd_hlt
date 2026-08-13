@@ -1809,3 +1809,57 @@ def main():
                 args, checkpoint_state(epoch), epoch + 1, name="main")
             if not args.local_testing:
                 wandb.run.summary["best_val_rw_acc"] = val_rw_acc
+                wandb.run.summary["best_val_acc"] = val_acc
+                wandb.run.summary["best_val_loss"] = val_loss
+
+        val_abcd_score = val_abcd.get("score", float("nan"))
+        if np.isfinite(val_abcd_score):
+            abcd_score_history.append(float(val_abcd_score))
+            smoothed_abcd_score = float(np.median(abcd_score_history))
+            loss_ok = (
+                best_loss is None
+                or val_loss <= args.abcd_ckpt_loss_tol * best_loss
+            )
+            epoch_ready = epoch + 1 >= max(1, args.abcd_ckpt_min_epoch)
+            if (
+                epoch_ready
+                and loss_ok
+                and (
+                    best_abcd_score is None
+                    or val_abcd_score < best_abcd_score
+                )
+            ):
+                # Save the exact epoch whose cross-fitted score improved. A
+                # rolling-median decision can otherwise attach a good historical
+                # score to a worse current model state.
+                best_abcd_score = float(val_abcd_score)
+                state = checkpoint_state(epoch)
+                state.update({
+                    "selection_metric": (
+                        "cross_fitted_weighted_val_qcd_md_grid_score"),
+                    "selection_value": float(val_abcd_score),
+                    "selection_raw_value": float(val_abcd_score),
+                    "selection_rolling_median": float(smoothed_abcd_score),
+                    "selection_history": list(abcd_score_history),
+                    "selection_val_loss": float(val_loss),
+                    "selection_val_qcd_proxy_corr": float(val_qcd_corr),
+                    "selection_val_proxy_abcd": val_abcd,
+                })
+                log.debug("Saving ABCD closure checkpoint")
+                save_checkpoint(args, state, epoch + 1, name="abcd")
+                save_checkpoint(args, state, epoch + 1, name="closure")
+                if not args.local_testing:
+                    wandb.run.summary["best_val_proxy_abcd_score"] = (
+                        val_abcd_score)
+                    wandb.run.summary["best_val_proxy_abcd_p90"] = val_abcd.get(
+                        "p90_abs_log_nonclosure", float("nan"))
+                    wandb.run.summary["best_val_proxy_abcd_tail"] = val_abcd.get(
+                        "tail_mean_abs_log_nonclosure", float("nan"))
+
+    log.debug(f"Done. Best val loss: {best_loss:.5f}")
+    if not args.local_testing:
+        wandb.finish()
+
+
+if __name__ == "__main__":
+    main()
