@@ -71,8 +71,9 @@ python train_hlt.py \
   --critic_penalty_type ratio_to_one \
   --critic_scope qcd \
   --critic_shuffle global \
+  --critic_weighted_shuffle 0 \
   --critic_train_frac 1.0 \
-  --n_critic_steps_per_batch 2 \
+  --n_critic_steps_per_batch 1 \
   --baseline_labels 0,1,2,3 \
   --nuisance_bin_scope qcd \
   --n_bins 20 \
@@ -85,13 +86,24 @@ python train_hlt.py \
   --closure_scope qcd \
   --closure_score_mode own_class \
   --closure_class_min_events 5 \
+  --closure_reverse_profile_weight 0 \
+  --closure_physical_resample 0 \
   --closure_tail_quantiles 0.5,0.7,0.9 \
+  --val_md_mode ema \
   --val_md_folds 2 \
   --abcd_ckpt_smoothing_epochs 1 \
+  --abcd_ckpt_min_epoch 1 \
   --md_proxy_type ema \
+  --md_ema_momentum 0.05 \
+  --md_proxy_shrinkage 0 \
   --exp_name smoke_nurd \
   --project_name hlt \
   --manualSeed 42
+
+if ! compgen -G "checkpoints/hlt/hlt/smoke_nurd/checkpoint_main_*.pth.tar" > /dev/null; then
+  echo "ERROR: smoke NURD training returned without a main checkpoint" >&2
+  exit 3
+fi
 
 echo "=== Smoke outputs ==="
 ls -lh checkpoints/hlt/hlt/smoke_ae/

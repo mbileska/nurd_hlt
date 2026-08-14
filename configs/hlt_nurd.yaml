@@ -3,9 +3,11 @@ metric:
   goal: minimize
   name: Val/proxy_abcd_score
 parameters:
+  training_profile:
+    values: [weighted_v4_anchor]
   # data
   n_bins:
-    values: [40]
+    values: [20]
   nuisance_bin_scope:
     values: [qcd]
   baseline_labels:
@@ -37,21 +39,23 @@ parameters:
   critic_schedule:
     values: [warmup]
   critic_type:
-    values: [bin_pred]
+    values: [density_ratio]
   critic_bin_resolutions:
-    values: ["10,20,40"]
+    values: ["20"]
   critic_penalty_type:
-    values: [prior_match]
+    values: [ratio_to_one]
   critic_scope:
     values: [qcd]
   critic_shuffle:
     values: [global]
+  critic_weighted_shuffle:
+    values: [0]
   critic_train_frac:
     values: [1.0]
   n_critic_steps_per_batch:
-    values: [2]
+    values: [1]
   qcd_batch_fraction:
-    values: [0.25]
+    values: [0.0]
   max_weight_ratio:
     values: [10.0]
   closure_loss_type:
@@ -75,9 +79,9 @@ parameters:
   closure_profile_weight:
     values: [0.5]
   closure_reverse_profile_weight:
-    values: [0.5]
+    values: [0.0]
   closure_physical_resample:
-    values: [1]
+    values: [0]
   closure_resample_size:
     values: [1024]
   closure_profile_bins:
@@ -89,7 +93,7 @@ parameters:
   closure_tail_abcd_weight:
     values: [1.0]
   closure_tail_quantiles:
-    values: ["0.50,0.60,0.70,0.80,0.85,0.90,0.95"]
+    values: ["0.50,0.65,0.80,0.90"]
   closure_tail_scale:
     values: [12.0]
   closure_tail_min_events:
@@ -105,15 +109,23 @@ parameters:
   val_abcd_min_region_frac:
     values: [0.005]
   md_proxy_type:
-    values: [epoch]
+    values: [ema]
   md_ema_momentum:
     values: [0.05]
   md_proxy_shrinkage:
-    values: [0.05]
+    values: [0.0]
+  val_md_mode:
+    values: [ema]
   val_md_folds:
     values: [2]
   abcd_ckpt_smoothing_epochs:
-    values: [5]
+    values: [1]
+  abcd_ckpt_min_epoch:
+    values: [1]
+  val_abcd_min_effective_events:
+    values: [0.0]
+  val_abcd_max_ratio_unc:
+    values: [.inf]
   # contrastive
   contrast_weight:
     values: [0.02]

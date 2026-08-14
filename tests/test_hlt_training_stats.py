@@ -6,11 +6,26 @@ from utils.hlt_training_stats import (
     QCDRichBatchSampler,
     RunningQCDMDProxy,
     cross_fitted_mahalanobis,
+    full_measure_scoped_mean,
     soft_conditioner_profile_loss,
     soft_copula_grid_loss,
     weighted_balanced_folds,
     weighted_resample_indices,
 )
+
+
+def test_scoped_critic_penalty_keeps_v4_full_measure_scale():
+    penalties = torch.tensor([2.0, 4.0])
+    qcd_weights = torch.tensor([3.0, 1.0])
+    all_background_weights = torch.tensor([3.0, 1.0, 6.0])
+
+    contribution = full_measure_scoped_mean(
+        penalties, qcd_weights, all_background_weights)
+
+    assert torch.isclose(contribution, torch.tensor(1.0))
+    assert not torch.isclose(
+        contribution,
+        (penalties * qcd_weights).sum() / qcd_weights.sum())
 
 
 def test_capped_nurd_weights_preserve_sample_mean():

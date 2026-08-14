@@ -6,6 +6,23 @@ from sklearn.covariance import LedoitWolf
 from sklearn.model_selection import KFold
 from torch.utils.data import Sampler
 
+
+def full_measure_scoped_mean(values, scope_weights, full_weights, eps=1e-8):
+    """Weighted scoped contribution normalized by the full event measure.
+
+    V4 added its QCD-only critic penalty to per-event losses before reducing
+    over the complete all-background batch. Normalizing over QCD alone changes
+    the loss coefficient by the inverse QCD fraction.
+    """
+    values = torch.as_tensor(values).reshape(-1)
+    scope_weights = torch.as_tensor(
+        scope_weights, device=values.device, dtype=values.dtype).reshape(-1)
+    full_weights = torch.as_tensor(
+        full_weights, device=values.device, dtype=values.dtype).reshape(-1)
+    if values.numel() != scope_weights.numel():
+        raise ValueError("values and scope_weights must align.")
+    return (values * scope_weights).sum() / full_weights.sum().clamp(min=eps)
+
 from utils.event_weights import weighted_quantile
 
 

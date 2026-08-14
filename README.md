@@ -257,16 +257,17 @@ AE epochs             100
 NURD epochs           200
 nuisance bins         20 weighted quantiles, fitted on training QCD
 training batches      natural shuffled all-background batches
-critic                weighted QCD density-ratio critic, two updates per batch
+critic                V4 QCD density-ratio critic, one update per batch
 critic penalty        bounded ratio_to_one
-closure               physical-resampled V3/V4 hybrid objective vs EMA QCD MD
-checkpoint MD         weight-balanced two-fold cross-fitted shrinkage covariance
+closure               generator-weighted V4 hybrid objective vs EMA QCD MD; no resampling
+checkpoint MD         V4 lagged EMA QCD MD; no shrinkage or cross-fitting
 ABCD yields           generator weighted, uncertainty from sumw2
 ```
 
-Two hundred NURD epochs retain the completed v6 campaign length and use the
-lower learning-rate tail without increasing the 12-hour hard limit. Slurm
-terminates the job at 12 hours; it cannot consume a GPU indefinitely.
+Two hundred NURD epochs reproduce the V4 campaign length. One critic update,
+no closure resampling, and EMA checkpoint scoring remove the later extra work
+that caused the v11 allocation to time out. Slurm still terminates the job at
+the 12-hour hard limit.
 
 Monitor:
 
@@ -280,11 +281,14 @@ tail -f "$BASE/logs/nurd_hlt_train-$JOB.err"
 The `.out` header should contain:
 
 ```text
+TRAINING_PROFILE=weighted_v4_anchor
 CRITIC_SCOPE=qcd
 CRITIC_TYPE=density_ratio
 CRITIC_BIN_RESOLUTIONS=20
 CRITIC_PENALTY_TYPE=ratio_to_one
 CRITIC_SHUFFLE=global
+CRITIC_WEIGHTED_SHUFFLE=0
+N_CRITIC_STEPS=1
 N_BINS=20
 QCD_BATCH_FRACTION=0.0
 NUISANCE_BIN_SCOPE=qcd
@@ -292,9 +296,13 @@ CLOSURE_SCOPE=qcd
 CLOSURE_SCORE_MODE=own_class
 NURD_EPOCHS=200
 MD_PROXY_TYPE=ema
-MD_EMA_MOMENTUM=0.01
+MD_EMA_MOMENTUM=0.05
+MD_PROXY_SHRINKAGE=0.0
+VAL_MD_MODE=ema
 CLOSURE_LOSS_TYPE=hybrid
 CLOSURE_WEIGHT=1.0
+CLOSURE_REVERSE_PROFILE_WEIGHT=0.0
+CLOSURE_PHYSICAL_RESAMPLE=0
 CONTRAST_WEIGHT=0.02
 ```
 
@@ -331,7 +339,7 @@ optimization experiment.
 The latest-eval script defaults to:
 
 ```text
-NURD_GLOB=hlt_nurd_closure_bs4096_qcd_weighted_v4_transfer_v11_*
+NURD_GLOB=hlt_nurd_closure_bs4096_weighted_v4_anchor_v12_*
 PREFER_ABCD_CKPT=1
 ABCD_SCOPE=qcd
 SCORE_MODE=qcd_md
@@ -358,7 +366,7 @@ Evaluate the latest validation-loss checkpoint for comparison:
 ```bash
 unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP NURD_GLOB
 PREFER_ABCD_CKPT=0 PREFER_CLOSURE_CKPT=0 \
-  WANDB_NAME_PREFIX=qcd_weighted_v4_transfer_v11_main \
+  WANDB_NAME_PREFIX=weighted_v4_anchor_v12_main \
   sbatch slurm/submit_eval_latest.sbatch
 ```
 
