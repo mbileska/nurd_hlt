@@ -1,120 +1,106 @@
-# NURD HLT Anomaly Detection
+# NURD HLT QCD closure
 
-This branch trains a two-axis HLT anomaly detector:
+This branch contains the corrected weighted V4×4 campaign.
 
-- Axis 1: object-feature autoencoder reconstruction loss.
-- Axis 2 for the primary closure result: QCD-referenced, PCA-whitened
-  Mahalanobis distance from the PF-candidate encoder.
-- Learned backgrounds: `DY=0`, `QCD=1`, `TT=2`, and `WJets=3`.
-- Primary report: ABCD closure on independent QCD test events.
+- Axis 1 is object-feature autoencoder reconstruction loss.
+- Axis 2 is QCD-referenced, PCA-whitened Mahalanobis distance from the
+  PF-candidate encoder.
+- `DY=0`, `QCD=1`, `TT=2`, and `WJets=3` all train the classifier and
+  supervised contrastive representation.
+- Nuisance removal and the direct closure objective are QCD-scoped.
+- The primary result is generator-weighted QCD closure on the independent
+  Mequinna test sample.
 
-Classification and supervised contrastive learning still use all four
-backgrounds. Only the nuisance-removal and closure objectives are QCD-scoped,
-because the primary ABCD estimate is evaluated on QCD.
+## Fixed evaluation contract
 
-## What Changed From `main`
+Every Slurm evaluation runs exactly two protocols for the same NURD and AE
+checkpoints:
 
-### Data And Weights
+```text
+$BASE/outputs/<EVAL_NAME>/
+├── held-out/   primary weighted Mequinna result
+├── legacy/     origin/main historical QCD comparison
+└── evaluation_summary.json
+```
 
-- The legacy campaign uses `hlt_smcocktail_train.pt` and
-  `hlt_smcocktail_test.pt`. The new Mequinna campaign is stored separately under
-  `data/mequinna_1M_noZB/`; never overwrite the legacy files because that makes
-  checkpoint provenance ambiguous.
-- The Mequinna release also provides event-aligned `weight_train.pt` and
-  `weight_test.pt` generator weights. These are physics generator weights, not
-  the NURD label/nuisance weights described below.
-- Generator weights are now required by the default Mequinna Slurm campaign.
-  They are applied consistently to AE and NURD losses, nuisance-bin quantiles,
-  NURD frequency estimates, critic/closure objectives, latent references,
-  validation checkpoint selection, and final ABCD yields.
-- The campaign does not truncate the new files: 90% of every Mequinna training
-  event trains the AE/NURD models, the remaining stratified 10% selects
-  checkpoints and ABCD thresholds, and every independent test event is used
-  once for the final report. Test events never enter optimization or reference
-  fitting.
-- AE reconstruction is computed once. The train/validation split is made before
-  fitting nuisance preprocessing.
-- Twenty generator-weighted AE-loss nuisance bins are fitted from training QCD only, then the same
-  edges are applied to every training and validation event. Validation data
-  cannot influence the nuisance definition.
-- Exact NURD weights are fitted on training data only and reused unchanged for
-  validation.
-- Weight clipping now preserves both the configured cap and a sample-weighted
-  training mean of one.
-- Nuisance edges and the fitted weight table are stored in every NURD
-  checkpoint.
+`held-out/` is the only primary result. Its latent reference, checkpoint
+selection, threshold selection, and reporting events are disjoint:
 
-### Training Objective
+```text
+Mequinna training file
+├── 90% reference fitting and model training
+├──  5% checkpoint validation
+└──  5% ABCD threshold tuning
 
-- All-background classifier and supervised contrastive losses are unchanged in
-  scope: all four backgrounds teach the encoder their structure.
-- Natural shuffled batches are used by default; QCD-rich sampling remains an
-  explicit optional experiment.
-- A QCD density-ratio critic distinguishes real `(latent, AE-bin)` pairs from
-  shuffled pairs. The critic takes two inexpensive updates on reused encoder
-  activations. Its shuffled AE bins are sampled from the generator-weighted
-  nuisance marginal, so the negative examples represent the physical
-  product-of-marginals rather than the raw event distribution.
-- The encoder uses the bounded `ratio_to_one` objective, making the learned
-  density ratio approach one without an unbounded adversarial CE objective.
-- Supervised contrastive learning weights both anchors and comparison events by
-  the NURD times generator measure. Previously only anchors were weighted, so
-  the raw Mequinna class mixture still defined every contrastive denominator.
-- Direct QCD closure regularization acts on continuous AE loss and QCD MD. The
-  default restores the v3/v4 hybrid objective: log-correlation, distance
-  correlation, forward/reverse profile flatness, and the original soft
-  tail-ABCD log-ratio. The complete objective is evaluated after drawing QCD
-  from the generator-weighted physical measure; this avoids changing the
-  successful objective into the soft-copula loss used by later failed runs.
-- The QCD MD proxy is a real online EMA. A batch is scored against the previous
-  detached reference before that batch updates the weighted moments, avoiding
-  self-scoring while tracking the changing encoder.
-- The weighted EMA update is reduced from `0.05` to `0.01`; with roughly 360
-  batches per epoch this still follows encoder evolution while averaging over
-  substantially more physical QCD statistics.
-- Contrastive weight decreases from `0.15` to `0.02` over 40 epochs. Closure
-  weight increases from `0` to `1.0` over 15 epochs, restoring the settings that
-  gave the strongest broad QCD closure before v6 weakened them.
+Mequinna test file
+└── 100% report-only held-out events
+```
 
-### Selection And Evaluation
+The AE and NURD use the same three training-file roles, balanced by
+generator-weight mass within each background class. The threshold-tuning 5%
+is used by neither training nor checkpoint selection. Exact row indices are
+saved in both checkpoints and must match during NURD training and evaluation.
 
-- `checkpoint_main_*` is selected by validation NURD loss.
-- Validation QCD MD is two-fold cross-fitted with weighted shrinkage covariance.
-  Fold assignment balances generator-weight mass, so a few large-weight events
-  cannot make one reference fold statistically much weaker than the other.
-- `checkpoint_abcd.pth.tar` and `checkpoint_closure.pth.tar` are selected by a
-  broad cross-fitted QCD MD score: p90 plus tail and median log-nonclosure,
-  subject to validation-loss, effective-region-count, and propagated-ratio-
-  uncertainty guards. Selection starts after epoch 40 and saves the exact epoch
-  that produced the improving score; an older rolling-median implementation
-  could save a different current state than the historical score described.
-- Final threshold selection uses the untouched model-validation portion of the
-  training file. The complete test file is report-only.
-- ABCD cuts use weighted quantiles. `A/B/C/D` are generator-weighted yields,
-  ratio uncertainty uses per-region `sumw2`, and raw event-count minima are
-  retained as a guard against a few high-weight events.
-- For QCD MD, all untouched model-validation QCD tune thresholds because this
-  score does not use empirical tail calibration. The independent test file
-  remains report-only.
-- The default scan requires at least 10% of tuning QCD in region A, at least 1%
-  in every region, and at most 15% propagated ratio uncertainty. Selection uses
-  five-fold and neighboring-grid stability instead of the closure of one cell.
-- Evaluation trains a fresh nonlinear nuisance auditor after freezing the
-  encoder. Its test-QCD accuracy/AUC/CE diagnose residual AE-bin information.
-- `calibrated_union`, `min_md`, and other all-background scores remain available
-  as secondary studies. They are not the default QCD-closure axis.
+`legacy/` exactly reproduces the relevant `origin/main` behavior on
+`$BASE/data/hlt_smcocktail_test.pt`: unweighted QCD-only MD is fitted on that
+complete test sample, and the ABCD working point is optimized and reported on
+the same QCD events. It is an oracle compatibility result, not a held-out
+measurement.
 
-These changes are intended to improve broad QCD closure, not guarantee a
-particular result. Rank models from independent `report_at_selected`, the
-closure curve, and grid median/p90 together, not from a tuned point alone.
+Evaluation refuses to run when:
 
-## One-Time Della Setup
+- the NURD experiment/checkpoint is ambiguous;
+- the AE digest does not match the NURD checkpoint;
+- the code commit differs from the training commit;
+- the Mequinna reference sample or weight digest differs from training;
+- held-out reference and report files are the same;
+- the output directory is already non-empty.
+
+The campaign also refuses to evaluate a classifier-loss fallback. Training
+must produce `checkpoint_abcd.pth.tar` under the constrained broad-closure
+selection rules; otherwise the training job fails and the dependent eval is
+not launched.
+
+## Weighted V4×4 model
+
+V4 used 20 AE nuisance bins. This profile uses 80 generator-weighted QCD
+quantile bins and does not add extra critics or critic resolutions.
+
+The V4 architecture, loss coefficients, schedules, natural all-background
+batches, one critic update per batch, and 200 epochs are retained. Required
+weighted-data corrections are:
+
+- generator weights define AE training, nuisance quantiles, NURD frequencies,
+  physical QCD critic/closure objectives, references, and ABCD yields;
+- the density-ratio critic's joint and shuffled samples use the same physical
+  QCD measure;
+- stochastic AE, CE, and SupCon losses use fixed full-training normalizers
+  instead of biased random-batch self-normalization;
+- the complete V4 closure objective is evaluated analytically with generator
+  weights; physical resampling is disabled because that was a later V7
+  experiment and adds avoidable stochastic variance;
+- the intended V4 reverse profile is active with its conditioner gradient fixed;
+- the EMA QCD reference decays weighted sufficient statistics, so influence is
+  proportional to batch generator-weight mass;
+- checkpoint MD is two-fold cross-fitted using the V4 covariance definition;
+- closure checkpoint selection begins at epoch 20, uses a five-epoch rolling
+  median, requires at least 20 effective events per ABCD region, and rejects
+  propagated ratio uncertainty above 0.15;
+- object features receive identical nonfinite-value handling in AE training,
+  NURD training, and evaluation;
+- unknown training arguments are fatal.
+
+The final held-out threshold scan requires at least 10% of tuning QCD in A,
+1% in every ABCD region, propagated ratio uncertainty below 15%, five-fold
+physical-mass stability, and local grid stability.
+
+## Della setup
 
 ```bash
 module load anaconda3/2025.12
 conda activate disco
 
-cd /home/mb7126/nurd_hlt
+cd ~/nurd_hlt
 git fetch origin
 git switch wip-mila-test
 git pull --ff-only
@@ -123,345 +109,144 @@ export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
 mkdir -p "$BASE"/{checkpoints,logs,outputs,wandb,matplotlib}
 ```
 
-Verify the environment:
-
-```bash
-python -c "import torch, wandb, numpy, sklearn, scipy, matplotlib; print('imports ok'); print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
-```
-
-## Mequinna Dataset
-
-Keep the new release in a versioned scratch directory:
+Required data:
 
 ```text
 $BASE/data/mequinna_1M_noZB/hlt_smcocktail_mequinna_train.pt
 $BASE/data/mequinna_1M_noZB/hlt_smcocktail_mequinna_test.pt
 $BASE/data/mequinna_1M_noZB/weight_train.pt
 $BASE/data/mequinna_1M_noZB/weight_test.pt
+$BASE/data/hlt_smcocktail_test.pt
+$BASE/data/hlt_signal_TpTp.pt              optional
 ```
 
-The CERN source is:
-
-```text
-/eos/user/e/escheull/smcocktail_1M_noZB/
-```
-
-If the files are not already on Della, run from a Della login node:
+Inspect the weight contract before spending GPU time:
 
 ```bash
-export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
-export DATA_DIR=$BASE/data/mequinna_1M_noZB
-export EOS_DIR=/eos/user/e/escheull/smcocktail_1M_noZB
-mkdir -p "$DATA_DIR"
-
-rsync -ahP mbileska@lxplus.cern.ch:$EOS_DIR/hlt_smcocktail_mequinna_train.pt "$DATA_DIR/"
-rsync -ahP mbileska@lxplus.cern.ch:$EOS_DIR/hlt_smcocktail_mequinna_test.pt "$DATA_DIR/"
-rsync -ahP mbileska@lxplus.cern.ch:$EOS_DIR/genweight_lookup/weight_train.pt "$DATA_DIR/"
-rsync -ahP mbileska@lxplus.cern.ch:$EOS_DIR/genweight_lookup/weight_test.pt "$DATA_DIR/"
-```
-
-Validate event alignment, finite values, signs, total weight, and effective
-sample size with the same loader used by training:
-
-```bash
-export DATA_DIR=$BASE/data/mequinna_1M_noZB
 python - <<'PY'
 import os
 import torch
 from utils.event_weights import load_event_weights
 
-root = os.environ["DATA_DIR"]
+root = os.path.join(os.environ["BASE"], "data", "mequinna_1M_noZB")
 for split in ("train", "test"):
     sample = torch.load(
         os.path.join(root, f"hlt_smcocktail_mequinna_{split}.pt"),
         map_location="cpu",
     )
-    print(f"\n{split}: keys={list(sample)}")
-    for key, value in sample.items():
-        print(f"  {key}: shape={tuple(value.shape)} dtype={value.dtype}")
     _, metadata = load_event_weights(
         os.path.join(root, f"weight_{split}.pt"), sample)
-    print("  generator weights:", metadata)
+    print(split, metadata)
 PY
 ```
 
-Negative weights are rejected with a clear error because these positive
-weighted classification and closure losses do not implement signed-weight
-statistics. The smoke test now validates the real generator-weight path:
+Negative or nonfinite weights and length/event-ID mismatches are fatal. A plain
+weight tensor has no event IDs, so source-level row alignment cannot be proven;
+the loader marks this as `alignment_verified: false` and checkpoints its exact
+content digest.
+
+## Smoke test
 
 ```bash
 sbatch slurm/submit_smoke.sbatch
 ```
 
-Verify the legacy data when reproducing an older campaign:
+Success requires `SMOKE DONE`, a main checkpoint, and no traceback.
+
+## Launch training and both evaluations
+
+The recommended command generates one run tag in the login shell and submits
+an evaluation with an `afterok` dependency on that exact training job:
 
 ```bash
-export TRAIN_PT=$BASE/data/hlt_smcocktail_train.pt
-export TEST_PT=$BASE/data/hlt_smcocktail_test.pt
-export SIGNAL_PT=$BASE/data/hlt_signal_TpTp.pt
-
-python -c "import torch; x=torch.load('$TRAIN_PT',map_location='cpu'); print(x.keys()); print(x['pf'].shape,x['obj'].shape,x['label'].shape); print(torch.unique(x['label'],return_counts=True))"
-python -c "import torch; x=torch.load('$TEST_PT',map_location='cpu'); print(x.keys()); print(x['pf'].shape,x['obj'].shape,x['label'].shape)"
-python -c "import torch; x=torch.load('$SIGNAL_PT',map_location='cpu'); print(x.keys()); print(x['pf'].shape,x['obj'].shape,x['label'].shape)"
+cd ~/nurd_hlt
+export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
+bash slurm/launch_v4x4_campaign.sh
 ```
 
-Do not install the repository's old full `requirements.txt` over a working
-CUDA environment. Install only a package that is actually missing.
+The launcher prints the exact run tag, checkpoint directory, output directory,
+training job ID, and evaluation job ID. Training has an 18-hour allocation so
+a roughly 12-hour run is not killed at the boundary. Evaluation has eight hours
+for both protocols.
 
-Before submissions, remove inherited overrides:
+Monitor the IDs printed by the launcher:
 
 ```bash
-unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP RUN_TAG NURD_GLOB
-unset WANDB_RUN_NAME WANDB_RUN_ID ABCD_SCOPE SCORE_MODE MIN_MD
-unset PREFER_ABCD_CKPT PREFER_CLOSURE_CKPT
-unset TRAIN_PT TEST_PT REFERENCE_PT GEN_WEIGHT_TRAIN TEST_WEIGHTS REFERENCE_WEIGHTS
+squeue -j <train_job>,<eval_job>
+sacct -X -j <train_job>,<eval_job> \
+  --format=JobID,JobName%30,State,ExitCode,Elapsed,Timelimit
 ```
 
-## Smoke Test
+Training is complete only when its log contains `TRAINING DONE`. Evaluation is
+complete only when its log contains `DUAL QCD EVAL DONE`.
 
-Submit:
+### Reuse an exact AE
+
+Only reuse an AE produced by this contract from the same code commit, new
+Mequinna sample, generator weights, and exact 90/5/5 row partition:
 
 ```bash
-sbatch slurm/submit_smoke.sbatch
+export SKIP_AE=1
+export AE_CKPT=$BASE/checkpoints/hlt/hlt/<exact_ae_exp>/checkpoint_ae.pth
+bash slurm/launch_v4x4_campaign.sh
 ```
 
-Inspect:
+The AE SHA256 is embedded in every NURD checkpoint and verified during both
+evaluations.
+
+## Launch both evaluations for an existing completed run
+
+Use an exact experiment name. Wildcards, newest-directory fallback, and
+main-checkpoint fallback are intentionally disabled:
 
 ```bash
-JOB=<smoke_job_id>
-squeue -j "$JOB"
-tail -f "$BASE/logs/nurd_smoke-$JOB.out"
-tail -f "$BASE/logs/nurd_smoke-$JOB.err"
+export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
+export NURD_EXP=hlt_nurd_closure_bs4096_<exact_run_tag>
+export EVAL_NAME=<exact_run_tag>_eval
+
+sbatch --export=ALL,BASE="$BASE",NURD_EXP="$NURD_EXP",EVAL_NAME="$EVAL_NAME" \
+  slurm/submit_eval_latest.sbatch
 ```
 
-Success requires `SMOKE DONE`, no traceback, and `Critic scope: qcd`.
-
-## Full Training
-
-Submit the default campaign:
+If the AE path saved in the NURD checkpoint is no longer resolvable, provide
+the exact file explicitly:
 
 ```bash
-unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP RUN_TAG NURD_GLOB
-unset WANDB_RUN_NAME WANDB_RUN_ID
-sbatch slurm/submit_train.sbatch
+export AE_CKPT=$BASE/checkpoints/hlt/hlt/<exact_ae_exp>/checkpoint_ae.pth
+sbatch --export=ALL,BASE="$BASE",NURD_EXP="$NURD_EXP",EVAL_NAME="$EVAL_NAME",AE_CKPT="$AE_CKPT" \
+  slurm/submit_eval_latest.sbatch
 ```
 
-Defaults:
+## Reading results
+
+Start with:
+
+```bash
+cat "$BASE/outputs/$EVAL_NAME/evaluation_summary.json"
+```
+
+For the primary result, inspect:
 
 ```text
-wall time             12:00:00 hard limit
-GPU                   1 A100 with at least 75 GiB
-CPU                   8 cores, 48 GiB RAM
-batch size            4096
-AE epochs             100
-NURD epochs           200
-nuisance bins         20 weighted quantiles, fitted on training QCD
-training batches      natural shuffled all-background batches
-critic                V4 QCD density-ratio critic, one update per batch
-critic penalty        bounded ratio_to_one
-closure               generator-weighted V4 hybrid objective vs EMA QCD MD; no resampling
-checkpoint MD         V4 lagged EMA QCD MD; no shrinkage or cross-fitting
-ABCD yields           generator weighted, uncertainty from sumw2
+held-out/diagnostics.json
+  abcd_selection.report_at_selected
+  abcd_grid.median_abs_nonclosure
+  abcd_grid.p90_abs_nonclosure
+  closure_curve
+  correlations.qcd
+  nuisance_auditor
 ```
 
-Two hundred NURD epochs reproduce the V4 campaign length. One critic update,
-no closure resampling, and EMA checkpoint scoring remove the later extra work
-that caused the v11 allocation to time out. Slurm still terminates the job at
-the 12-hour hard limit.
+The selected working point is chosen only on the dedicated Mequinna threshold
+split. `report_at_selected` applies that frozen point to the independent test
+sample. `report_best_for_reference` is descriptive only and must not be quoted
+as the held-out result.
 
-Monitor:
-
-```bash
-JOB=<training_job_id>
-squeue -j "$JOB" -o "%.18i %.9P %.24j %.8T %.10M %.20R"
-tail -f "$BASE/logs/nurd_hlt_train-$JOB.out"
-tail -f "$BASE/logs/nurd_hlt_train-$JOB.err"
-```
-
-The `.out` header should contain:
-
-```text
-TRAINING_PROFILE=weighted_v4_anchor
-CRITIC_SCOPE=qcd
-CRITIC_TYPE=density_ratio
-CRITIC_BIN_RESOLUTIONS=20
-CRITIC_PENALTY_TYPE=ratio_to_one
-CRITIC_SHUFFLE=global
-CRITIC_WEIGHTED_SHUFFLE=0
-N_CRITIC_STEPS=1
-N_BINS=20
-QCD_BATCH_FRACTION=0.0
-NUISANCE_BIN_SCOPE=qcd
-CLOSURE_SCOPE=qcd
-CLOSURE_SCORE_MODE=own_class
-NURD_EPOCHS=200
-MD_PROXY_TYPE=ema
-MD_EMA_MOMENTUM=0.05
-MD_PROXY_SHRINKAGE=0.0
-VAL_MD_MODE=ema
-CLOSURE_LOSS_TYPE=hybrid
-CLOSURE_WEIGHT=1.0
-CLOSURE_REVERSE_PROFILE_WEIGHT=0.0
-CLOSURE_PHYSICAL_RESAMPLE=0
-CONTRAST_WEIGHT=0.02
-```
-
-Training is complete only when the output contains `TRAINING DONE`.
-
-Recover the exact experiment names:
-
-```bash
-grep -E '^AE_EXP=|^NURD_EXP=' "$BASE/logs/nurd_hlt_train-$JOB.out"
-```
-
-Checkpoints are written to:
-
-```text
-$BASE/checkpoints/hlt/hlt/<AE_EXP>/checkpoint_ae.pth
-$BASE/checkpoints/hlt/hlt/<NURD_EXP>/checkpoint_main_*.pth.tar
-$BASE/checkpoints/hlt/hlt/<NURD_EXP>/checkpoint_abcd.pth.tar
-$BASE/checkpoints/hlt/hlt/<NURD_EXP>/checkpoint_closure.pth.tar
-```
-
-To reuse a completed AE:
-
-```bash
-unset CKPT OUTDIR NURD_EXP RUN_TAG WANDB_RUN_NAME WANDB_RUN_ID
-AE_EXP=<exact_ae_exp> SKIP_AE=1 sbatch slurm/submit_train.sbatch
-```
-
-Do not increase `NUM_WORKERS`, CPU memory, or batch size without measuring the
-result. `BATCH_SIZE=3072` is the fallback for lower VRAM, but it is a distinct
-optimization experiment.
-
-## Primary QCD Evaluation
-
-The latest-eval script defaults to:
-
-```text
-NURD_GLOB=hlt_nurd_closure_bs4096_weighted_v4_anchor_v12_*
-PREFER_ABCD_CKPT=1
-ABCD_SCOPE=qcd
-SCORE_MODE=qcd_md
-MIN_A_FRAC=0.10
-MIN_REGION_FRAC=0.01
-MAX_RATIO_UNC=0.15
-SELECTION_FOLDS=5
-SELECTION_STAT_WEIGHT=0.5
-SELECTION_NEIGHBOR_WEIGHT=1.0
-SCAN_PERCENT_MAX=0.98
-```
-
-Evaluate the latest closure-selected checkpoint:
-
-```bash
-unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP RUN_TAG NURD_GLOB
-unset WANDB_RUN_NAME WANDB_RUN_ID ABCD_SCOPE SCORE_MODE
-unset PREFER_ABCD_CKPT PREFER_CLOSURE_CKPT
-sbatch slurm/submit_eval_latest.sbatch
-```
-
-Evaluate the latest validation-loss checkpoint for comparison:
-
-```bash
-unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP NURD_GLOB
-PREFER_ABCD_CKPT=0 PREFER_CLOSURE_CKPT=0 \
-  WANDB_NAME_PREFIX=weighted_v4_anchor_v12_main \
-  sbatch slurm/submit_eval_latest.sbatch
-```
-
-Monitor and find the output directory:
-
-```bash
-JOB=<eval_job_id>
-squeue -j "$JOB"
-tail -f "$BASE/logs/nurd_eval_latest-$JOB.out"
-tail -f "$BASE/logs/nurd_eval_latest-$JOB.err"
-
-OUT=$(grep '^Results:' "$BASE/logs/nurd_eval_latest-$JOB.out" | sed 's/^Results: //')
-ls -lh "$OUT"
-ls -lh "$OUT/plots"
-cat "$OUT/diagnostics.json"
-```
-
-Use these fields to compare models:
-
-```text
-abcd_selection.report_at_selected.ratio
-abcd_selection.report_at_selected.nonclosure
-abcd_selection.report_at_selected.ratio_unc
-abcd_grid.median_abs_nonclosure
-abcd_grid.p90_abs_nonclosure
-closure_curve
-correlations.qcd
-nuisance_auditor
-signal_at_selected
-legacy_same_sample.best
-```
-
-The one evaluation command emits both requested views. The primary result is
-`abcd_selection.report_at_selected`, whose cuts come from training validation
-and whose yields come from independent test data. `legacy_same_sample.best`
-repeats the historical optimize-and-report-on-test scan with corrected
-generator-weighted yields. It is an oracle comparison only. Do not rank models
-from `tune_best`, `report_best_for_reference`, or `legacy_same_sample`.
-
-## Evaluate A Specific Checkpoint
-
-```bash
-NURD_EXP=<exact_nurd_exp>
-AE_EXP=<exact_ae_exp>
-
-CKPT=$BASE/checkpoints/hlt/hlt/$NURD_EXP/checkpoint_abcd.pth.tar
-AE_CKPT=$BASE/checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth
-OUTDIR=$BASE/outputs/manual_${NURD_EXP}_qcd_md
-
-CKPT="$CKPT" AE_CKPT="$AE_CKPT" OUTDIR="$OUTDIR" \
-ABCD_SCOPE=qcd SCORE_MODE=qcd_md \
-  sbatch slurm/submit_eval_latest.sbatch
-```
-
-For an older checkpoint without saved nuisance edges, add
-`SKIP_NUISANCE_AUDITOR=1`.
-
-## Secondary All-Background Studies
-
-Keep QCD as the closure population and change only axis 2:
-
-```bash
-ABCD_SCOPE=qcd SCORE_MODE=calibrated_union \
-  WANDB_NAME_PREFIX=experimental_calibrated_union \
-  sbatch slurm/submit_eval_latest.sbatch
-
-ABCD_SCOPE=qcd SCORE_MODE=min_md \
-  WANDB_NAME_PREFIX=experimental_min_md \
-  sbatch slurm/submit_eval_latest.sbatch
-
-ABCD_SCOPE=qcd SCORE_MODE=mixture_nll \
-  WANDB_NAME_PREFIX=experimental_mixture_nll \
-  sbatch slurm/submit_eval_latest.sbatch
-```
-
-To measure closure on all known backgrounds:
-
-```bash
-ABCD_SCOPE=all_baselines SCORE_MODE=calibrated_union \
-  WANDB_NAME_PREFIX=experimental_all_baselines \
-  sbatch slurm/submit_eval_latest.sbatch
-```
-
-These are secondary questions. They should not replace the primary apples-to-
-apples `ABCD_SCOPE=qcd SCORE_MODE=qcd_md` comparison.
+For historical comparison, use `legacy/diagnostics.json` and remember that it
+is deliberately same-sample and unweighted.
 
 ## W&B
 
-Jobs use offline W&B by default. Each evaluation log prints its exact sync
-command. From a login node:
-
-```bash
-export WANDB_API_KEY=$(cat ~/.secrets/wandb_api_key)
-wandb sync <offline-run-directory-printed-by-the-job>
-```
-
-Use `SYNC_WANDB=1` only when compute nodes can reach W&B. Offline mode avoids
-training failures caused by network timeouts.
+Jobs default to offline W&B. Set `SYNC_WANDB=1` only when compute nodes can
+reach W&B, or sync the two printed offline run directories later from a login
+node.

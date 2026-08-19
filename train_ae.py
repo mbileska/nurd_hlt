@@ -20,10 +20,16 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import train_test_split
 
 from models.hlt_autoencoder import HLTAutoencoder
-from utils.event_weights import load_event_weights, weighted_mean_and_std
+from utils.event_weights import (
+    EVENT_ID_KEYS,
+    load_event_weights,
+    sample_signature,
+    split_diagnostics,
+    weighted_mean_and_std,
+    weighted_stratified_split,
+)
 
 # ── Args ──────────────────────────────────────────────────────────────────────
 
@@ -37,6 +43,8 @@ parser.add_argument("--lr",         default=1e-3,   type=float)
 parser.add_argument("--weight_decay",default=0.0,   type=float)
 parser.add_argument("--cosine",     default=1,      type=int)
 parser.add_argument("--val_split",  default=0.1,    type=float)
+parser.add_argument("--threshold_tune_fraction", default=0.5, type=float,
+                    help="Fraction of --val_split reserved and never used by AE training or selection.")
 parser.add_argument("--latent_dim", default=16,     type=int)
 parser.add_argument("--enc_nodes",  default=[512, 256], nargs="+", type=int)
 parser.add_argument("--dec_nodes",  default=[256, 512], nargs="+", type=int)
@@ -46,6 +54,8 @@ parser.add_argument("--exp_name",   default="ae",   type=str)
 parser.add_argument("--project_name", default="hlt", type=str)
 parser.add_argument("--local_testing", default=0,   type=int)
 parser.add_argument("--manualSeed", default=42,     type=int)
+parser.add_argument("--code_commit", default=None, type=str,
+                    help="Git commit recorded by the campaign launcher.")
 args = parser.parse_args()
 
 if not args.local_testing:
@@ -84,6 +94,13 @@ gen_weights, gen_weight_metadata = load_event_weights(
 if args.max_events > 0:
     obj = obj[:args.max_events]
     labels = labels[:args.max_events]
+signature_sample = {"obj": obj, "label": labels}
+if "pf" in raw:
+    signature_sample["pf"] = raw["pf"][:len(labels)]
+for key in EVENT_ID_KEYS:
+    if key in raw:
+        signature_sample[key] = raw[key][:len(labels)]
+data_signature = sample_signature(signature_sample)
 del raw
 
 # flatten first 4 features per candidate: [N, n_cands, 4] -> [N, n_cands*4]
@@ -94,12 +111,36 @@ del obj
 
 # ── Train / val split ─────────────────────────────────────────────────────────
 
-idx = np.arange(len(obj_flat))
-idx_tr, idx_val = train_test_split(
-    idx, test_size=args.val_split, random_state=args.manualSeed,
-    stratify=labels.numpy())
-idx_tr = torch.as_tensor(idx_tr, dtype=torch.long)
-idx_val = torch.as_tensor(idx_val, dtype=torch.long)
+if not 0.0 < float(args.val_split) < 1.0:
+    raise ValueError("--val_split must lie in (0, 1).")
+if not 0.0 < float(args.threshold_tune_fraction) < 1.0:
+    raise ValueError("--threshold_tune_fraction must lie in (0, 1).")
+tune_fraction = float(args.val_split) * float(args.threshold_tune_fraction)
+checkpoint_fraction = float(args.val_split) - tune_fraction
+train_fraction = 1.0 - float(args.val_split)
+idx_tr, idx_val, idx_tune = weighted_stratified_split(
+    labels, gen_weights,
+    (train_fraction, checkpoint_fraction, tune_fraction),
+    seed=args.manualSeed)
+idx_tr, idx_val, idx_tune = [
+    torch.as_tensor(indices, dtype=torch.long)
+    for indices in (idx_tr, idx_val, idx_tune)
+]
+split_indices = {
+    "reference_fit": idx_tr,
+    "checkpoint_validation": idx_val,
+    "threshold_tune": idx_tune,
+}
+split_metadata = {
+    "scheme": "generator_mass_balanced_stratified_folds_v1",
+    "seed": int(args.manualSeed),
+    "fractions": {
+        "reference_fit": train_fraction,
+        "checkpoint_validation": checkpoint_fraction,
+        "threshold_tune": tune_fraction,
+    },
+    "diagnostics": split_diagnostics(labels, gen_weights, split_indices),
+}
 
 # Fit the AE scaler on the weighted training split only. This avoids both
 # validation leakage and a mismatch between the physical training objective and
@@ -117,6 +158,7 @@ obj_tr = obj_norm[idx_tr]
 obj_val = obj_norm[idx_val]
 w_tr = gen_weights[idx_tr]
 w_val = gen_weights[idx_val]
+train_weight_mean = max(float(w_tr.mean().item()), 1e-12)
 del obj_norm, labels
 
 dl_tr = DataLoader(
@@ -167,7 +209,10 @@ for epoch in range(args.epochs):
         optim.zero_grad()
         recon, _ = ae(batch)
         losses = mse(recon, batch).mean(dim=1)
-        loss = (losses * batch_weights).sum() / batch_weights.sum().clamp(min=1e-8)
+        # A fixed full-training normalizer makes this an unbiased stochastic
+        # estimate of the global generator-weighted objective. Dividing by each
+        # random batch's own weight sum biases gradients for broad weights.
+        loss = (losses * batch_weights).mean() / train_weight_mean
         loss.backward()
         optim.step()
         scheduler.step()
@@ -203,6 +248,10 @@ for epoch in range(args.epochs):
                 "std": std.cpu(),
             },
             "gen_weight_metadata": gen_weight_metadata,
+            "data_signature": data_signature,
+            "data_split_indices": split_indices,
+            "split_metadata": split_metadata,
+            "code_commit": args.code_commit,
             "epoch": epoch + 1,
         }, ckpt_path)
         log.debug(f"  → saved best checkpoint ({ckpt_path})")

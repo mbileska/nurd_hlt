@@ -2,13 +2,17 @@ import sys
 import types
 
 import numpy as np
+import pytest
+import torch
 
 sys.modules.setdefault("wandb", types.SimpleNamespace())
 
 from eval_abcd_nurd import (
     class_assignment_diagnostics,
+    checkpoint_reference_splits,
     scan_abcd_grid,
     scan_legacy_same_sample,
+    scan_main_legacy_qcd,
 )
 
 
@@ -76,6 +80,23 @@ def test_legacy_same_sample_scan_keeps_historical_oracle_semantics():
     assert summary["tuning_effective_sample_size"] < len(axis1)
 
 
+def test_main_legacy_qcd_scan_uses_unweighted_numpy_quantiles_and_old_sign():
+    axis1 = np.arange(1000, dtype=np.float64)
+    axis2 = np.roll(axis1, 137)
+    percent = np.array([0.50, 0.60, 0.70])
+
+    best, summary = scan_main_legacy_qcd(
+        axis1, axis2, percent, min_A=10, min_D=10)
+
+    assert best["t1"] == np.quantile(axis1, best["p1"])
+    assert best["t2"] == np.quantile(axis2, best["p2"])
+    assert np.isclose(
+        best["nonclosure"],
+        (best["A"] - best["A_hat"]) / best["A_hat"],
+    )
+    assert 0 < summary["n_points"] <= len(percent) ** 2
+
+
 def test_class_assignment_uses_generator_weighted_measure():
     products = {
         "reference_labels": np.array([0, 1]),
@@ -92,3 +113,34 @@ def test_class_assignment_uses_generator_weighted_measure():
     assert np.isclose(classifier["balanced_accuracy"], 0.55)
     assert classifier["confusion_matrix"] == [[1, 1], [0, 1]]
     assert classifier["weighted_confusion_matrix"] == [[1.0, 9.0], [0.0, 1.0]]
+
+
+def test_heldout_reference_roles_must_match_checkpoint_provenance():
+    signature = {"n_events": 10, "label_sha256": "sample"}
+    checkpoint = {
+        "checkpoint_contract_version": 2,
+        "data_split_indices": {
+            "reference_fit": torch.tensor([0, 1, 2, 3, 4, 5]),
+            "checkpoint_validation": torch.tensor([6, 7]),
+            "threshold_tune": torch.tensor([8, 9]),
+        },
+        "data_provenance": {
+            "sample": signature,
+            "generator_weights": {"sha256": "weights"},
+        },
+    }
+    metadata = {
+        "sample_signature": signature,
+        "sha256": "weights",
+    }
+
+    fit, checkpoint_val, tune = checkpoint_reference_splits(
+        checkpoint, np.zeros(10, dtype=int), metadata)
+    assert fit.tolist() == [0, 1, 2, 3, 4, 5]
+    assert checkpoint_val.tolist() == [6, 7]
+    assert tune.tolist() == [8, 9]
+
+    with pytest.raises(ValueError, match="generator-weight digest"):
+        checkpoint_reference_splits(
+            checkpoint, np.zeros(10, dtype=int),
+            {**metadata, "sha256": "wrong"})

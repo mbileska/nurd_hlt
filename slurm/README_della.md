@@ -1,94 +1,47 @@
-# Della Runbook
+# Della command reference
 
-The authoritative end-to-end instructions for branch `wip-mila-test` are in
-[`../README.md`](../README.md). This short file is a command reference.
-
-## Update And Verify
+The authoritative weighted V4×4 contract is in [`../README.md`](../README.md).
 
 ```bash
 module load anaconda3/2025.12
 conda activate disco
-cd /home/mb7126/nurd_hlt
+cd ~/nurd_hlt
 git fetch origin
 git switch wip-mila-test
 git pull --ff-only
-
 export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
-python -c "import torch,wandb,numpy,sklearn,scipy,matplotlib; print(torch.__version__,torch.version.cuda,torch.cuda.is_available())"
 ```
 
-Clear inherited selections before every submission:
-
-```bash
-unset CKPT OUTDIR AE_CKPT AE_EXP NURD_EXP RUN_TAG
-unset WANDB_RUN_NAME WANDB_RUN_ID NURD_GLOB
-unset ABCD_SCOPE SCORE_MODE MIN_MD
-unset TRAIN_PT TEST_PT REFERENCE_PT GEN_WEIGHT_TRAIN TEST_WEIGHTS REFERENCE_WEIGHTS
-```
-
-## Smoke
+Smoke test:
 
 ```bash
 sbatch slurm/submit_smoke.sbatch
 ```
 
-Success is `SMOKE DONE` in:
+Submit one exact training job and its dependent held-out plus legacy evaluation:
+
+```bash
+bash slurm/launch_v4x4_campaign.sh
+```
+
+The launcher prints both job IDs and the result directory:
 
 ```text
-$BASE/logs/nurd_smoke-<job_id>.out
+$BASE/outputs/<EVAL_NAME>/held-out/
+$BASE/outputs/<EVAL_NAME>/legacy/
+$BASE/outputs/<EVAL_NAME>/evaluation_summary.json
 ```
 
-## Train
+Evaluate an already completed contract-v2 run:
 
 ```bash
-sbatch slurm/submit_train.sbatch
+export NURD_EXP=hlt_nurd_closure_bs4096_<exact_run_tag>
+export EVAL_NAME=<exact_run_tag>_eval
+sbatch --export=ALL,BASE="$BASE",NURD_EXP="$NURD_EXP",EVAL_NAME="$EVAL_NAME" \
+  slurm/submit_eval_latest.sbatch
 ```
 
-Defaults: 100 AE epochs, 200 NURD epochs, a 12-hour hard limit, one 80 GB A100,
-8 CPU cores, 48 GB CPU memory, and zero DataLoader workers. Training uses
-the Mequinna train sample plus generator weights, 20 weighted QCD-defined
-nuisance bins, a two-step physically shuffled QCD density-ratio critic, natural
-batches, the physical-resampled V3/V4 hybrid tail-closure objective, online EMA QCD MD, and
-generator-weighted cross-fitted validation closure.
-
-Monitor:
-
-```bash
-JOB=<training_job_id>
-squeue -j $JOB
-tail -f $BASE/logs/nurd_hlt_train-$JOB.out
-tail -f $BASE/logs/nurd_hlt_train-$JOB.err
-```
-
-## Evaluate
-
-Recommended independent-test QCD closure with QCD Mahalanobis distance:
-
-```bash
-sbatch slurm/submit_eval_latest.sbatch
-```
-
-Closure-selected checkpoint:
-
-```bash
-PREFER_ABCD_CKPT=1 ABCD_SCOPE=qcd SCORE_MODE=qcd_md \
-  sbatch slurm/submit_eval_latest.sbatch
-```
-
-The eval job fits weighted class references on training, selects thresholds on
-the original validation split, and reports weighted ABCD yields with `sumw2`
-uncertainty on independent test. The same run also stores the historical
-weighted same-sample oracle under `legacy_same_sample`.
-
-Inspect:
-
-```bash
-JOB=<eval_job_id>
-OUT=$(grep '^Results:' $BASE/logs/nurd_eval_latest-$JOB.out | sed 's/^Results: //')
-cat "$OUT/diagnostics.json"
-cat "$OUT/abcd_thresholds.json"
-ls -lh "$OUT/plots"
-```
-
-See the main README for explicit checkpoint selection, score comparisons,
-all-baseline closure, interpretation, and W&B synchronization.
+Wildcards, newest-run fallback, newest-AE fallback, main-checkpoint fallback,
+and output overwrites are disabled. `NURD_EXP` must be exact and contain an
+eligible `checkpoint_abcd.pth.tar`. The held-out result is primary; `legacy/`
+is the unweighted, same-sample QCD protocol from `origin/main`.

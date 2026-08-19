@@ -67,16 +67,17 @@ python train_hlt.py \
   --local_testing 1 \
   --critic_schedule warmup \
   --critic_type density_ratio \
-  --critic_bin_resolutions 20 \
+  --critic_bin_resolutions 80 \
   --critic_penalty_type ratio_to_one \
   --critic_scope qcd \
   --critic_shuffle global \
-  --critic_weighted_shuffle 0 \
+  --critic_weighted_shuffle 1 \
   --critic_train_frac 1.0 \
   --n_critic_steps_per_batch 1 \
   --baseline_labels 0,1,2,3 \
   --nuisance_bin_scope qcd \
-  --n_bins 20 \
+  --n_bins 80 \
+  --threshold_tune_fraction 0.5 \
   --qcd_batch_fraction 0 \
   --reweight 1 \
   --joint_indep 1 \
@@ -86,16 +87,16 @@ python train_hlt.py \
   --closure_scope qcd \
   --closure_score_mode own_class \
   --closure_class_min_events 5 \
-  --closure_reverse_profile_weight 0 \
+  --closure_reverse_profile_weight 0.5 \
   --closure_physical_resample 0 \
   --closure_tail_quantiles 0.5,0.7,0.9 \
-  --val_md_mode ema \
+  --val_md_mode cross_fitted \
   --val_md_folds 2 \
   --abcd_ckpt_smoothing_epochs 1 \
   --abcd_ckpt_min_epoch 1 \
   --md_proxy_type ema \
   --md_ema_momentum 0.05 \
-  --md_proxy_shrinkage 0 \
+  --md_proxy_shrinkage 0.0 \
   --exp_name smoke_nurd \
   --project_name hlt \
   --manualSeed 42

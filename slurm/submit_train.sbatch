@@ -2,7 +2,7 @@
 #SBATCH --job-name=nurd_hlt_train
 #SBATCH --output=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/%x-%j.out
 #SBATCH --error=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/%x-%j.err
-#SBATCH --time=12:00:00
+#SBATCH --time=18:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:a100:1
@@ -48,8 +48,8 @@ if [[ -e checkpoints && ! -L checkpoints ]]; then
 fi
 ln -sfnT "$BASE/checkpoints" checkpoints
 
-RUN_TAG="${RUN_TAG:-weighted_v4_anchor_v12_$(date +%Y%m%d_%H%M%S)}"
-TRAINING_PROFILE="${TRAINING_PROFILE:-weighted_v4_anchor}"
+RUN_TAG="${RUN_TAG:-weighted_v4_x4_$(date +%Y%m%d_%H%M%S)}"
+TRAINING_PROFILE="${TRAINING_PROFILE:-weighted_v4_x4}"
 AE_EXP="${AE_EXP:-ae_pretrain_$RUN_TAG}"
 NURD_EXP="${NURD_EXP:-hlt_nurd_closure_bs4096_$RUN_TAG}"
 BATCH_SIZE="${BATCH_SIZE:-4096}"
@@ -63,7 +63,7 @@ CLOSURE_SCOPE="${CLOSURE_SCOPE:-qcd}"
 CLOSURE_CLASS_MIN_EVENTS="${CLOSURE_CLASS_MIN_EVENTS:-20}"
 CLOSURE_CLASS_WEIGHTING="${CLOSURE_CLASS_WEIGHTING:-equal}"
 CLOSURE_SCORE_MODE="${CLOSURE_SCORE_MODE:-own_class}"
-CLOSURE_REVERSE_PROFILE_WEIGHT="${CLOSURE_REVERSE_PROFILE_WEIGHT:-0.0}"
+CLOSURE_REVERSE_PROFILE_WEIGHT="${CLOSURE_REVERSE_PROFILE_WEIGHT:-0.5}"
 CLOSURE_PHYSICAL_RESAMPLE="${CLOSURE_PHYSICAL_RESAMPLE:-0}"
 CLOSURE_RESAMPLE_SIZE="${CLOSURE_RESAMPLE_SIZE:-1024}"
 CLOSURE_TAIL_ABCD_WEIGHT="${CLOSURE_TAIL_ABCD_WEIGHT:-1.0}"
@@ -75,16 +75,17 @@ VAL_ABCD_QUANTILES="${VAL_ABCD_QUANTILES:-0.50,0.55,0.60,0.65,0.70,0.75,0.80,0.8
 VAL_ABCD_MIN_EVENTS="${VAL_ABCD_MIN_EVENTS:-20}"
 VAL_ABCD_MIN_REGION_FRAC="${VAL_ABCD_MIN_REGION_FRAC:-0.005}"
 ABCD_CKPT_LOSS_TOL="${ABCD_CKPT_LOSS_TOL:-1.10}"
-ABCD_CKPT_MIN_EPOCH="${ABCD_CKPT_MIN_EPOCH:-1}"
+ABCD_CKPT_MIN_EPOCH="${ABCD_CKPT_MIN_EPOCH:-20}"
 BASELINE_LABELS="${BASELINE_LABELS:-0,1,2,3}"
 NUISANCE_BIN_SCOPE="${NUISANCE_BIN_SCOPE:-qcd}"
 CRITIC_SCOPE="${CRITIC_SCOPE:-qcd}"
-N_BINS="${N_BINS:-20}"
+N_BINS="${N_BINS:-80}"
+THRESHOLD_TUNE_FRACTION="${THRESHOLD_TUNE_FRACTION:-0.5}"
 CRITIC_TYPE="${CRITIC_TYPE:-density_ratio}"
-CRITIC_BIN_RESOLUTIONS="${CRITIC_BIN_RESOLUTIONS:-20}"
+CRITIC_BIN_RESOLUTIONS="${CRITIC_BIN_RESOLUTIONS:-80}"
 CRITIC_PENALTY_TYPE="${CRITIC_PENALTY_TYPE:-ratio_to_one}"
 CRITIC_SHUFFLE="${CRITIC_SHUFFLE:-global}"
-CRITIC_WEIGHTED_SHUFFLE="${CRITIC_WEIGHTED_SHUFFLE:-0}"
+CRITIC_WEIGHTED_SHUFFLE="${CRITIC_WEIGHTED_SHUFFLE:-1}"
 N_CRITIC_STEPS="${N_CRITIC_STEPS:-1}"
 QCD_BATCH_FRACTION="${QCD_BATCH_FRACTION:-0.0}"
 CONTRAST_WEIGHT="${CONTRAST_WEIGHT:-0.02}"
@@ -94,13 +95,25 @@ MAX_WEIGHT_RATIO="${MAX_WEIGHT_RATIO:-10.0}"
 MD_PROXY_TYPE="${MD_PROXY_TYPE:-ema}"
 MD_EMA_MOMENTUM="${MD_EMA_MOMENTUM:-0.05}"
 MD_PROXY_SHRINKAGE="${MD_PROXY_SHRINKAGE:-0.0}"
-VAL_MD_MODE="${VAL_MD_MODE:-ema}"
+VAL_MD_MODE="${VAL_MD_MODE:-cross_fitted}"
 VAL_MD_FOLDS="${VAL_MD_FOLDS:-2}"
-ABCD_CKPT_SMOOTHING_EPOCHS="${ABCD_CKPT_SMOOTHING_EPOCHS:-1}"
-VAL_ABCD_MIN_EFFECTIVE_EVENTS="${VAL_ABCD_MIN_EFFECTIVE_EVENTS:-0}"
-VAL_ABCD_MAX_RATIO_UNC="${VAL_ABCD_MAX_RATIO_UNC:-inf}"
+ABCD_CKPT_SMOOTHING_EPOCHS="${ABCD_CKPT_SMOOTHING_EPOCHS:-5}"
+VAL_ABCD_MIN_EFFECTIVE_EVENTS="${VAL_ABCD_MIN_EFFECTIVE_EVENTS:-20}"
+VAL_ABCD_MAX_RATIO_UNC="${VAL_ABCD_MAX_RATIO_UNC:-0.15}"
 NUM_WORKERS="${NUM_WORKERS:-0}"
 AE_CKPT="${AE_CKPT:-checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth}"
+CODE_COMMIT="${CODE_COMMIT:-$(git rev-parse HEAD)}"
+
+if [[ "$(git rev-parse HEAD)" != "$CODE_COMMIT" ]]; then
+  echo "ERROR: queued training commit no longer matches the checked-out code."
+  echo "Requested: $CODE_COMMIT"
+  echo "Current:   $(git rev-parse HEAD)"
+  exit 2
+fi
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "ERROR: tracked code has uncommitted changes. Refusing an unreproducible run."
+  exit 2
+fi
 
 echo "=== Full training started: $(date) ==="
 echo "Host: $(hostname)"
@@ -124,6 +137,7 @@ echo "CRITIC_SHUFFLE=$CRITIC_SHUFFLE"
 echo "CRITIC_WEIGHTED_SHUFFLE=$CRITIC_WEIGHTED_SHUFFLE"
 echo "N_CRITIC_STEPS=$N_CRITIC_STEPS"
 echo "N_BINS=$N_BINS"
+echo "THRESHOLD_TUNE_FRACTION=$THRESHOLD_TUNE_FRACTION"
 echo "QCD_BATCH_FRACTION=$QCD_BATCH_FRACTION"
 echo "NUISANCE_BIN_SCOPE=$NUISANCE_BIN_SCOPE"
 echo "CONTRAST_WEIGHT=$CONTRAST_WEIGHT"
@@ -161,6 +175,7 @@ echo "VAL_ABCD_MIN_EFFECTIVE_EVENTS=$VAL_ABCD_MIN_EFFECTIVE_EVENTS"
 echo "VAL_ABCD_MAX_RATIO_UNC=$VAL_ABCD_MAX_RATIO_UNC"
 echo "W&B project: nurd-ood-hlt"
 echo "W&B mode: $WANDB_MODE"
+echo "CODE_COMMIT=$CODE_COMMIT"
 echo "Minimum GPU memory: ${MIN_GPU_MEM_GB} GiB"
 
 python -c "import torch; print('torch', torch.__version__, 'cuda build', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO GPU')"
@@ -180,6 +195,7 @@ else
   python train_ae.py \
     --data "$TRAIN_PT" \
     --gen_weights "$GEN_WEIGHT_TRAIN" \
+    --threshold_tune_fraction "$THRESHOLD_TUNE_FRACTION" \
     --epochs "$AE_EPOCHS" \
     --batch_size "$BATCH_SIZE" \
     --lr 1e-3 \
@@ -187,7 +203,8 @@ else
     --enc_nodes 512 256 \
     --dec_nodes 256 512 \
     --exp_name "$AE_EXP" \
-    --project_name hlt
+    --project_name hlt \
+    --code_commit "$CODE_COMMIT"
 fi
 
 echo "=== Step 2: NURD closure training ==="
@@ -199,6 +216,7 @@ python train_hlt.py \
   --epochs "$NURD_EPOCHS" \
   --batch_size "$BATCH_SIZE" \
   --num_workers "$NUM_WORKERS" \
+  --threshold_tune_fraction "$THRESHOLD_TUNE_FRACTION" \
   --lr 1e-4 \
   --weight_decay 5e-3 \
   --n_bins "$N_BINS" \
@@ -271,10 +289,11 @@ python train_hlt.py \
   --qcd_label 1 \
   --exp_name "$NURD_EXP" \
   --project_name hlt \
+  --code_commit "$CODE_COMMIT" \
   --manualSeed 42
 
-if ! compgen -G "checkpoints/hlt/hlt/$NURD_EXP/checkpoint_main_*.pth.tar" > /dev/null; then
-  echo "ERROR: NURD training returned without writing a main checkpoint: $NURD_EXP" >&2
+if [[ ! -s "checkpoints/hlt/hlt/$NURD_EXP/checkpoint_abcd.pth.tar" ]]; then
+  echo "ERROR: NURD training produced no statistically eligible ABCD checkpoint: $NURD_EXP" >&2
   exit 3
 fi
 

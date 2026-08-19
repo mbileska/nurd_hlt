@@ -13,12 +13,15 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 from collections import defaultdict
-from sklearn.model_selection import train_test_split
 
 from utils.event_weights import (
+    EVENT_ID_KEYS,
     load_event_weights,
+    sample_signature,
+    split_diagnostics,
     weighted_mean_and_std,
     weighted_quantile,
+    weighted_stratified_split,
 )
 
 
@@ -243,7 +246,8 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
                        max_events=-1, ae_scaler=None, ae_batch_size=4096,
                        max_weight_ratio=10.0, nuisance_bin_scope="all",
                        qcd_label=1, baseline_labels=None,
-                       gen_weight_path=None):
+                       gen_weight_path=None,
+                       threshold_tune_fraction=0.5):
     """
     Load the HLT .pt file, pre-normalise obj features, and return
     (train_dataset, val_dataset).  Call once; pass the same bin_edges
@@ -257,19 +261,32 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
     obj    = raw["obj"]
     if max_events > 0:
         pf, labels, obj = pf[:max_events], labels[:max_events], obj[:max_events]
+    signature_sample = {"pf": pf, "obj": obj, "label": labels}
+    for key in EVENT_ID_KEYS:
+        if key in raw:
+            signature_sample[key] = raw[key][:len(labels)]
+    data_signature = sample_signature(signature_sample)
     pf = torch.nan_to_num(pf, nan=0.0, posinf=0.0, neginf=0.0)
 
-    idx_all = np.arange(len(labels))
-    idx_tr, idx_val = train_test_split(
-        idx_all, test_size=val_split, random_state=seed,
-        stratify=labels.cpu().numpy()
-    )
-    idx_tr = torch.tensor(idx_tr, dtype=torch.long)
-    idx_val = torch.tensor(idx_val, dtype=torch.long)
+    if not 0.0 < float(val_split) < 1.0:
+        raise ValueError("val_split must lie in (0, 1).")
+    if not 0.0 < float(threshold_tune_fraction) < 1.0:
+        raise ValueError("threshold_tune_fraction must lie in (0, 1).")
+    tune_fraction = float(val_split) * float(threshold_tune_fraction)
+    checkpoint_fraction = float(val_split) - tune_fraction
+    train_fraction = 1.0 - float(val_split)
+    split_values = weighted_stratified_split(
+        labels, gen_weights,
+        (train_fraction, checkpoint_fraction, tune_fraction), seed=seed)
+    idx_tr, idx_val, idx_tune = [
+        torch.as_tensor(values, dtype=torch.long) for values in split_values
+    ]
 
     # Flatten object features and fit fallback normalization on training events
     # only. The normal path uses the scaler saved by the weighted AE checkpoint.
-    obj_flat = obj[:, :, :4].reshape(obj.shape[0], -1).float()
+    obj_flat = torch.nan_to_num(
+        obj[:, :, :4].reshape(obj.shape[0], -1).float(),
+        nan=0.0, posinf=0.0, neginf=0.0)
     if ae_scaler is None:
         mu, std = weighted_mean_and_std(
             obj_flat[idx_tr], gen_weights[idx_tr], dim=0)
@@ -353,4 +370,28 @@ def build_hlt_datasets(pt_path, ae_model, n_bins=20, val_split=0.1, seed=42,
         split="val", bin_edges=bin_edges,
         max_weight_ratio=max_weight_ratio,
         weight_table=ds_train.weights)
+    split_indices = {
+        "reference_fit": idx_tr.cpu(),
+        "checkpoint_validation": idx_val.cpu(),
+        "threshold_tune": idx_tune.cpu(),
+    }
+    split_metadata = {
+        "scheme": "generator_mass_balanced_stratified_folds_v1",
+        "seed": int(seed),
+        "fractions": {
+            "reference_fit": train_fraction,
+            "checkpoint_validation": checkpoint_fraction,
+            "threshold_tune": tune_fraction,
+        },
+        "diagnostics": split_diagnostics(
+            labels, gen_weights, split_indices),
+    }
+    provenance = {
+        "sample": data_signature,
+        "generator_weights": dict(gen_weight_metadata),
+    }
+    for dataset in (ds_train, ds_val):
+        dataset.split_indices = split_indices
+        dataset.split_metadata = split_metadata
+        dataset.provenance = provenance
     return ds_train, ds_val, obj_scaler, gen_weight_metadata

@@ -120,6 +120,27 @@ def test_qcd_md_proxy_ema_scores_before_tracking_current_batch():
     assert torch.allclose(proxy.mean, torch.tensor([3.0, 3.0]))
 
 
+def test_qcd_md_proxy_ema_respects_generator_weight_mass():
+    proxy = RunningQCDMDProxy(momentum=0.5, eps=1e-6, mode="ema")
+    proxy.update(torch.tensor([[0.0], [0.0]]), torch.tensor([1.0, 1.0]))
+    proxy.update(torch.tensor([[10.0]]), torch.tensor([18.0]))
+
+    # old_mass=(1-.5)*2=1 and new_mass=.5*18=9
+    assert torch.allclose(proxy.mean, torch.tensor([9.0]))
+    assert np.isclose(proxy.ema_mass, 10.0)
+
+
+def test_qcd_md_proxy_zero_mass_batch_cannot_create_nan():
+    proxy = RunningQCDMDProxy(momentum=0.5, eps=1e-6, mode="ema")
+    latent = torch.tensor([[1.0], [2.0]])
+    scores = proxy.md(
+        latent, torch.tensor([True, True]), update=True,
+        weights=torch.zeros(2))
+
+    assert torch.equal(scores, torch.zeros_like(scores))
+    assert not proxy.ready
+
+
 def test_reverse_profile_has_conditioner_gradient():
     conditioner = torch.linspace(-2.0, 2.0, 256, requires_grad=True)
     target = conditioner.detach().pow(2) + 0.1 * torch.sin(

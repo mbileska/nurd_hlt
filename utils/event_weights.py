@@ -1,6 +1,9 @@
 """Validated event-weight loading and weighted statistics."""
 
+import hashlib
+import math
 from pathlib import Path
+from fractions import Fraction
 
 import numpy as np
 import torch
@@ -15,6 +18,47 @@ WEIGHT_KEYS = (
     "weights",
 )
 EVENT_ID_KEYS = ("eventid", "event_id", "eventids", "event_ids")
+
+
+def tensor_sha256(value):
+    """Stable content digest for a tensor/array after moving it to CPU."""
+    tensor = torch.as_tensor(value).detach().cpu().contiguous()
+    digest = hashlib.sha256()
+    digest.update(str(tensor.dtype).encode("utf-8"))
+    digest.update(np.asarray(tensor.shape, dtype=np.int64).tobytes())
+    digest.update(tensor.numpy().tobytes())
+    return digest.hexdigest()
+
+
+def file_sha256(path, chunk_size=1024 * 1024):
+    """Return the SHA256 of a file without loading the whole file at once."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(int(chunk_size))
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sample_signature(sample):
+    """Small deterministic signature used to bind checkpoints to event rows."""
+    if "label" not in sample:
+        raise ValueError("Sample is missing the required 'label' tensor.")
+    signature = {
+        "n_events": int(torch.as_tensor(sample["label"]).shape[0]),
+        "label_sha256": tensor_sha256(sample["label"]),
+        "shapes": {
+            key: list(torch.as_tensor(sample[key]).shape)
+            for key in ("pf", "obj", "label") if key in sample
+        },
+    }
+    event_ids, event_id_key = _find_value(sample, EVENT_ID_KEYS)
+    if event_ids is not None:
+        signature["event_id_key"] = event_id_key
+        signature["event_id_sha256"] = tensor_sha256(event_ids)
+    return signature
 
 
 def _as_1d_float_tensor(value, name):
@@ -61,6 +105,8 @@ def load_event_weights(path, sample, max_events=-1, require_nonnegative=True):
             "n_events": n_used,
             "sum_weights": float(n_used),
             "effective_events": float(n_used),
+            "alignment_verified": True,
+            "sha256": tensor_sha256(weights),
         }
 
     payload = torch.load(Path(path), map_location="cpu")
@@ -128,7 +174,158 @@ def load_event_weights(path, sample, max_events=-1, require_nonnegative=True):
         "max": float(weights.max().item()),
         "mean": float(weights.mean().item()),
         "effective_events": float(effective),
+        "alignment_verified": bool(payload_ids is not None),
+        "sha256": tensor_sha256(weights),
     }
+
+
+def weighted_balanced_folds(weights, n_splits=2, seed=42):
+    """Assign rows to folds while balancing total generator weight."""
+    weights = np.asarray(weights, dtype=np.float64).reshape(-1)
+    if weights.size == 0:
+        return np.empty(0, dtype=np.int16)
+    if not np.isfinite(weights).all() or np.any(weights < 0):
+        raise ValueError("Fold weights must be finite and non-negative.")
+    n_splits = min(max(int(n_splits), 2), weights.size)
+    rng = np.random.default_rng(int(seed))
+    shuffled = rng.permutation(weights.size)
+    order = shuffled[np.argsort(-weights[shuffled], kind="stable")]
+    fold_mass = np.zeros(n_splits, dtype=np.float64)
+    fold_size = np.zeros(n_splits, dtype=np.int64)
+    fold_ids = np.empty(weights.size, dtype=np.int16)
+    for index in order:
+        fold = min(range(n_splits), key=lambda value: (
+            fold_mass[value], fold_size[value], value))
+        fold_ids[index] = fold
+        fold_mass[fold] += weights[index]
+        fold_size[fold] += 1
+    return fold_ids
+
+
+def weighted_stratified_split(labels, weights, fractions, seed=42,
+                              max_folds=100):
+    """Split every class into generator-mass-balanced deterministic folds.
+
+    Fractions must form a simple rational partition, e.g. ``(0.9, .05, .05)``.
+    Rows are first balanced by physical generator mass within each class and
+    then whole folds are assigned to the requested partitions. This prevents a
+    few high-weight events from dominating one validation role while retaining
+    disjoint event sets.
+    """
+    labels = np.asarray(torch.as_tensor(labels).detach().cpu()).reshape(-1)
+    weights = np.asarray(
+        torch.as_tensor(weights).detach().cpu(), dtype=np.float64).reshape(-1)
+    fractions = [float(value) for value in fractions]
+    if labels.shape[0] != weights.shape[0]:
+        raise ValueError("labels and weights must have the same length.")
+    if not fractions or any(value <= 0.0 for value in fractions):
+        raise ValueError("split fractions must all be positive.")
+    if not np.isclose(sum(fractions), 1.0, rtol=0.0, atol=1e-9):
+        raise ValueError("split fractions must sum to one.")
+    if not np.isfinite(weights).all() or np.any(weights < 0.0):
+        raise ValueError("split weights must be finite and non-negative.")
+
+    rational = [Fraction(str(value)).limit_denominator(max_folds)
+                for value in fractions]
+    n_folds = 1
+    for value in rational:
+        n_folds = math.lcm(n_folds, value.denominator)
+    if n_folds > int(max_folds):
+        raise ValueError(
+            f"split fractions require {n_folds} folds; maximum is {max_folds}.")
+    fold_counts = [int(value * n_folds) for value in rational]
+    if sum(fold_counts) != n_folds or any(value < 1 for value in fold_counts):
+        raise ValueError(
+            "split fractions cannot be represented as non-empty whole folds.")
+
+    split_parts = [[] for _ in fractions]
+    split_ranges = []
+    start = 0
+    for count in fold_counts:
+        split_ranges.append(range(start, start + count))
+        start += count
+
+    for label_index, label in enumerate(np.unique(labels)):
+        class_indices = np.flatnonzero(labels == label)
+        if class_indices.size < n_folds:
+            raise ValueError(
+                f"Class {label} has {class_indices.size} rows but {n_folds} "
+                "are required for the requested physical split.")
+        local_folds = weighted_balanced_folds(
+            weights[class_indices], n_splits=n_folds,
+            seed=int(seed) + label_index * 1009)
+        for split_index, fold_range in enumerate(split_ranges):
+            mask = np.isin(local_folds, np.fromiter(
+                fold_range, dtype=np.int16))
+            split_parts[split_index].append(class_indices[mask])
+
+    rng = np.random.default_rng(int(seed))
+    result = []
+    for parts in split_parts:
+        values = np.concatenate(parts).astype(np.int64, copy=False)
+        result.append(rng.permutation(values))
+    combined = np.concatenate(result)
+    if combined.size != labels.size or np.unique(combined).size != labels.size:
+        raise RuntimeError("weighted stratified split lost or duplicated rows.")
+    return result
+
+
+def split_diagnostics(labels, weights, named_indices):
+    """JSON-serializable row, sumw, and ESS diagnostics for data partitions."""
+    labels = np.asarray(torch.as_tensor(labels).detach().cpu()).reshape(-1)
+    weights = np.asarray(
+        torch.as_tensor(weights).detach().cpu(), dtype=np.float64).reshape(-1)
+    result = {}
+    for name, indices in named_indices.items():
+        indices = np.asarray(indices, dtype=np.int64)
+        subset = weights[indices]
+        sumw = float(subset.sum())
+        sumw2 = float(np.square(subset).sum())
+        details = {
+            "rows": int(indices.size),
+            "sum_weights": sumw,
+            "effective_events": sumw * sumw / max(sumw2, 1e-30),
+            "per_class": {},
+        }
+        for label in np.unique(labels):
+            class_weights = weights[indices[labels[indices] == label]]
+            class_sumw = float(class_weights.sum())
+            class_sumw2 = float(np.square(class_weights).sum())
+            details["per_class"][str(int(label))] = {
+                "rows": int(class_weights.size),
+                "sum_weights": class_sumw,
+                "effective_events": (
+                    class_sumw * class_sumw / max(class_sumw2, 1e-30)),
+            }
+        result[str(name)] = details
+    return result
+
+
+def validate_shared_data_contract(checkpoint, provenance, split_indices,
+                                  code_commit):
+    """Require an AE checkpoint to match the NURD data, weights, and roles."""
+    if checkpoint.get("data_signature") != provenance.get("sample"):
+        raise ValueError("AE checkpoint data signature does not match --data.")
+    expected_weights = checkpoint.get(
+        "gen_weight_metadata", {}).get("sha256")
+    actual_weights = provenance.get("generator_weights", {}).get("sha256")
+    if not expected_weights or expected_weights != actual_weights:
+        raise ValueError(
+            "AE checkpoint generator weights do not match --gen_weights.")
+    if not code_commit or checkpoint.get("code_commit") != code_commit:
+        raise ValueError("AE checkpoint code commit does not match this NURD run.")
+    expected_splits = checkpoint.get("data_split_indices")
+    if not isinstance(expected_splits, dict):
+        raise ValueError(
+            "AE checkpoint lacks the shared 90/5/5 data split contract.")
+    if set(expected_splits) != set(split_indices):
+        raise ValueError("AE/NURD data split roles do not match.")
+    for role, actual in split_indices.items():
+        expected = torch.as_tensor(expected_splits[role]).long().cpu()
+        actual = torch.as_tensor(actual).long().cpu()
+        if not torch.equal(expected, actual):
+            raise ValueError(
+                f"AE/NURD data split mismatch for role {role!r}.")
 
 
 def weighted_mean_and_std(values, weights, dim=0, eps=1e-12):

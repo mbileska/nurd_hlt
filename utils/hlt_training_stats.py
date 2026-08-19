@@ -5,9 +5,11 @@ import torch
 from sklearn.covariance import LedoitWolf
 from sklearn.model_selection import KFold
 from torch.utils.data import Sampler
+from utils.event_weights import weighted_balanced_folds, weighted_quantile
 
 
-def full_measure_scoped_mean(values, scope_weights, full_weights, eps=1e-8):
+def full_measure_scoped_mean(values, scope_weights, full_weights, eps=1e-8,
+                             fixed_normalizer=None):
     """Weighted scoped contribution normalized by the full event measure.
 
     V4 added its QCD-only critic penalty to per-event losses before reducing
@@ -21,10 +23,12 @@ def full_measure_scoped_mean(values, scope_weights, full_weights, eps=1e-8):
         full_weights, device=values.device, dtype=values.dtype).reshape(-1)
     if values.numel() != scope_weights.numel():
         raise ValueError("values and scope_weights must align.")
-    return (values * scope_weights).sum() / full_weights.sum().clamp(min=eps)
-
-from utils.event_weights import weighted_quantile
-
+    if fixed_normalizer is None:
+        denominator = full_weights.sum().clamp(min=eps)
+    else:
+        denominator = values.new_tensor(
+            float(fixed_normalizer) * full_weights.numel()).clamp(min=eps)
+    return (values * scope_weights).sum() / denominator
 
 def weighted_resample_indices(weights, n_samples=None):
     """Draw indices from the physical measure represented by event weights."""
@@ -44,30 +48,6 @@ def weighted_resample_indices(weights, n_samples=None):
         )
     probabilities = weights / weights.sum()
     return torch.multinomial(probabilities, n_samples, replacement=True)
-
-
-def weighted_balanced_folds(weights, n_splits=2, seed=42):
-    """Assign rows to folds while balancing total generator weight."""
-    weights = np.asarray(weights, dtype=np.float64).reshape(-1)
-    if weights.size == 0:
-        return np.empty(0, dtype=np.int16)
-    if not np.isfinite(weights).all() or np.any(weights < 0):
-        raise ValueError("Fold weights must be finite and non-negative.")
-    n_splits = min(max(int(n_splits), 2), weights.size)
-    rng = np.random.default_rng(int(seed))
-    shuffled = rng.permutation(weights.size)
-    order = shuffled[np.argsort(-weights[shuffled], kind="stable")]
-    fold_mass = np.zeros(n_splits, dtype=np.float64)
-    fold_size = np.zeros(n_splits, dtype=np.int64)
-    fold_ids = np.empty(weights.size, dtype=np.int16)
-    for index in order:
-        # Size is a deterministic tie-breaker when several folds have equal mass.
-        fold = min(range(n_splits), key=lambda value: (
-            fold_mass[value], fold_size[value], value))
-        fold_ids[index] = fold
-        fold_mass[fold] += weights[index]
-        fold_size[fold] += 1
-    return fold_ids
 
 
 def soft_conditioner_profile_loss(conditioner, target, n_bins=8,
@@ -198,6 +178,7 @@ class RunningQCDMDProxy:
         self.mode = mode
         self.mean = None
         self.second_moment = None
+        self.ema_mass = 0.0
         self.updates = 0
         self.begin_epoch()
 
@@ -270,15 +251,22 @@ class RunningQCDMDProxy:
             if not self.ready:
                 self.mean = batch_mean
                 self.second_moment = batch_second
+                self.ema_mass = float(count.item())
             else:
+                # Decay sufficient statistics rather than equally averaging
+                # self-normalized batch moments. This preserves the configured
+                # EMA when batches have equal mass and correctly gives a batch
+                # influence proportional to its generator-weight mass.
+                old_mass = (1.0 - self.momentum) * self.ema_mass
+                new_mass = self.momentum * float(count.item())
+                total_mass = old_mass + new_mass
                 self.mean = (
-                    (1.0 - self.momentum) * self.mean
-                    + self.momentum * batch_mean
-                )
+                    old_mass * self.mean + new_mass * batch_mean
+                ) / max(total_mass, self.eps)
                 self.second_moment = (
-                    (1.0 - self.momentum) * self.second_moment
-                    + self.momentum * batch_second
-                )
+                    old_mass * self.second_moment + new_mass * batch_second
+                ) / max(total_mass, self.eps)
+                self.ema_mass = total_mass
             self.updates += 1
             return
         total = total.cpu()
@@ -310,6 +298,11 @@ class RunningQCDMDProxy:
 
         qcd_latent = latent[qcd_mask]
         qcd_weights = None if weights is None else weights[qcd_mask]
+        if qcd_weights is not None:
+            qcd_weight_mass = float(qcd_weights.detach().sum().item())
+            if not math.isfinite(qcd_weight_mass) or qcd_weight_mass <= 0.0:
+                return torch.zeros(
+                    latent.size(0), device=latent.device, dtype=latent.dtype)
         if self.ready:
             scores = self._score(latent, self.mean, self.second_moment)
         else:
@@ -327,6 +320,7 @@ class RunningQCDMDProxy:
             "shrinkage": self.shrinkage,
             "mode": self.mode,
             "updates": self.updates,
+            "ema_mass": float(self.ema_mass),
             "mean": None if self.mean is None else self.mean.detach().cpu(),
             "second_moment": (
                 None if self.second_moment is None
@@ -340,8 +334,12 @@ class RunningQCDMDProxy:
         self.shrinkage = float(state.get("shrinkage", 0.05))
         self.mode = state.get("mode", "epoch")
         self.updates = int(state.get("updates", 0))
+        self.ema_mass = float(state.get("ema_mass", 0.0))
         self.mean = state.get("mean")
         self.second_moment = state.get("second_moment")
+        if self.ready and self.mode == "ema" and self.ema_mass <= 0.0:
+            # Backward compatibility for pre-fix checkpoints.
+            self.ema_mass = 1.0
         self.begin_epoch()
 
 

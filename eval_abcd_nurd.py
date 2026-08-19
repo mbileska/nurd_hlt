@@ -13,10 +13,9 @@ import torch
 import wandb
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
-from scipy.stats import binned_statistic, gaussian_kde, rankdata
+from scipy.stats import binned_statistic, gaussian_kde
 from sklearn.decomposition import PCA
 from sklearn.metrics import log_loss, roc_auc_score
-from sklearn.model_selection import train_test_split
 from sklearn.neural_network import MLPClassifier
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
@@ -24,9 +23,15 @@ from matplotlib.lines import Line2D
 
 from models.hlt_con import HLTContrastiveModel
 from models.hlt_autoencoder import HLTAutoencoder
-from utils.hlt_score_calibration import fit_class_references, score_latents
+from utils.hlt_score_calibration import (
+    ClassReference,
+    fit_class_references,
+    score_latents,
+)
 from utils.event_weights import (
+    file_sha256,
     load_event_weights,
+    sample_signature,
     weighted_quantile_numpy,
 )
 from utils.hlt_training_stats import weighted_balanced_folds
@@ -319,55 +324,71 @@ def scan_legacy_same_sample(loss_1, loss_2, percent, min_A=50, min_D=500,
     )
 
 
-def split_for_threshold_report(n_events, holdout_frac=0.5, seed=42,
-                               axis1=None, axis2=None, n_strata=8,
-                               strata_labels=None):
-    idx = np.arange(n_events)
-    if holdout_frac <= 0.0 or holdout_frac >= 1.0 or n_events < 4:
-        return idx, idx, "same_sample"
-    rng = np.random.default_rng(seed)
-    if axis1 is None or axis2 is None:
-        perm = rng.permutation(idx)
-        n_report = int(round(holdout_frac * n_events))
-        n_report = min(max(n_report, 1), n_events - 1)
-        report_idx = perm[:n_report]
-        tune_idx = perm[n_report:]
-        return tune_idx, report_idx, "holdout_random"
+def fit_legacy_main_qcd_reference(latents, labels, qcd_label=1,
+                                  n_components=None):
+    """Reproduce origin/main's QCD PCA-whitening fit on the full test sample."""
+    latents = np.asarray(latents, dtype=np.float64)
+    labels = np.asarray(labels)
+    values = latents[labels == int(qcd_label)]
+    if values.shape[0] < 10:
+        raise ValueError(
+            f"Legacy QCD evaluation needs at least 10 label={qcd_label} rows.")
+    mean = values.mean(axis=0)
+    centered = values - mean
+    covariance = centered.T @ centered / values.shape[0]
+    eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+    if n_components is not None:
+        eigenvectors = eigenvectors[:, -int(n_components):]
+        eigenvalues = eigenvalues[-int(n_components):]
+    eigenvalues = np.clip(eigenvalues, 1e-6, None)
+    whitening = eigenvectors / np.sqrt(eigenvalues)
+    calibration_md = np.sum(((values - mean) @ whitening) ** 2, axis=1)
+    calibration_md.sort()
+    return [ClassReference(
+        label=int(qcd_label),
+        mean=mean,
+        whitening=whitening,
+        eigenvalues=eigenvalues,
+        logdet=float(np.log(eigenvalues).sum()),
+        prior=1.0,
+        calibration_md=calibration_md,
+        calibration_weight=np.ones_like(calibration_md),
+    )]
 
-    axis1 = np.asarray(axis1)
-    axis2 = np.asarray(axis2)
-    valid = np.isfinite(axis1) & np.isfinite(axis2)
-    if valid.sum() != n_events:
-        return split_for_threshold_report(n_events, holdout_frac, seed)
 
-    q1 = np.quantile(axis1, np.linspace(0.0, 1.0, n_strata + 1))
-    q2 = np.quantile(axis2, np.linspace(0.0, 1.0, n_strata + 1))
-    b1 = np.searchsorted(q1[1:-1], axis1, side="right")
-    b2 = np.searchsorted(q2[1:-1], axis2, side="right")
-    strata = b1 * n_strata + b2
-    if strata_labels is not None:
-        strata_labels = np.asarray(strata_labels)
-        if strata_labels.shape[0] == n_events:
-            _, label_codes = np.unique(strata_labels, return_inverse=True)
-            strata = label_codes * (n_strata * n_strata) + strata
-
-    tune_parts, report_parts = [], []
-    for s in np.unique(strata):
-        members = idx[strata == s]
-        members = rng.permutation(members)
-        if members.size < 2:
-            tune_parts.append(members)
-            continue
-        n_report = int(round(holdout_frac * members.size))
-        n_report = min(max(n_report, 1), members.size - 1)
-        report_parts.append(members[:n_report])
-        tune_parts.append(members[n_report:])
-
-    tune_idx = np.concatenate(tune_parts) if tune_parts else np.array([], dtype=int)
-    report_idx = np.concatenate(report_parts) if report_parts else np.array([], dtype=int)
-    if tune_idx.size == 0 or report_idx.size == 0:
-        return split_for_threshold_report(n_events, holdout_frac, seed)
-    return rng.permutation(tune_idx), rng.permutation(report_idx), "holdout_stratified"
+def scan_main_legacy_qcd(loss_1, loss_2, percent, min_A=50, min_D=500):
+    """Exact unweighted same-sample QCD scan from origin/main."""
+    loss_1 = np.asarray(loss_1)
+    loss_2 = np.asarray(loss_2)
+    best = {"nonclosure": np.inf}
+    absolute_nonclosure = []
+    for p1 in percent:
+        for p2 in percent:
+            t1 = float(np.quantile(loss_1, p1))
+            t2 = float(np.quantile(loss_2, p2))
+            high1 = loss_1 > t1
+            high2 = loss_2 > t2
+            A = int(np.count_nonzero(high1 & high2))
+            B = int(np.count_nonzero(high1 & ~high2))
+            C = int(np.count_nonzero(~high1 & high2))
+            D = int(np.count_nonzero(~high1 & ~high2))
+            if A < int(min_A) or D < int(min_D):
+                continue
+            A_hat = B * C / max(D, 1e-8)
+            nonclosure = (
+                (A - A_hat) / A_hat if A_hat > 0.0 else np.inf)
+            if np.isfinite(nonclosure):
+                absolute_nonclosure.append(abs(nonclosure))
+            if np.isfinite(nonclosure) and abs(nonclosure) < abs(best["nonclosure"]):
+                best = {
+                    "p1": float(p1), "p2": float(p2),
+                    "t1": t1, "t2": t2,
+                    "A": A, "B": B, "C": C, "D": D,
+                    "A_hat": float(A_hat),
+                    "nonclosure": float(nonclosure),
+                    "ratio": float(A_hat / max(A, 1e-8)),
+                }
+    return best, _grid_summary(absolute_nonclosure)
 
 
 def profile_plot(ax, x, y, nbins=30, logx=False, min_per_bin=20,
@@ -454,22 +475,62 @@ def _weighted_pearson(x, y, weights):
     return float(np.sum(weights * x_centered * y_centered) / denominator)
 
 
+def _weighted_midrank(values, weights):
+    """Physical-measure CDF midranks, including exact tie groups."""
+    values = np.asarray(values)
+    weights = np.asarray(weights, dtype=np.float64)
+    order = np.argsort(values, kind="stable")
+    sorted_values = values[order]
+    sorted_weights = weights[order]
+    ranks = np.empty(values.shape[0], dtype=np.float64)
+    total = max(float(sorted_weights.sum()), 1e-30)
+    cumulative = 0.0
+    start = 0
+    while start < sorted_values.size:
+        stop = start + 1
+        while stop < sorted_values.size and sorted_values[stop] == sorted_values[start]:
+            stop += 1
+        group_mass = float(sorted_weights[start:stop].sum())
+        ranks[order[start:stop]] = (cumulative + 0.5 * group_mass) / total
+        cumulative += group_mass
+        start = stop
+    return ranks
+
+
 def _safe_correlations(x, y, max_points=50_000, dcor_points=2_000, seed=42,
                        weights=None):
     if weights is None:
         weights = np.ones(len(x), dtype=np.float64)
+    # Pearson and Spearman are inexpensive enough to compute on every valid
+    # row. Uniform row subsampling followed by importance weights can leave a
+    # tiny and seed-dependent physical ESS for broad generator weights.
     x_s, y_s, w_s = _sample_weighted_pair(
-        x, y, weights, max_points, seed=seed)
-    out = {"n": int(x_s.shape[0]), "pearson": np.nan, "spearman": np.nan,
-           "distance_corr": np.nan}
+        x, y, weights, max_points=0, seed=seed)
+    total_weight = float(w_s.sum())
+    sumw2 = float(np.square(w_s).sum())
+    out = {
+        "n": int(x_s.shape[0]),
+        "effective_events": total_weight * total_weight / max(sumw2, 1e-30),
+        "pearson": np.nan,
+        "spearman": np.nan,
+        "distance_corr": np.nan,
+        "distance_corr_sample_n": 0,
+        "distance_corr_sampling": "physical_weighted_resample",
+    }
     if x_s.shape[0] < 3 or np.std(x_s) == 0 or np.std(y_s) == 0:
         return out
     out["pearson"] = _weighted_pearson(x_s, y_s, w_s)
     out["spearman"] = _weighted_pearson(
-        rankdata(x_s), rankdata(y_s), w_s)
+        _weighted_midrank(x_s, w_s), _weighted_midrank(y_s, w_s), w_s)
     if dcor_points and dcor_points > 0:
-        x_d, y_d, w_d = _sample_weighted_pair(
-            x, y, weights, dcor_points, seed=seed + 1)
+        n_draws = min(int(dcor_points), x_s.shape[0])
+        probabilities = w_s / max(w_s.sum(), 1e-12)
+        rng = np.random.default_rng(seed + 1)
+        indices = rng.choice(
+            x_s.shape[0], n_draws, replace=True, p=probabilities)
+        x_d, y_d = x_s[indices], y_s[indices]
+        w_d = np.ones(n_draws, dtype=np.float64)
+        out["distance_corr_sample_n"] = int(n_draws)
         if x_d.shape[0] >= 3 and np.std(x_d) > 0 and np.std(y_d) > 0:
             ax = np.abs(x_d[:, None] - x_d[None, :])
             ay = np.abs(y_d[:, None] - y_d[None, :])
@@ -583,6 +644,8 @@ def compute_ae_scores(ae, ae_scaler, pt_path, device, batch_size=4096,
     raw = torch.load(pt_path, map_location="cpu")
     event_weights, weight_metadata = load_event_weights(
         gen_weight_path, raw)
+    weight_metadata = dict(weight_metadata)
+    weight_metadata["sample_signature"] = sample_signature(raw)
     obj = raw["obj"]
     N = obj.shape[0]
     print(f"  AE inference on {N} events...", flush=True)
@@ -591,7 +654,9 @@ def compute_ae_scores(ae, ae_scaler, pt_path, device, batch_size=4096,
     with torch.no_grad():
         for i0 in range(0, N, batch_size):
             obj_batch = obj[i0:i0 + batch_size, :, :4]
-            xb = obj_batch.reshape(obj_batch.shape[0], -1).float()
+            xb = torch.nan_to_num(
+                obj_batch.reshape(obj_batch.shape[0], -1).float(),
+                nan=0.0, posinf=0.0, neginf=0.0)
             xb = (xb - mu.view(1, -1)) / std.view(1, -1)
             xb = xb.to(device)
             recon, _ = ae(xb)
@@ -629,17 +694,51 @@ def embed_pf(model, pt_path, device, batch_size=512):
     )
 
 
-def make_reference_splits(labels, val_fraction=0.1, calibration_fraction=0.5,
-                          seed=42):
-    """Reproduce training split, then divide untouched validation into calibration/tuning."""
-    labels = np.asarray(labels)
-    indices = np.arange(labels.shape[0])
-    train_indices, tune_indices = train_test_split(
-        indices, test_size=val_fraction, random_state=seed, stratify=labels)
-    calibration_indices, tune_indices = train_test_split(
-        tune_indices, train_size=calibration_fraction, random_state=seed + 1,
-        stratify=labels[tune_indices])
-    return train_indices, calibration_indices, tune_indices
+def checkpoint_reference_splits(checkpoint, labels, reference_weight_metadata):
+    """Load the exact disjoint fit/tune roles saved by weighted V4×4 training."""
+    if int(checkpoint.get("checkpoint_contract_version", 0)) < 2:
+        raise ValueError(
+            "Held-out evaluation requires a contract-v2 checkpoint with exact "
+            "reference, checkpoint-validation, and threshold-tuning indices.")
+    split_indices = checkpoint.get("data_split_indices")
+    if not isinstance(split_indices, dict):
+        raise ValueError("Checkpoint is missing data_split_indices.")
+    required = {
+        "reference_fit", "checkpoint_validation", "threshold_tune"}
+    if not required.issubset(split_indices):
+        raise ValueError(
+            f"Checkpoint split roles are incomplete: {sorted(split_indices)}")
+    converted = {
+        name: np.asarray(
+            value.detach().cpu() if torch.is_tensor(value) else value,
+            dtype=np.int64,
+        )
+        for name, value in split_indices.items()
+    }
+    combined = np.concatenate([converted[name] for name in required])
+    if combined.size != len(labels) or np.unique(combined).size != len(labels):
+        raise ValueError(
+            "Checkpoint reference roles do not form a disjoint partition of "
+            "the supplied reference sample.")
+    if combined.min(initial=0) < 0 or combined.max(initial=-1) >= len(labels):
+        raise ValueError("Checkpoint split indices are outside the reference sample.")
+
+    provenance = checkpoint.get("data_provenance", {})
+    expected_sample = provenance.get("sample")
+    actual_sample = reference_weight_metadata.get("sample_signature")
+    if expected_sample != actual_sample:
+        raise ValueError(
+            "Reference sample signature does not match the training checkpoint.")
+    expected_weights = provenance.get("generator_weights", {}).get("sha256")
+    actual_weights = reference_weight_metadata.get("sha256")
+    if not expected_weights or expected_weights != actual_weights:
+        raise ValueError(
+            "Reference generator-weight digest does not match training.")
+    return (
+        converted["reference_fit"],
+        converted["checkpoint_validation"],
+        converted["threshold_tune"],
+    )
 
 
 def class_assignment_diagnostics(true_labels, score_products, weights=None):
@@ -772,6 +871,33 @@ def nuisance_auditor(train_latents, train_ae, test_latents, test_ae, bin_edges,
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def ABCD(config):
+    evaluation_protocol = config.get("evaluation_protocol", "heldout")
+    if evaluation_protocol not in {"heldout", "legacy_main_qcd"}:
+        raise ValueError(
+            f"Unsupported evaluation_protocol={evaluation_protocol!r}.")
+    reference_pt = config.get("reference_pt")
+    if evaluation_protocol == "heldout":
+        if not reference_pt:
+            raise ValueError("Held-out evaluation requires --reference_pt.")
+        if not config.get("reference_weights") or not config.get("test_weights"):
+            raise ValueError(
+                "Held-out evaluation requires both reference and test weights.")
+        if os.path.realpath(reference_pt) == os.path.realpath(config["test_pt"]):
+            raise ValueError(
+                "Held-out reference and report samples must be different files.")
+        if config.get("abcd_scope", "qcd") != "qcd" or config.get(
+                "score_mode", "qcd_md") != "qcd_md":
+            raise ValueError(
+                "heldout requires --abcd_scope qcd --score_mode qcd_md.")
+    else:
+        if reference_pt or config.get("reference_weights") or config.get("test_weights"):
+            raise ValueError(
+                "legacy_main_qcd must be unweighted and must not receive a reference file.")
+        if config.get("abcd_scope", "qcd") != "qcd" or config.get(
+                "score_mode", "qcd_md") != "qcd_md":
+            raise ValueError(
+                "legacy_main_qcd requires --abcd_scope qcd --score_mode qcd_md.")
+
     print("Logging in to wandb...", flush=True)
     wandb.login()
     resume_id = config.get("resume_run_id", None)
@@ -793,7 +919,6 @@ def ABCD(config):
     qcd_label = int(config.get("qcd_label", 1))
     abcd_scope = config.get("abcd_scope", "qcd")
     score_mode = config.get("score_mode", "qcd_md")
-    reference_pt = config.get("reference_pt")
     if not baseline_labels:
         raise ValueError("baseline_labels must contain at least one label")
     if bool(config.get("min_md")):
@@ -810,13 +935,21 @@ def ABCD(config):
 
     # ── load models ───────────────────────────────────────────────────────────
     model, main_ckpt = load_nurd_model(config["ckpt"], device)
+    expected_ae_hash = main_ckpt.get("ae_checkpoint_sha256")
+    if evaluation_protocol == "heldout" and not expected_ae_hash:
+        raise ValueError("Held-out checkpoint is missing ae_checkpoint_sha256.")
+    if expected_ae_hash:
+        actual_ae_hash = file_sha256(config["ae_ckpt"])
+        if actual_ae_hash != expected_ae_hash:
+            raise ValueError(
+                "AE checkpoint digest does not match the NURD checkpoint.")
     ae_scaler = main_ckpt["ae_scaler"]
     ae = load_ae(config["ae_ckpt"], ae_scaler, device)
 
     # The reference file is the original training sample. Its model-validation
     # split selects thresholds; the independent test file is report-only.
     ae_reference = None
-    if reference_pt:
+    if evaluation_protocol == "heldout":
         print("Computing AE scores (reference)...", flush=True)
         ae_reference, reference_weights, reference_weight_metadata = compute_ae_scores(
             ae, ae_scaler, reference_pt, device,
@@ -842,28 +975,29 @@ def ABCD(config):
         reference_latents, reference_logits, reference_labels = embed_pf(
             model, reference_pt, device,
             batch_size=config.get("batch_size", 512))
-        fit_idx, calibration_idx, reference_tune_idx = make_reference_splits(
-            reference_labels,
-            val_fraction=float(config.get("reference_val_fraction", 0.1)),
-            calibration_fraction=float(config.get("reference_calibration_fraction", 0.5)),
-            seed=int(config.get("reference_split_seed", 42)))
+        fit_idx, checkpoint_validation_idx, reference_tune_idx = (
+            checkpoint_reference_splits(
+                main_ckpt, reference_labels, reference_weight_metadata))
+        # Keep threshold tuning isolated from every fitted score component.
+        # QCD MD itself does not use empirical calibration, while the optional
+        # all-background diagnostics use the already-spent checkpoint split.
+        calibration_idx = checkpoint_validation_idx
+        reference_shrinkage = float(
+            main_ckpt.get("config", {}).get("md_proxy_shrinkage", 0.0))
         references = fit_class_references(
             reference_latents, reference_labels, fit_idx, calibration_idx,
             baseline_labels, n_components=config.get("n_pca"),
-            sample_weights=reference_weights)
-        threshold_tune_source = "disjoint_uncalibrated_validation"
-        if score_mode == "qcd_md":
-            # QCD MD uses only the covariance fitted on fit_idx; it does not use
-            # empirical tail calibration. Reclaim the full untouched validation
-            # split for statistically stronger threshold selection.
-            reference_tune_idx = np.concatenate(
-                [calibration_idx, reference_tune_idx])
-            threshold_tune_source = "full_model_validation"
+            sample_weights=reference_weights,
+            shrinkage=reference_shrinkage)
+        threshold_tune_source = "checkpoint_contract_threshold_tune"
         reference_details = {
             "fit_n": int(len(fit_idx)),
+            "checkpoint_validation_n": int(len(checkpoint_validation_idx)),
             "calibration_n": int(len(calibration_idx)),
             "threshold_tune_n": int(len(reference_tune_idx)),
             "threshold_tune_source": threshold_tune_source,
+            "calibration_source": "checkpoint_validation",
+            "covariance_shrinkage": reference_shrinkage,
             "per_class_fit": {
                 str(label): int(np.count_nonzero(reference_labels[fit_idx] == label))
                 for label in baseline_labels
@@ -882,8 +1016,8 @@ def ABCD(config):
             flush=True)
     else:
         print(
-            "WARNING: no --reference_pt supplied. Latent references are fit on the "
-            "test sample, so this compatibility mode must not be quoted as final.",
+            "Legacy main QCD protocol: fitting the QCD MD reference and "
+            "selecting thresholds on the complete old test sample.",
             flush=True)
         reference_latents = reference_logits = reference_labels = None
         reference_axis2 = reference_tune_idx = None
@@ -893,12 +1027,9 @@ def ABCD(config):
         model, config["test_pt"], device,
         batch_size=config.get("batch_size", 512))
     if not reference_pt:
-        fit_idx, calibration_idx, _ = make_reference_splits(
-            labels, val_fraction=0.2, calibration_fraction=0.25,
-            seed=int(config.get("reference_split_seed", 42)))
-        references = fit_class_references(
-            latents_all, labels, fit_idx, calibration_idx, baseline_labels,
-            n_components=config.get("n_pca"), sample_weights=bkg_weights)
+        references = fit_legacy_main_qcd_reference(
+            latents_all, labels, qcd_label=qcd_label,
+            n_components=config.get("n_pca"))
     con_bkg, score_products = score_latents(
         latents_all, logits_all, references,
         score_mode=score_mode, qcd_label=qcd_label)
@@ -973,6 +1104,7 @@ def ABCD(config):
             dcor_sample_size=dcor_sample_size,
             weights=weights_masked),
         "score_definition": {
+            "evaluation_protocol": evaluation_protocol,
             "mode": score_mode,
             "abcd_scope": abcd_scope,
             "reference_source": reference_pt,
@@ -1097,8 +1229,15 @@ def ABCD(config):
     min_region_frac = float(config.get("min_region_frac", 0.01))
     max_ratio_unc = float(config.get("max_ratio_unc", 0.05))
     selection_folds = int(config.get("selection_folds", 5))
-    holdout_frac = float(config.get("closure_holdout_frac", 0.5))
     split_seed = int(config.get("closure_split_seed", 42))
+    if evaluation_protocol == "legacy_main_qcd":
+        min_A_frac = 0.0
+        min_region_frac = 0.0
+        max_ratio_unc = float("inf")
+        selection_folds = 1
+        selection_stat_weight = 0.0
+        selection_neighbor_weight = 0.0
+        selection_neighbor_radius = 0
     if abcd_scope in {"all_baselines", "baselines"}:
         axis1_report = axis1_baselines
         axis2_report = axis2_baselines
@@ -1131,31 +1270,34 @@ def ABCD(config):
         axis1_tune = ae_reference[reference_candidates]
         axis2_tune = reference_axis2[reference_candidates]
         weights_tune = reference_weights[reference_candidates]
-        closure_mode = "train_validation_to_independent_test"
+        closure_mode = "disjoint_train_tune_to_independent_test"
     else:
-        tune_idx, report_idx, closure_mode = split_for_threshold_report(
-            len(axis1_report), holdout_frac=holdout_frac, seed=split_seed,
-            axis1=axis1_report, axis2=axis2_report,
-            strata_labels=labels_report if scope_name == "all_baselines" else None)
-        axis1_tune, axis2_tune = axis1_report[tune_idx], axis2_report[tune_idx]
-        weights_tune = weights_report[tune_idx]
-        axis1_report, axis2_report = axis1_report[report_idx], axis2_report[report_idx]
-        weights_report = weights_report[report_idx]
-        labels_report = labels_report[report_idx]
+        axis1_tune, axis2_tune = axis1_report, axis2_report
+        weights_tune = weights_report
+        closure_mode = "legacy_main_same_sample_qcd"
     print(
         f"ABCD threshold scope: {scope_name}; mode: {closure_mode}; "
         f"tune={len(axis1_tune)} report={len(axis1_report)}",
         flush=True,
     )
 
-    best_tune, tune_grid_summary = scan_abcd_grid(
-        axis1_tune, axis2_tune, percent, min_A=min_A, min_D=min_D,
-        min_A_frac=min_A_frac, selection_stat_weight=selection_stat_weight,
-        selection_neighbor_weight=selection_neighbor_weight,
-        selection_neighbor_radius=selection_neighbor_radius,
-        min_region_frac=min_region_frac, max_ratio_unc=max_ratio_unc,
-        selection_folds=selection_folds, selection_seed=split_seed,
-        weights=weights_tune)
+    if evaluation_protocol == "legacy_main_qcd":
+        best_tune, tune_grid_summary = scan_main_legacy_qcd(
+            axis1_tune, axis2_tune, percent, min_A=min_A, min_D=min_D)
+        if "t1" in best_tune:
+            best_tune["legacy_nonclosure"] = best_tune["nonclosure"]
+            best_tune["log_nonclosure"] = float(np.log(max(
+                best_tune["ratio"], 1e-12)))
+            best_tune["selection_score"] = abs(best_tune["nonclosure"])
+    else:
+        best_tune, tune_grid_summary = scan_abcd_grid(
+            axis1_tune, axis2_tune, percent, min_A=min_A, min_D=min_D,
+            min_A_frac=min_A_frac, selection_stat_weight=selection_stat_weight,
+            selection_neighbor_weight=selection_neighbor_weight,
+            selection_neighbor_radius=selection_neighbor_radius,
+            min_region_frac=min_region_frac, max_ratio_unc=max_ratio_unc,
+            selection_folds=selection_folds, selection_seed=split_seed,
+            weights=weights_tune)
     if "t1" not in best_tune:
         raise RuntimeError(
             "No ABCD working point found on threshold-tuning split. "
@@ -1178,17 +1320,21 @@ def ABCD(config):
         "selection_log_nonclosure": float(best_tune["log_nonclosure"]),
         "selection_score": float(best_tune.get("selection_score", np.nan)),
     })
-    best_report_scan, grid_summary = scan_abcd_grid(
-        axis1_report, axis2_report, percent, min_A=min_A, min_D=min_D,
-        min_A_frac=min_A_frac, selection_stat_weight=selection_stat_weight,
-        selection_neighbor_weight=selection_neighbor_weight,
-        selection_neighbor_radius=selection_neighbor_radius,
-        min_region_frac=min_region_frac, max_ratio_unc=max_ratio_unc,
-        selection_folds=selection_folds, selection_seed=split_seed,
-        weights=weights_report)
-    legacy_same_sample, legacy_grid_summary = scan_legacy_same_sample(
-        axis1_report, axis2_report, percent,
-        min_A=min_A, min_D=min_D, weights=weights_report)
+    if evaluation_protocol == "legacy_main_qcd":
+        report_at_selected["abcd_over_true_minus_one"] = report_at_selected[
+            "nonclosure"]
+        report_at_selected["nonclosure"] = report_at_selected[
+            "legacy_nonclosure"]
+        best_report_scan, grid_summary = best_tune, tune_grid_summary
+    else:
+        best_report_scan, grid_summary = scan_abcd_grid(
+            axis1_report, axis2_report, percent, min_A=min_A, min_D=min_D,
+            min_A_frac=min_A_frac, selection_stat_weight=selection_stat_weight,
+            selection_neighbor_weight=selection_neighbor_weight,
+            selection_neighbor_radius=selection_neighbor_radius,
+            min_region_frac=min_region_frac, max_ratio_unc=max_ratio_unc,
+            selection_folds=selection_folds, selection_seed=split_seed,
+            weights=weights_report)
     selected_per_class = per_class_abcd_at_thresholds(
         axis1_report, axis2_report, labels_report, baseline_labels, t1_opt,
         t2_opt, weights=weights_report)
@@ -1201,17 +1347,17 @@ def ABCD(config):
         f"(ABCD/true ratio={report_at_selected['ratio']:.4f})",
         flush=True,
     )
-    print(
-        "Legacy weighted same-sample oracle nonclosure: "
-        f"{100.0*legacy_same_sample.get('nonclosure', np.nan):.2f}%",
-        flush=True,
-    )
+    if evaluation_protocol == "legacy_main_qcd":
+        print(
+            "Legacy main QCD same-sample nonclosure: "
+            f"{100.0*report_at_selected['nonclosure']:.2f}%",
+            flush=True,
+        )
 
     diagnostics["abcd_selection"] = {
         "scope": scope_name,
         "score_mode": score_mode,
         "mode": closure_mode,
-        "holdout_frac": holdout_frac,
         "split_seed": split_seed,
         "min_A": min_A,
         "min_A_frac": min_A_frac,
@@ -1233,15 +1379,17 @@ def ABCD(config):
     }
     diagnostics["abcd_grid"] = grid_summary
     diagnostics["abcd_tune_grid"] = tune_grid_summary
-    diagnostics["legacy_same_sample"] = {
-        "warning": (
-            "Thresholds are optimized and reported on the same sample; "
-            "use only for comparison with historical evaluation."
-        ),
-        "generator_weighted": True,
-        "best": legacy_same_sample,
-        "grid": legacy_grid_summary,
-    }
+    if evaluation_protocol == "legacy_main_qcd":
+        diagnostics["legacy_main_qcd"] = {
+            "warning": (
+                "Historical unweighted oracle: QCD MD and thresholds are fit "
+                "and reported on the same old test sample."
+            ),
+            "origin": "origin/main:eval_abcd_nurd.py",
+            "generator_weighted": False,
+            "best": best_tune,
+            "grid": tune_grid_summary,
+        }
     print(
         "ABCD report grid: "
         f"mean |nonclosure|={grid_summary['mean_abs_nonclosure']:.4f}, "
@@ -1266,9 +1414,10 @@ def ABCD(config):
         "ABCD/report_best_nonclosure": float(best_report_scan.get("nonclosure", np.nan)),
         "ABCD/report_best_log_nonclosure": float(best_report_scan.get("log_nonclosure", np.nan)),
         "ABCD/scope_all_baselines": int(scope_name == "all_baselines"),
-        "ABCD/closure_mode_holdout": int(closure_mode.startswith("holdout")),
+        "ABCD/closure_mode_holdout": int(
+            evaluation_protocol == "heldout"),
         "ABCD/closure_mode_independent_test": int(
-            closure_mode == "train_validation_to_independent_test"),
+            evaluation_protocol == "heldout"),
         "ABCD/grid_mean_abs_nonclosure": grid_summary["mean_abs_nonclosure"],
         "ABCD/grid_median_abs_nonclosure": grid_summary["median_abs_nonclosure"],
         "ABCD/grid_p90_abs_nonclosure": grid_summary["p90_abs_nonclosure"],
@@ -1277,15 +1426,15 @@ def ABCD(config):
         "ABCD/B": float(report_at_selected["B"]),
         "ABCD/C": float(report_at_selected["C"]),
         "ABCD/D": float(report_at_selected["D"]),
-        "LegacySameSample/nonclosure": float(
-            legacy_same_sample.get("nonclosure", np.nan)),
-        "LegacySameSample/log_nonclosure": float(
-            legacy_same_sample.get("log_nonclosure", np.nan)),
-        "LegacySameSample/grid_median_abs_nonclosure": (
-            legacy_grid_summary["median_abs_nonclosure"]),
-        "LegacySameSample/grid_p90_abs_nonclosure": (
-            legacy_grid_summary["p90_abs_nonclosure"]),
     })
+    if evaluation_protocol == "legacy_main_qcd":
+        wandb.log({
+            "LegacyMainQCD/nonclosure": float(best_tune["nonclosure"]),
+            "LegacyMainQCD/grid_median_abs_nonclosure": (
+                tune_grid_summary["median_abs_nonclosure"]),
+            "LegacyMainQCD/grid_p90_abs_nonclosure": (
+                tune_grid_summary["p90_abs_nonclosure"]),
+        })
 
     if sig_axis1 is not None and sig_axis2 is not None:
         sig_A, sig_B, sig_C, sig_D = abcd_counts_at_thresholds(
@@ -1605,8 +1754,12 @@ def ABCD(config):
         int(curve_percent_steps))
 
     for p in curve_percent:
-        t1, t2, _A, _B, _C, _D = abcd_counts(
-            curve_axis1, curve_axis2, p, p, weights=curve_weights)
+        if evaluation_protocol == "legacy_main_qcd":
+            t1 = float(np.quantile(curve_axis1, p))
+            t2 = float(np.quantile(curve_axis2, p))
+        else:
+            t1, t2, _A, _B, _C, _D = abcd_counts(
+                curve_axis1, curve_axis2, p, p, weights=curve_weights)
         record = abcd_record_at_thresholds(
             curve_axis1, curve_axis2, t1, t2, weights=curve_weights)
         effs.append(record["A"] / max(Ntot_bkg, 1e-12))
@@ -1652,10 +1805,10 @@ def ABCD(config):
 
     fig, ax = plt.subplots(figsize=fig_size)
     curve_label = f"AE + {score_label}"
-    if closure_mode == "train_validation_to_independent_test":
+    if evaluation_protocol == "heldout":
         curve_label += " independent test"
-    elif closure_mode.startswith("holdout"):
-        curve_label += " held-out"
+    else:
+        curve_label += " legacy main QCD"
     ax.plot(effs, closure_ratio, c="g", label=curve_label)
     ax.fill_between(effs, closure_ratio - closure_unc, closure_ratio + closure_unc,
                     facecolor="g", alpha=0.5, interpolate=True)
@@ -1704,7 +1857,7 @@ def ABCD(config):
             "tune_log_nonclosure": float(best_tune["log_nonclosure"]),
             "report_best_nonclosure": float(best_report_scan.get("nonclosure", np.nan)),
             "report_best_log_nonclosure": float(best_report_scan.get("log_nonclosure", np.nan)),
-            "legacy_same_sample": legacy_same_sample,
+            "evaluation_protocol": evaluation_protocol,
             "abcd_scope": scope_name,
             "score_mode": score_mode,
             "reference_pt": reference_pt,
@@ -1750,6 +1903,11 @@ def ABCD(config):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--evaluation_protocol", default="heldout",
+        choices=["heldout", "legacy_main_qcd"],
+        help="Strict independent weighted result or the exact historical "
+             "origin/main QCD same-sample compatibility result.")
     parser.add_argument("--ckpt",         required=True,
                         help="Path to NURD main checkpoint (checkpoint_main.pth.tar)")
     parser.add_argument("--ae_ckpt",      required=True,
@@ -1823,16 +1981,8 @@ if __name__ == "__main__":
                         help="Max events sampled for Pearson/Spearman correlation diagnostics")
     parser.add_argument("--dcor_sample_size", type=int, default=2_000,
                         help="Max events sampled for distance-correlation diagnostics; 0 disables it")
-    parser.add_argument("--closure_holdout_frac", type=float, default=0.5,
-                        help="Compatibility mode used only without --reference_pt: fraction "
-                             "held out for reporting after threshold selection.")
     parser.add_argument("--closure_split_seed", type=int, default=42,
-                        help="Random seed for QCD tune/report split")
-    parser.add_argument("--reference_val_fraction", type=float, default=0.1,
-                        help="Must match the validation fraction used in train_hlt.py.")
-    parser.add_argument("--reference_calibration_fraction", type=float, default=0.5,
-                        help="Fraction of the untouched model-validation split used to "
-                             "calibrate class MD tails; the rest selects ABCD thresholds.")
+                        help="Random seed for threshold-tuning stability folds.")
     parser.add_argument("--reference_split_seed", type=int, default=42,
                         help="Seed used to reproduce the model train/validation split.")
     parser.add_argument("--wandb_run_name", default=None)

@@ -1,8 +1,8 @@
 #!/bin/bash
-#SBATCH --job-name=nurd_eval_latest
+#SBATCH --job-name=nurd_eval_dual
 #SBATCH --output=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/%x-%j.out
 #SBATCH --error=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/%x-%j.err
-#SBATCH --time=04:00:00
+#SBATCH --time=08:00:00
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:1
@@ -18,28 +18,21 @@ set -u
 BASE="${BASE:-/scratch/gpfs/IOJALVO/mb7126/nurd_hlt}"
 CODE_DIR="${CODE_DIR:-/home/mb7126/nurd_hlt}"
 MEQUINNA_DIR="${MEQUINNA_DIR:-$BASE/data/mequinna_1M_noZB}"
-TEST_PT="${TEST_PT:-$MEQUINNA_DIR/hlt_smcocktail_mequinna_test.pt}"
-REFERENCE_PT="${REFERENCE_PT:-$MEQUINNA_DIR/hlt_smcocktail_mequinna_train.pt}"
-TEST_WEIGHTS="${TEST_WEIGHTS:-$MEQUINNA_DIR/weight_test.pt}"
-REFERENCE_WEIGHTS="${REFERENCE_WEIGHTS:-$MEQUINNA_DIR/weight_train.pt}"
-SIGNAL_WEIGHTS="${SIGNAL_WEIGHTS:-}"
+HELDOUT_TEST_PT="${HELDOUT_TEST_PT:-$MEQUINNA_DIR/hlt_smcocktail_mequinna_test.pt}"
+HELDOUT_REFERENCE_PT="${HELDOUT_REFERENCE_PT:-$MEQUINNA_DIR/hlt_smcocktail_mequinna_train.pt}"
+HELDOUT_TEST_WEIGHTS="${HELDOUT_TEST_WEIGHTS:-$MEQUINNA_DIR/weight_test.pt}"
+HELDOUT_REFERENCE_WEIGHTS="${HELDOUT_REFERENCE_WEIGHTS:-$MEQUINNA_DIR/weight_train.pt}"
+LEGACY_TEST_PT="${LEGACY_TEST_PT:-$BASE/data/hlt_smcocktail_test.pt}"
 SIGNAL_PT="${SIGNAL_PT:-$BASE/data/hlt_signal_TpTp.pt}"
+SIGNAL_WEIGHTS="${SIGNAL_WEIGHTS:-}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-256}"
 AE_BATCH_SIZE="${AE_BATCH_SIZE:-4096}"
 N_PCA="${N_PCA:-6}"
-CORR_SAMPLE_SIZE="${CORR_SAMPLE_SIZE:-50000}"
 DCOR_SAMPLE_SIZE="${DCOR_SAMPLE_SIZE:-2000}"
-CLOSURE_HOLDOUT_FRAC="${CLOSURE_HOLDOUT_FRAC:-0.5}"
-CLOSURE_SPLIT_SEED="${CLOSURE_SPLIT_SEED:-42}"
-NURD_GLOB="${NURD_GLOB:-hlt_nurd_closure_bs4096_weighted_v4_anchor_v12_*}"
-WANDB_NAME_PREFIX="${WANDB_NAME_PREFIX:-weighted_v4_anchor_v12_eval}"
-SYNC_WANDB="${SYNC_WANDB:-0}"
-PREFER_ABCD_CKPT="${PREFER_ABCD_CKPT:-1}"
-PREFER_CLOSURE_CKPT="${PREFER_CLOSURE_CKPT:-0}"
 BASELINE_LABELS="${BASELINE_LABELS:-0,1,2,3}"
-ABCD_SCOPE="${ABCD_SCOPE:-qcd}"
-SCORE_MODE="${SCORE_MODE:-qcd_md}"
-MIN_MD="${MIN_MD:-0}"
+SCAN_PERCENT_MIN="${SCAN_PERCENT_MIN:-0.50}"
+SCAN_PERCENT_MAX="${SCAN_PERCENT_MAX:-0.98}"
+SCAN_PERCENT_STEPS="${SCAN_PERCENT_STEPS:-48}"
 MIN_A="${MIN_A:-50}"
 MIN_A_FRAC="${MIN_A_FRAC:-0.10}"
 MIN_D="${MIN_D:-500}"
@@ -49,53 +42,46 @@ SELECTION_FOLDS="${SELECTION_FOLDS:-5}"
 SELECTION_STAT_WEIGHT="${SELECTION_STAT_WEIGHT:-0.5}"
 SELECTION_NEIGHBOR_WEIGHT="${SELECTION_NEIGHBOR_WEIGHT:-1.0}"
 SELECTION_NEIGHBOR_RADIUS="${SELECTION_NEIGHBOR_RADIUS:-1}"
-SCAN_PERCENT_MIN="${SCAN_PERCENT_MIN:-0.50}"
-SCAN_PERCENT_MAX="${SCAN_PERCENT_MAX:-0.98}"
-SCAN_PERCENT_STEPS="${SCAN_PERCENT_STEPS:-48}"
-CLOSURE_CURVE_PERCENT_MIN="${CLOSURE_CURVE_PERCENT_MIN:-$SCAN_PERCENT_MIN}"
-CLOSURE_CURVE_PERCENT_MAX="${CLOSURE_CURVE_PERCENT_MAX:-$SCAN_PERCENT_MAX}"
-CLOSURE_CURVE_PERCENT_STEPS="${CLOSURE_CURVE_PERCENT_STEPS:-$SCAN_PERCENT_STEPS}"
-CLOSURE_CURVE_XMIN="${CLOSURE_CURVE_XMIN:-}"
-CLOSURE_CURVE_XMAX="${CLOSURE_CURVE_XMAX:-}"
+SYNC_WANDB="${SYNC_WANDB:-0}"
 
 mkdir -p "$BASE/logs" "$BASE/wandb" "$BASE/matplotlib" "$BASE/outputs"
-
 export WANDB_DIR="$BASE/wandb"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export MPLCONFIGDIR="$BASE/matplotlib"
 
 cd "$CODE_DIR"
-
 if [[ -e checkpoints && ! -L checkpoints ]]; then
   echo "ERROR: $CODE_DIR/checkpoints exists and is not a symlink."
-  echo "Move it or back it up, then link checkpoints to $BASE/checkpoints."
   exit 2
 fi
 ln -sfnT "$BASE/checkpoints" checkpoints
 
 if [[ -z "${CKPT:-}" ]]; then
-  if [[ "$PREFER_ABCD_CKPT" == "1" ]]; then
-    CKPT="$(find "$BASE/checkpoints/hlt/hlt" -path "*/$NURD_GLOB/checkpoint_abcd.pth.tar" \
-      -printf '%T@ %p\n' | sort -nr | awk 'NR==1 {print $2}')"
+  if [[ -z "${NURD_EXP:-}" ]]; then
+    echo "ERROR: set exact NURD_EXP or CKPT; wildcard/latest discovery is disabled."
+    exit 2
   fi
-  if [[ -z "${CKPT:-}" && "$PREFER_CLOSURE_CKPT" == "1" ]]; then
-    CKPT="$(find "$BASE/checkpoints/hlt/hlt" -path "*/$NURD_GLOB/checkpoint_closure.pth.tar" \
-      -printf '%T@ %p\n' | sort -nr | awk 'NR==1 {print $2}')"
-  fi
-  if [[ -z "${CKPT:-}" ]]; then
-    CKPT="$(find "$BASE/checkpoints/hlt/hlt" -path "*/$NURD_GLOB/checkpoint_main_*.pth.tar" \
-      -printf '%T@ %p\n' | sort -nr | awk 'NR==1 {print $2}')"
-  fi
+  NURD_DIR="$BASE/checkpoints/hlt/hlt/$NURD_EXP"
+  CKPT="$NURD_DIR/checkpoint_abcd.pth.tar"
 fi
-if [[ -z "${CKPT:-}" || ! -f "$CKPT" ]]; then
-  echo "ERROR: no NURD checkpoint found under $BASE/checkpoints/hlt/hlt matching $NURD_GLOB"
+if [[ ! -s "${CKPT:-}" ]]; then
+  echo "ERROR: statistically eligible ABCD checkpoint not found: ${CKPT:-unset}"
+  echo "The dual evaluation never falls back to a classifier-loss main checkpoint."
   exit 2
 fi
+NURD_EXP="${NURD_EXP:-$(basename "$(dirname "$CKPT")")}" # exact directory name
 
-NURD_EXP="${NURD_EXP:-$(basename "$(dirname "$CKPT")")}"
-CKPT_FILE="$(basename "$CKPT")"
-CKPT_TAG="${CKPT_FILE#checkpoint_main_}"
-CKPT_TAG="${CKPT_TAG%.pth.tar}"
+python - "$CKPT" <<'PY'
+import sys
+import torch
+
+payload = torch.load(sys.argv[1], map_location="cpu")
+if int(payload.get("checkpoint_contract_version", 0)) < 2:
+    raise SystemExit("ERROR: dual evaluation requires a contract-v2 checkpoint.")
+if not payload.get("selection_metric"):
+    raise SystemExit(
+        "ERROR: checkpoint was not selected by the constrained ABCD metric.")
+PY
 
 if [[ -z "${AE_CKPT:-}" ]]; then
   AE_CKPT="$(python - "$CKPT" "$BASE" "$CODE_DIR" <<'PY'
@@ -103,191 +89,151 @@ import os
 import sys
 import torch
 
-ckpt_path, base, code_dir = sys.argv[1:4]
-ckpt = torch.load(ckpt_path, map_location="cpu")
-ae_ckpt = ckpt.get("config", {}).get("ae_ckpt", "")
-if ae_ckpt and not os.path.isabs(ae_ckpt):
-    ae_ckpt = os.path.normpath(os.path.join(code_dir, ae_ckpt))
-if ae_ckpt and not os.path.exists(ae_ckpt) and "/checkpoints/" in ae_ckpt:
-    rel = ae_ckpt.split("/checkpoints/", 1)[1]
-    ae_ckpt = os.path.join(base, "checkpoints", rel)
-print(ae_ckpt)
+checkpoint, base, code_dir = sys.argv[1:]
+payload = torch.load(checkpoint, map_location="cpu")
+path = payload.get("config", {}).get("ae_ckpt", "")
+if path and not os.path.isabs(path):
+    path = os.path.normpath(os.path.join(code_dir, path))
+if path and not os.path.exists(path) and "/checkpoints/" in path:
+    path = os.path.join(base, "checkpoints", path.split("/checkpoints/", 1)[1])
+print(path)
 PY
 )"
 fi
-
-if [[ -z "${AE_CKPT:-}" || ! -f "$AE_CKPT" ]]; then
-  AE_DIR="$(ls -td "$BASE"/checkpoints/hlt/hlt/ae_pretrain_* 2>/dev/null | head -1)"
-  AE_CKPT="$AE_DIR/checkpoint_ae.pth"
-fi
-if [[ ! -f "$AE_CKPT" ]]; then
-  echo "ERROR: AE checkpoint not found. Set AE_CKPT explicitly."
-  echo "Resolved AE_CKPT=$AE_CKPT"
+if [[ ! -s "${AE_CKPT:-}" ]]; then
+  echo "ERROR: the checkpoint's exact AE could not be resolved; set AE_CKPT explicitly."
+  echo "AE_CKPT=${AE_CKPT:-unset}"
   exit 2
 fi
 
-SAFE_PREFIX="$(printf '%s' "${WANDB_NAME_PREFIX}_${ABCD_SCOPE}_${SCORE_MODE}" \
-  | tr -c 'A-Za-z0-9_-' '_')"
-RUN_STAMP="$(date +%Y%m%d_%H%M%S)"
-WANDB_RUN_NAME="${WANDB_RUN_NAME:-${SAFE_PREFIX}_${NURD_EXP}_ckpt_${CKPT_TAG}_abcd}"
-WANDB_RUN_ID="${WANDB_RUN_ID:-eval_${CKPT_TAG}_${RUN_STAMP}}"
-OUTDIR="${OUTDIR:-$BASE/outputs/abcd_${NURD_EXP}_ckpt_${CKPT_TAG}_${SAFE_PREFIX}}"
-
-if [[ ! -f "$TEST_PT" ]]; then
-  echo "ERROR: test sample not found: $TEST_PT"
+CURRENT_COMMIT="$(git rev-parse HEAD)"
+CHECKPOINT_COMMIT="$(python - "$CKPT" <<'PY'
+import sys
+import torch
+payload = torch.load(sys.argv[1], map_location="cpu")
+print(payload.get("config", {}).get("code_commit", ""))
+PY
+)"
+if [[ -z "$CHECKPOINT_COMMIT" || "$CURRENT_COMMIT" != "$CHECKPOINT_COMMIT" ]]; then
+  echo "ERROR: code/checkpoint provenance mismatch."
+  echo "Current:    $CURRENT_COMMIT"
+  echo "Checkpoint: ${CHECKPOINT_COMMIT:-missing}"
   exit 2
 fi
-if [[ ! -f "$REFERENCE_PT" ]]; then
-  echo "ERROR: training reference sample not found: $REFERENCE_PT"
-  exit 2
-fi
-if [[ ! -f "$TEST_WEIGHTS" || ! -f "$REFERENCE_WEIGHTS" ]]; then
-  echo "ERROR: generator-weight files are missing."
-  echo "TEST_WEIGHTS=$TEST_WEIGHTS"
-  echo "REFERENCE_WEIGHTS=$REFERENCE_WEIGHTS"
+if ! git diff --quiet || ! git diff --cached --quiet; then
+  echo "ERROR: tracked code has uncommitted changes."
   exit 2
 fi
 
-SIGNAL_ARGS=()
-if [[ -n "${SIGNAL_PT:-}" && -f "$SIGNAL_PT" ]]; then
-  SIGNAL_ARGS=(--signal_pt "$SIGNAL_PT")
-  if [[ -n "$SIGNAL_WEIGHTS" && -f "$SIGNAL_WEIGHTS" ]]; then
-    SIGNAL_ARGS+=(--signal_weights "$SIGNAL_WEIGHTS")
+EVAL_NAME="${EVAL_NAME:-${NURD_EXP}_eval_${SLURM_JOB_ID:-manual}}"
+if [[ ! "$EVAL_NAME" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "ERROR: EVAL_NAME may contain only letters, numbers, dot, underscore, and dash."
+  exit 2
+fi
+OUTDIR_ROOT="${OUTDIR_ROOT:-$BASE/outputs/$EVAL_NAME}"
+if [[ -d "$OUTDIR_ROOT" && -n "$(find "$OUTDIR_ROOT" -mindepth 1 -print -quit)" ]]; then
+  echo "ERROR: evaluation output already exists and is non-empty: $OUTDIR_ROOT"
+  exit 2
+fi
+mkdir -p "$OUTDIR_ROOT/held-out" "$OUTDIR_ROOT/legacy"
+
+for path in \
+  "$HELDOUT_TEST_PT" "$HELDOUT_REFERENCE_PT" \
+  "$HELDOUT_TEST_WEIGHTS" "$HELDOUT_REFERENCE_WEIGHTS" \
+  "$LEGACY_TEST_PT"; do
+  if [[ ! -s "$path" ]]; then
+    echo "ERROR: required evaluation input is missing: $path"
+    exit 2
+  fi
+done
+
+HELDOUT_SIGNAL_ARGS=()
+LEGACY_SIGNAL_ARGS=()
+if [[ -s "$SIGNAL_PT" ]]; then
+  HELDOUT_SIGNAL_ARGS=(--signal_pt "$SIGNAL_PT")
+  LEGACY_SIGNAL_ARGS=(--signal_pt "$SIGNAL_PT")
+  if [[ -n "$SIGNAL_WEIGHTS" && -s "$SIGNAL_WEIGHTS" ]]; then
+    HELDOUT_SIGNAL_ARGS+=(--signal_weights "$SIGNAL_WEIGHTS")
   fi
 fi
 
-EXTRA_ARGS=()
-if [[ "${MIN_MD:-0}" == "1" ]]; then
-  EXTRA_ARGS+=(--min_md)
-fi
-if [[ "${SKIP_PCA_MD_PLOTS:-0}" == "1" ]]; then
-  EXTRA_ARGS+=(--skip_pca_md_plots)
-fi
-if [[ "${SKIP_EMBEDDING_PCA:-0}" == "1" ]]; then
-  EXTRA_ARGS+=(--skip_embedding_pca)
-fi
-if [[ "${SKIP_NUISANCE_AUDITOR:-0}" == "1" ]]; then
-  EXTRA_ARGS+=(--skip_nuisance_auditor)
-fi
-if [[ -n "$CLOSURE_CURVE_XMIN" ]]; then
-  EXTRA_ARGS+=(--closure_curve_xmin "$CLOSURE_CURVE_XMIN")
-fi
-if [[ -n "$CLOSURE_CURVE_XMAX" ]]; then
-  EXTRA_ARGS+=(--closure_curve_xmax "$CLOSURE_CURVE_XMAX")
-fi
+JOB_TOKEN="${SLURM_JOB_ID:-manual}"
+COMMON_ARGS=(
+  --ckpt "$CKPT"
+  --ae_ckpt "$AE_CKPT"
+  --n_pca "$N_PCA"
+  --batch_size "$EVAL_BATCH_SIZE"
+  --ae_batch_size "$AE_BATCH_SIZE"
+  --dcor_sample_size "$DCOR_SAMPLE_SIZE"
+  --baseline_labels "$BASELINE_LABELS"
+  --abcd_scope qcd
+  --score_mode qcd_md
+  --min_A "$MIN_A"
+  --min_D "$MIN_D"
+  --scan_percent_min "$SCAN_PERCENT_MIN"
+  --scan_percent_max "$SCAN_PERCENT_MAX"
+  --scan_percent_steps "$SCAN_PERCENT_STEPS"
+  --wandb_project nurd-ood-hlt
+)
 
-echo "=== Latest ABCD eval started: $(date) ==="
-echo "Host: $(hostname)"
-echo "Code: $CODE_DIR"
-echo "Results: $OUTDIR"
-echo "AE_CKPT: $AE_CKPT"
-echo "CKPT: $CKPT"
+echo "=== Dual QCD evaluation started: $(date) ==="
 echo "NURD_EXP: $NURD_EXP"
-echo "CKPT_TAG: $CKPT_TAG"
-echo "TEST_PT: $TEST_PT"
-echo "REFERENCE_PT: $REFERENCE_PT"
-echo "TEST_WEIGHTS: $TEST_WEIGHTS"
-echo "REFERENCE_WEIGHTS: $REFERENCE_WEIGHTS"
-echo "SIGNAL_PT: ${SIGNAL_PT:-}"
-echo "EVAL_BATCH_SIZE: $EVAL_BATCH_SIZE"
-echo "AE_BATCH_SIZE: $AE_BATCH_SIZE"
-echo "N_PCA: $N_PCA"
-echo "CORR_SAMPLE_SIZE: $CORR_SAMPLE_SIZE"
-echo "DCOR_SAMPLE_SIZE: $DCOR_SAMPLE_SIZE"
-echo "CLOSURE_HOLDOUT_FRAC: $CLOSURE_HOLDOUT_FRAC"
-echo "CLOSURE_SPLIT_SEED: $CLOSURE_SPLIT_SEED"
-echo "BASELINE_LABELS: $BASELINE_LABELS"
-echo "ABCD_SCOPE: $ABCD_SCOPE"
-echo "SCORE_MODE: $SCORE_MODE"
-echo "MIN_MD: $MIN_MD"
-echo "MIN_A: $MIN_A"
-echo "MIN_A_FRAC: $MIN_A_FRAC"
-echo "MIN_D: $MIN_D"
-echo "MIN_REGION_FRAC: $MIN_REGION_FRAC"
-echo "MAX_RATIO_UNC: $MAX_RATIO_UNC"
-echo "SELECTION_FOLDS: $SELECTION_FOLDS"
-echo "SELECTION_STAT_WEIGHT: $SELECTION_STAT_WEIGHT"
-echo "SELECTION_NEIGHBOR_WEIGHT: $SELECTION_NEIGHBOR_WEIGHT"
-echo "SELECTION_NEIGHBOR_RADIUS: $SELECTION_NEIGHBOR_RADIUS"
-echo "SCAN_PERCENT_MIN: $SCAN_PERCENT_MIN"
-echo "SCAN_PERCENT_MAX: $SCAN_PERCENT_MAX"
-echo "SCAN_PERCENT_STEPS: $SCAN_PERCENT_STEPS"
-echo "CLOSURE_CURVE_PERCENT_MIN: $CLOSURE_CURVE_PERCENT_MIN"
-echo "CLOSURE_CURVE_PERCENT_MAX: $CLOSURE_CURVE_PERCENT_MAX"
-echo "CLOSURE_CURVE_PERCENT_STEPS: $CLOSURE_CURVE_PERCENT_STEPS"
-echo "CLOSURE_CURVE_XMIN: $CLOSURE_CURVE_XMIN"
-echo "CLOSURE_CURVE_XMAX: $CLOSURE_CURVE_XMAX"
-echo "NURD_GLOB: $NURD_GLOB"
-echo "PREFER_ABCD_CKPT: $PREFER_ABCD_CKPT"
-echo "PREFER_CLOSURE_CKPT: $PREFER_CLOSURE_CKPT"
-echo "WANDB_RUN_NAME: $WANDB_RUN_NAME"
-echo "WANDB_RUN_ID: $WANDB_RUN_ID"
-echo "SYNC_WANDB: $SYNC_WANDB"
-echo "W&B mode: $WANDB_MODE"
+echo "CKPT: $CKPT"
+echo "AE_CKPT: $AE_CKPT"
+echo "CODE_COMMIT: $CURRENT_COMMIT"
+echo "OUTPUT_ROOT: $OUTDIR_ROOT"
 
-python -c "import torch; print('torch', torch.__version__, 'cuda build', torch.version.cuda); print('CUDA available:', torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'NO GPU')"
-python -c "import numpy, sklearn, scipy, matplotlib, wandb; print('eval imports ok')"
-
+echo "=== Protocol 1/2: held-out weighted Mequinna report ==="
 python eval_abcd_nurd.py \
-  --ckpt "$CKPT" \
-  --ae_ckpt "$AE_CKPT" \
-  --test_pt "$TEST_PT" \
-  --test_weights "$TEST_WEIGHTS" \
-  --reference_pt "$REFERENCE_PT" \
-  --reference_weights "$REFERENCE_WEIGHTS" \
-  "${SIGNAL_ARGS[@]}" \
-  --outdir "$OUTDIR" \
-  --wandb_project nurd-ood-hlt \
-  --wandb_run_name "$WANDB_RUN_NAME" \
-  --resume_run_id "$WANDB_RUN_ID" \
-  --n_pca "$N_PCA" \
-  --batch_size "$EVAL_BATCH_SIZE" \
-  --ae_batch_size "$AE_BATCH_SIZE" \
-  --corr_sample_size "$CORR_SAMPLE_SIZE" \
-  --dcor_sample_size "$DCOR_SAMPLE_SIZE" \
-  --baseline_labels "$BASELINE_LABELS" \
-  --abcd_scope "$ABCD_SCOPE" \
-  --score_mode "$SCORE_MODE" \
-  --min_A "$MIN_A" \
+  "${COMMON_ARGS[@]}" \
+  --evaluation_protocol heldout \
+  --test_pt "$HELDOUT_TEST_PT" \
+  --test_weights "$HELDOUT_TEST_WEIGHTS" \
+  --reference_pt "$HELDOUT_REFERENCE_PT" \
+  --reference_weights "$HELDOUT_REFERENCE_WEIGHTS" \
+  --outdir "$OUTDIR_ROOT/held-out" \
   --min_A_frac "$MIN_A_FRAC" \
-  --min_D "$MIN_D" \
   --min_region_frac "$MIN_REGION_FRAC" \
   --max_ratio_unc "$MAX_RATIO_UNC" \
   --selection_folds "$SELECTION_FOLDS" \
   --selection_stat_weight "$SELECTION_STAT_WEIGHT" \
   --selection_neighbor_weight "$SELECTION_NEIGHBOR_WEIGHT" \
   --selection_neighbor_radius "$SELECTION_NEIGHBOR_RADIUS" \
-  --scan_percent_min "$SCAN_PERCENT_MIN" \
-  --scan_percent_max "$SCAN_PERCENT_MAX" \
-  --scan_percent_steps "$SCAN_PERCENT_STEPS" \
-  --closure_curve_percent_min "$CLOSURE_CURVE_PERCENT_MIN" \
-  --closure_curve_percent_max "$CLOSURE_CURVE_PERCENT_MAX" \
-  --closure_curve_percent_steps "$CLOSURE_CURVE_PERCENT_STEPS" \
-  --closure_holdout_frac "$CLOSURE_HOLDOUT_FRAC" \
-  --closure_split_seed "$CLOSURE_SPLIT_SEED" \
-  "${EXTRA_ARGS[@]}"
+  --wandb_run_name "${EVAL_NAME}_held_out" \
+  --resume_run_id "dual_${JOB_TOKEN}_held_out" \
+  "${HELDOUT_SIGNAL_ARGS[@]}"
 
-RUN_DIR="$(find "$WANDB_DIR/wandb" -maxdepth 1 -type d -name "offline-run-*-$WANDB_RUN_ID" | sort | tail -1)"
+echo "=== Protocol 2/2: origin/main legacy QCD report ==="
+python eval_abcd_nurd.py \
+  "${COMMON_ARGS[@]}" \
+  --evaluation_protocol legacy_main_qcd \
+  --test_pt "$LEGACY_TEST_PT" \
+  --outdir "$OUTDIR_ROOT/legacy" \
+  --wandb_run_name "${EVAL_NAME}_legacy" \
+  --resume_run_id "dual_${JOB_TOKEN}_legacy" \
+  "${LEGACY_SIGNAL_ARGS[@]}"
 
-echo "=== ABCD outputs ==="
-find "$OUTDIR" -maxdepth 2 -type f | sort
-echo "W&B offline run: $RUN_DIR"
-if [[ -n "$RUN_DIR" ]]; then
-  echo "W&B sync command: wandb sync $RUN_DIR"
-fi
+python scripts/summarize_dual_eval.py \
+  --root "$OUTDIR_ROOT" \
+  --ckpt "$CKPT" \
+  --ae-ckpt "$AE_CKPT" \
+  --nurd-exp "$NURD_EXP" \
+  --code-commit "$CURRENT_COMMIT"
+
+echo "=== Evaluation outputs ==="
+find "$OUTDIR_ROOT" -maxdepth 2 -type f | sort
+echo "Primary result: $OUTDIR_ROOT/held-out"
+echo "Legacy comparison: $OUTDIR_ROOT/legacy"
+echo "Combined summary: $OUTDIR_ROOT/evaluation_summary.json"
 
 if [[ "$SYNC_WANDB" == "1" ]]; then
-  if [[ -z "${WANDB_API_KEY:-}" && -f "$HOME/.secrets/wandb_api_key" ]]; then
-    export WANDB_API_KEY="$(cat "$HOME/.secrets/wandb_api_key")"
-  fi
-  if [[ -z "${WANDB_API_KEY:-}" ]]; then
-    echo "WARNING: SYNC_WANDB=1 but WANDB_API_KEY is unset and $HOME/.secrets/wandb_api_key is missing."
-  elif [[ -z "$RUN_DIR" ]]; then
-    echo "WARNING: SYNC_WANDB=1 but no offline run directory was found for $WANDB_RUN_ID."
-  else
-    wandb sync "$RUN_DIR" || echo "WARNING: wandb sync failed; rerun the printed sync command from a login node."
-  fi
+  mapfile -t RUN_DIRS < <(find "$WANDB_DIR/wandb" -maxdepth 1 -type d \
+    \( -name "offline-run-*-dual_${JOB_TOKEN}_held_out" \
+       -o -name "offline-run-*-dual_${JOB_TOKEN}_legacy" \) | sort)
+  for run_dir in "${RUN_DIRS[@]}"; do
+    wandb sync "$run_dir" || echo "WARNING: wandb sync failed for $run_dir"
+  done
 fi
 
-echo "ABCD EVAL DONE"
-echo "=== Latest ABCD eval finished: $(date) ==="
+echo "DUAL QCD EVAL DONE"
+echo "=== Dual QCD evaluation finished: $(date) ==="

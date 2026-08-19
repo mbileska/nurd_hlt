@@ -43,7 +43,12 @@ from utils.hlt_training_stats import (
     soft_conditioner_profile_loss,
     weighted_resample_indices,
 )
-from utils.event_weights import weighted_quantile, weighted_quantile_numpy
+from utils.event_weights import (
+    file_sha256,
+    validate_shared_data_contract,
+    weighted_quantile,
+    weighted_quantile_numpy,
+)
 from utils.hlt_closure_losses import soft_abcd_tail_loss
 
 # ── Contrastive losses ────────────────────────────────────────────────────────
@@ -54,7 +59,7 @@ class SupConLoss(nn.Module):
         self.T  = temperature
         self.Tb = base_temperature
 
-    def forward(self, features, labels, weights=None):
+    def forward(self, features, labels, weights=None, weight_normalizer=None):
         features = features.float()
         if features.dim() < 3:
             features = features.unsqueeze(1)
@@ -87,7 +92,10 @@ class SupConLoss(nn.Module):
         loss = loss.view(B)
         if weights is not None:
             weights = weights.float().view(-1).to(device)
-            return (loss * weights).sum() / weights.sum().clamp(min=1e-8)
+            if weight_normalizer is None:
+                return (loss * weights).sum() / weights.sum().clamp(min=1e-8)
+            return (loss * weights).mean() / max(
+                float(weight_normalizer), 1e-8)
         return loss.mean()
 
 
@@ -315,6 +323,9 @@ def compute_qcd_closure_loss(activations, labels, ae_reco, gen_weights, args,
         proxy_type=args.md_proxy_type, update=update,
         weights=gen_weights)
     qcd_weights = gen_weights[qcd_mask].float()
+    if float(qcd_weights.detach().sum().item()) <= 0.0:
+        zero = activations.sum() * 0.0
+        return zero, {}, n_qcd
     qcd_ae = ae_reco[qcd_mask].float()
     qcd_md = proxy_md[qcd_mask].float()
     objective_weights = qcd_weights
@@ -465,6 +476,9 @@ parser.add_argument("--gen_weights", default=None, type=str,
                     help="Event-aligned non-negative generator weights (.pt).")
 parser.add_argument("--ae_ckpt",    required=True,  type=str, help="Path to pre-trained AE checkpoint (.pth)")
 parser.add_argument("--val_split",  default=0.1,    type=float)
+parser.add_argument("--threshold_tune_fraction", default=0.5, type=float,
+                    help="Fraction of --val_split reserved exclusively for later "
+                         "ABCD threshold tuning. The remainder selects checkpoints.")
 parser.add_argument("--n_bins",     default=20,     type=int, help="Nuisance bins for AE reco loss")
 parser.add_argument("--nuisance_bin_scope", default="qcd",
                     choices=["all", "qcd", "per_class", "per_label", "baseline_per_class"],
@@ -474,9 +488,9 @@ parser.add_argument("--baseline_labels", default="0,1,2,3", type=str,
                     help="Comma/space-separated background labels to target for all-baseline training/eval.")
 # Training
 parser.add_argument("--training_profile", default="custom",
-                    choices=["custom", "weighted_v4_anchor"],
+                    choices=["custom", "weighted_v4_x4"],
                     help="Named, validated training configuration. The Della wrapper uses "
-                         "weighted_v4_anchor; use custom for deliberate ablations.")
+                         "weighted_v4_x4; use custom for deliberate ablations.")
 parser.add_argument("--epochs",         default=100,    type=int)
 parser.add_argument("--reweight_epochs",default=0,      type=int)
 parser.add_argument("--critic_epochs",  default=2,      type=int)
@@ -524,6 +538,8 @@ parser.add_argument("--local_rank",     default=-1,             type=int)
 parser.add_argument("--manualSeed",     default=None,           type=int)
 parser.add_argument("--local_testing",  default=0,              type=int)
 parser.add_argument("--max_events",     default=-1,             type=int)
+parser.add_argument("--code_commit", default=None, type=str,
+                    help="Git commit recorded by the launcher for provenance checks.")
 parser.add_argument("--critic_schedule", default="warmup",
                     choices=["warmup", "per_epoch", "per_batch"],
                     help="'warmup' trains the critic on selected batches and ramps lambda; "
@@ -552,10 +568,10 @@ parser.add_argument("--critic_shuffle", default="global",
                     choices=["within_label", "global"],
                     help="For density-ratio critics, shuffle nuisance bins within labels to test "
                          "r ⟂ z conditional on class instead of learning class/nuisance priors.")
-parser.add_argument("--critic_weighted_shuffle", default=0, type=int,
+parser.add_argument("--critic_weighted_shuffle", default=1, type=int,
                     choices=[0, 1],
-                    help="Post-V4 option that resamples shuffled nuisance values by event mass. "
-                         "Keep 0 for the faithful V4 anchor.")
+                    help="Sample shuffled nuisance values from the same physical event "
+                         "measure used by the critic. Required for weighted data.")
 # Warmup critic schedule parameters (used when --critic_schedule warmup)
 parser.add_argument("--critic_warmup_epochs", default=7,        type=int,
                     help="Epochs to train critic without applying penalty (let contrastive converge first)")
@@ -609,9 +625,8 @@ parser.add_argument("--closure_dcorr_weight", default=1.0, type=float,
                     help="Internal weight for distance-correlation component of dcorr_profile closure loss.")
 parser.add_argument("--closure_profile_weight", default=0.5, type=float,
                     help="Internal weight for profile-flatness component of dcorr_profile closure loss.")
-parser.add_argument("--closure_reverse_profile_weight", default=0.0, type=float,
-                    help="Optional post-V4 reverse profile term. Keep 0 for the faithful V4 anchor; "
-                         "the nominal V4 term had no encoder gradient.")
+parser.add_argument("--closure_reverse_profile_weight", default=0.5, type=float,
+                    help="V4 reverse-profile coefficient; the conditioner-gradient bug is fixed.")
 parser.add_argument("--closure_profile_bins", default=8, type=int,
                     help="Number of AE quantile bins for profile-flatness closure loss.")
 parser.add_argument("--closure_profile_tail_weight", default=2.0, type=float,
@@ -620,8 +635,8 @@ parser.add_argument("--closure_dcorr_max_samples", default=512, type=int,
                     help="Maximum selected-class events per batch used by distance correlation; <=0 uses all.")
 parser.add_argument("--closure_physical_resample", default=0, type=int,
                     choices=[0, 1],
-                    help="Resample QCD from the generator-weighted physical measure before applying "
-                         "the complete V3/V4 closure objective.")
+                    help="Optional post-V4 stochastic QCD resampling. The V4x4 profile keeps "
+                         "this off and applies generator weights analytically.")
 parser.add_argument("--closure_resample_size", default=1024, type=int,
                     help="Maximum physical-QCD draws per batch for closure; <=0 uses the raw QCD count.")
 parser.add_argument("--closure_tail_abcd_weight", default=1.0, type=float,
@@ -647,20 +662,19 @@ parser.add_argument("--val_abcd_min_events", default=20, type=int,
                     help="Minimum hard events per class and validation ABCD region.")
 parser.add_argument("--val_abcd_min_region_frac", default=0.005, type=float,
                     help="Minimum fraction of validation QCD required in every ABCD region.")
-parser.add_argument("--val_abcd_min_effective_events", default=0.0, type=float,
+parser.add_argument("--val_abcd_min_effective_events", default=20.0, type=float,
                     help="Minimum generator-weight effective events in every validation ABCD region.")
-parser.add_argument("--val_abcd_max_ratio_unc", default=float("inf"), type=float,
+parser.add_argument("--val_abcd_max_ratio_unc", default=0.15, type=float,
                     help="Maximum propagated ABCD ratio uncertainty used by checkpoint selection.")
 parser.add_argument("--val_abcd_tail_min_quantile", default=0.80, type=float,
                     help="Quantiles at or above this value are treated as tail cuts in the validation score.")
 parser.add_argument("--val_md_folds", default=2, type=int,
                     help="Cross-fitting folds for validation QCD Mahalanobis distance.")
-parser.add_argument("--val_md_mode", default="ema", choices=["ema", "cross_fitted"],
-                    help="V4 uses the lagged EMA MD for checkpoint selection. Cross-fitting is "
-                         "available only as an explicit later-method comparison.")
-parser.add_argument("--abcd_ckpt_smoothing_epochs", default=1, type=int,
+parser.add_argument("--val_md_mode", default="cross_fitted", choices=["ema", "cross_fitted"],
+                    help="Cross-fitted validation MD prevents self-scoring during checkpoint selection.")
+parser.add_argument("--abcd_ckpt_smoothing_epochs", default=5, type=int,
                     help="Rolling-median window for ABCD checkpoint selection.")
-parser.add_argument("--abcd_ckpt_min_epoch", default=1, type=int,
+parser.add_argument("--abcd_ckpt_min_epoch", default=20, type=int,
                     help="Do not select a closure checkpoint before this completed epoch.")
 parser.add_argument("--qcd_label",            default=1,     type=int,
                     help="Label index for QCD compatibility modes.")
@@ -680,8 +694,7 @@ parser.add_argument("--no_mi_norm",           action="store_true",
 parser.add_argument("--offload_critic_graph", action="store_true",
                     help="Compatibility flag from older scripts; the critic now reuses the "
                          "main forward activations, so no extra critic graph is offloaded.")
-args, unknown = parser.parse_known_args()
-print(f"Unknown args: {unknown}")
+args = parser.parse_args()
 args.baseline_labels_values = parse_int_list(args.baseline_labels)
 args.critic_bin_resolutions_values = parse_int_list(args.critic_bin_resolutions)
 args.closure_tail_quantiles_values = parse_float_list(args.closure_tail_quantiles)
@@ -697,59 +710,95 @@ if args.critic_type == "bin_pred":
             "Every --critic_bin_resolutions value must divide --n_bins.")
 if args.qcd_batch_fraction != 0.0 and not 0.0 < args.qcd_batch_fraction < 1.0:
     raise ValueError("--qcd_batch_fraction must be 0 or lie in (0, 1).")
-if args.training_profile == "weighted_v4_anchor":
+if args.training_profile == "weighted_v4_x4":
     profile_checks = {
         "epochs": args.epochs == 200,
         "batch_size": args.batch_size == 4096,
         "lr": args.lr == 1e-4,
         "weight_decay": args.weight_decay == 5e-3,
+        "optimizer": args.optimizer == "adam",
+        "cosine": args.cosine == 1,
+        "critic_epochs": args.critic_epochs == 2,
         "reweight": args.reweight == 1,
+        "exact": args.exact == 1,
         "joint_indep": args.joint_indep == 1,
         "lambda": args._lambda == 0.01,
+        "no_mi_norm": args.no_mi_norm,
         "baseline_labels": args.baseline_labels_values == [0, 1, 2, 3],
-        "n_bins": args.n_bins == 20,
+        "n_bins": args.n_bins == 80,
+        "critic_bin_resolutions": args.critic_bin_resolutions_values == [80],
         "nuisance_bin_scope": args.nuisance_bin_scope == "qcd",
+        "critic_schedule": args.critic_schedule == "warmup",
         "critic_type": args.critic_type == "density_ratio",
         "critic_penalty_type": args.critic_penalty_type == "ratio_to_one",
         "critic_scope": args.critic_scope == "qcd",
         "critic_shuffle": args.critic_shuffle == "global",
-        "critic_weighted_shuffle": args.critic_weighted_shuffle == 0,
+        "critic_weighted_shuffle": args.critic_weighted_shuffle == 1,
         "n_critic_steps_per_batch": args.n_critic_steps_per_batch == 1,
+        "critic_train_frac": args.critic_train_frac == 1.0,
+        "critic_warmup_epochs": args.critic_warmup_epochs == 7,
+        "critic_ramp_epochs": args.critic_ramp_epochs == 10,
+        "critic_lr_multiplier": args.critic_lr_multiplier == 10.0,
         "qcd_batch_fraction": args.qcd_batch_fraction == 0.0,
         "contrast_weight": args.contrast_weight == 0.02,
         "contrast_weight_start": args.contrast_weight_start == 0.15,
         "contrast_ramp_epochs": args.contrast_ramp_epochs == 40,
+        "contrast_temp": args.contrast_temp == 0.05,
+        "embed_size": args.embed_size == 128,
+        "latent_dim": args.latent_dim == 6,
+        "proj_dim": args.proj_dim == 6,
+        "num_heads": args.num_heads == 8,
+        "num_layers": args.num_layers == 4,
+        "dim_ff": args.dim_ff == 512,
+        "linear_dim": args.linear_dim == 16,
         "closure_weight": args.closure_weight == 1.0,
         "closure_weight_start": args.closure_weight_start == 0.0,
         "closure_ramp_epochs": args.closure_ramp_epochs == 15,
         "closure_loss_type": args.closure_loss_type == "hybrid",
         "closure_scope": args.closure_scope == "qcd",
+        "closure_class_min_events": args.closure_class_min_events == 20,
+        "closure_class_weighting": args.closure_class_weighting == "equal",
         "closure_score_mode": args.closure_score_mode == "own_class",
         "closure_corr_weight": args.closure_corr_weight == 0.25,
         "closure_dcorr_weight": args.closure_dcorr_weight == 1.0,
         "closure_profile_weight": args.closure_profile_weight == 0.5,
         "closure_reverse_profile_weight": (
-            args.closure_reverse_profile_weight == 0.0),
+            args.closure_reverse_profile_weight == 0.5),
+        "closure_profile_bins": args.closure_profile_bins == 8,
+        "closure_profile_tail_weight": args.closure_profile_tail_weight == 2.0,
+        "closure_dcorr_max_samples": args.closure_dcorr_max_samples == 512,
         "closure_physical_resample": args.closure_physical_resample == 0,
         "closure_tail_abcd_weight": args.closure_tail_abcd_weight == 1.0,
         "closure_tail_quantiles": (
             args.closure_tail_quantiles_values == [0.50, 0.65, 0.80, 0.90]),
+        "closure_tail_scale": args.closure_tail_scale == 12.0,
+        "closure_tail_min_events": args.closure_tail_min_events == 5,
+        "closure_tail_focus_weight": args.closure_tail_focus_weight == 2.0,
         "max_weight_ratio": args.max_weight_ratio == 10.0,
         "md_proxy_type": args.md_proxy_type == "ema",
         "md_ema_momentum": args.md_ema_momentum == 0.05,
         "md_proxy_shrinkage": args.md_proxy_shrinkage == 0.0,
-        "val_md_mode": args.val_md_mode == "ema",
-        "abcd_ckpt_smoothing_epochs": args.abcd_ckpt_smoothing_epochs == 1,
-        "abcd_ckpt_min_epoch": args.abcd_ckpt_min_epoch == 1,
+        "val_md_mode": args.val_md_mode == "cross_fitted",
+        "val_md_folds": args.val_md_folds == 2,
+        "val_abcd_quantiles": args.val_abcd_quantiles_values == [
+            0.50, 0.55, 0.60, 0.65, 0.70,
+            0.75, 0.80, 0.85, 0.90, 0.92],
+        "val_abcd_min_events": args.val_abcd_min_events == 20,
+        "val_abcd_min_region_frac": args.val_abcd_min_region_frac == 0.005,
+        "abcd_ckpt_loss_tol": args.abcd_ckpt_loss_tol == 1.10,
+        "abcd_ckpt_smoothing_epochs": args.abcd_ckpt_smoothing_epochs == 5,
+        "abcd_ckpt_min_epoch": args.abcd_ckpt_min_epoch == 20,
         "val_abcd_min_effective_events": (
-            args.val_abcd_min_effective_events == 0.0),
-        "val_abcd_max_ratio_unc": math.isinf(args.val_abcd_max_ratio_unc),
+            args.val_abcd_min_effective_events == 20.0),
+        "val_abcd_max_ratio_unc": args.val_abcd_max_ratio_unc == 0.15,
+        "threshold_tune_fraction": args.threshold_tune_fraction == 0.5,
         "gen_weights": bool(args.gen_weights),
+        "code_commit": bool(args.code_commit),
     }
     mismatches = [name for name, matches in profile_checks.items() if not matches]
     if mismatches:
         raise ValueError(
-            "weighted_v4_anchor received incompatible overrides: "
+            f"{args.training_profile} received incompatible overrides: "
             + ", ".join(mismatches)
             + ". Set --training_profile custom for deliberate ablations."
         )
@@ -817,6 +866,8 @@ def record_metrics(acc, loss, top1, inputs, outputs, targets, losses):
 def record_rw_metrics(acc, loss, inputs, outputs, targets, losses, weights):
     num_correct = torch.max(outputs,1)[1].data == targets
     weight_mass = float(weights.sum().item())
+    if not math.isfinite(weight_mass) or weight_mass <= 0.0:
+        return acc, loss
     acc.update(
         (num_correct * weights).sum().data / weights.sum().data,
         weight_mass)
@@ -966,6 +1017,9 @@ def shuffle_nuisance_bins(z, labels, joint_indep_args, sample_weights=None):
             return source_indices[torch.randperm(
                 source_indices.numel(), device=z.device)]
         local_weights = sample_weights[source_indices].detach().float()
+        if float(local_weights.sum().item()) <= 0.0:
+            return source_indices[torch.randperm(
+                source_indices.numel(), device=z.device)]
         return source_indices[weighted_resample_indices(
             local_weights, source_indices.numel())]
 
@@ -1070,7 +1124,10 @@ def compute_critic_loss_from_activations(activations, labels, nuisances,
 def _apply_critic_weights(losses, weights, joint_indep_args):
     if joint_indep_args.get("critic_type") == "density_ratio":
         weights = weights.repeat(2)
-    return (losses * weights).sum() / weights.sum().clamp(min=1e-8)
+    normalizer = joint_indep_args.get("critic_weight_normalizer")
+    if normalizer is None:
+        return (losses * weights).sum() / weights.sum().clamp(min=1e-8)
+    return (losses * weights).mean() / max(float(normalizer), 1e-8)
 
 
 def classification_weights(exact_weights, gen_weights, targets, reweight_args):
@@ -1089,6 +1146,24 @@ def classification_weights(exact_weights, gen_weights, targets, reweight_args):
     return corrected / corrected.mean().detach().clamp(min=1e-8)
 
 
+def critic_measure_weights(gen_weights, targets, reweight_args):
+    """Physical event measure used by both sides of the QCD critic.
+
+    NURD class/bin weights belong to classification. Including them in the
+    critic joint while drawing shuffled nuisance values from the generator
+    marginal changes the fake distribution and gives the critic an
+    unremovable nuisance-prior shortcut.
+    """
+    weights = gen_weights
+    correction = reweight_args.get("sampling_correction")
+    if correction is None:
+        return weights
+    factors = torch.full_like(weights, float(correction["other"]))
+    factors[targets.long() == int(reweight_args["qcd_label"])] = float(
+        correction["qcd"])
+    return weights * factors
+
+
 def train_critic(critic_model, model, train_loader, critic_criterion, critic_optimizer,
                  epoch, log, reweight_args, joint_indep_args):
     critic_model.train()
@@ -1099,8 +1174,8 @@ def train_critic(critic_model, model, train_loader, critic_criterion, critic_opt
         inputs, targets, nuisances = inputs.to(device), targets.long().to(device), nuisances.to(device)
         exact_weights = exact_weights.to(device)
         gen_weights = gen_weights.to(device)
-        objective_weights = classification_weights(
-            exact_weights, gen_weights, targets, reweight_args)
+        objective_weights = critic_measure_weights(
+            gen_weights, targets, reweight_args)
         inputs_c, targets_c, nuisances_c, scope_mask = select_critic_scope(
             inputs, targets, nuisances, joint_indep_args)
         if inputs_c.size(0) == 0:
@@ -1113,8 +1188,7 @@ def train_critic(critic_model, model, train_loader, critic_criterion, critic_opt
             critic_criterion, joint_indep_args,
             sample_weights=(
                 weights if joint_indep_args["critic_weighted_shuffle"] else None))
-        # V4 trained the critic under the same NURD measure as classification.
-        # Generator weights extend that measure to the new physical sample.
+        # Both joint and shuffled examples use the physical generator measure.
         tensor_loss = _apply_critic_weights(losses, weights, joint_indep_args)
         critic_optimizer.zero_grad()
         tensor_loss.backward(); critic_optimizer.step()
@@ -1132,8 +1206,8 @@ def validate_critic(val_loader, critic_model, model, critic_criterion, epoch, lo
             inputs, targets, nuisances = inputs.to(device), targets.long().to(device), nuisances.to(device)
             exact_weights = exact_weights.to(device)
             gen_weights = gen_weights.to(device)
-            objective_weights = classification_weights(
-                exact_weights, gen_weights, targets, reweight_args)
+            objective_weights = critic_measure_weights(
+                gen_weights, targets, reweight_args)
             inputs_c, targets_c, nuisances_c, scope_mask = select_critic_scope(
                 inputs, targets, nuisances, joint_indep_args)
             if inputs_c.size(0) == 0:
@@ -1275,7 +1349,8 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                 nuisances_c = nuisances[scope_mask]
                 if targets_c.size(0) > 1:
                     act_detached = activations.detach()[scope_mask]
-                    weights_c = weights[scope_mask]
+                    weights_c = critic_measure_weights(
+                        gen_weights, targets, reweight_args)[scope_mask]
                     n_steps = joint_indep_args.get("n_critic_steps_per_batch", 1)
                     for _ in range(n_steps):
                         c_out, c_targets, c_losses, _mi_proxy = compute_critic_loss_from_activations(
@@ -1308,7 +1383,8 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
             scope_mask = critic_scope_mask(targets, joint_indep_args)
             targets_c = targets[scope_mask]
             nuisances_c = nuisances[scope_mask]
-            critic_weights_c = weights[scope_mask]
+            critic_weights_c = critic_measure_weights(
+                gen_weights, targets, reweight_args)[scope_mask]
             critic_scope_frac_m.update(float(targets_c.size(0)) / max(inputs.size(0), 1), inputs.size(0))
             critic_count = max(targets_c.size(0), 1)
             
@@ -1354,7 +1430,9 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                             int(qcd_metric_mask.sum().item()))
                     if lam > 0.0:
                         critic_penalty_loss = full_measure_scoped_mean(
-                            penalty, critic_weights_c, weights)
+                            penalty, critic_weights_c, gen_weights,
+                            fixed_normalizer=reweight_args[
+                                "generator_weight_normalizer"])
                     info_loss_val = raw_mi_val
                 #bin pred critic
                 else:
@@ -1386,18 +1464,23 @@ def train(model, train_loader, val_loader, criterion, optimizer, epoch, log,
                             int(qcd_metric_mask.sum().item()))
                     if lam > 0.0:
                         critic_penalty_loss = full_measure_scoped_mean(
-                            penalty, critic_weights_c, weights)
+                            penalty, critic_weights_c, gen_weights,
+                            fixed_normalizer=reweight_args[
+                                "generator_weight_normalizer"])
                     info_loss_val = raw_mi_val
 
         # NURD reweighting. The critic contribution above uses this same full
         # measure and full-batch denominator, matching V4's per-event reduction.
         rw_acc, rw_loss = record_rw_metrics(rw_acc, rw_loss, inputs, outputs, targets, losses_ce, weights)
-        loss_nurd = (losses_ce * weights).sum() / weights.sum()
+        loss_nurd = (losses_ce * weights).mean() / max(
+            float(reweight_args["classification_weight_normalizer"]), 1e-8)
 
         #contrastive loss
         embeddings  = model.get_embeddings(activations)
         loss_con = contrastive_loss_fn(
-            embeddings, targets, weights)
+            embeddings, targets, weights,
+            weight_normalizer=reweight_args[
+                "classification_weight_normalizer"])
         contrast_w = args.contrast_weight if effective_contrast_weight is None else effective_contrast_weight
         loss_nurd_objective = loss_nurd + (
             lam * critic_penalty_loss
@@ -1538,6 +1621,8 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
             qcd_mask = targets.long() == int(args.qcd_label)
             if qcd_mask.sum() >= args.closure_class_min_events:
                 if joint_indep_args and joint_indep_args["joint_indep"]:
+                    critic_metric_weights = critic_measure_weights(
+                        gen_weights, targets, reweight_args)[qcd_mask]
                     critic_outputs, critic_targets, critic_losses, _ = (
                         compute_critic_loss_from_activations(
                             activations[qcd_mask], targets[qcd_mask],
@@ -1546,17 +1631,17 @@ def validate(val_loader, model, criterion, epoch, log, reweight_args,
                             joint_indep_args["critic_criterion"],
                             joint_indep_args,
                             sample_weights=(
-                                metric_weights[qcd_mask]
+                                critic_metric_weights
                                 if joint_indep_args["critic_weighted_shuffle"]
                                 else None)))
                     critic_acc_m.update(
                         _critic_accuracy(
                             critic_outputs, critic_targets,
-                            metric_weights[qcd_mask]),
+                            critic_metric_weights),
                         int(qcd_mask.sum().item()))
                     critic_ce_m.update(
                         _apply_critic_weights(
-                            critic_losses, metric_weights[qcd_mask],
+                            critic_losses, critic_metric_weights,
                             joint_indep_args).item(),
                         int(qcd_mask.sum().item()))
                 x_log = torch.log(ae_reco[qcd_mask].float().clamp(min=1e-8))
@@ -1694,7 +1779,12 @@ def main():
         qcd_label=args.qcd_label,
         baseline_labels=args.baseline_labels_values,
         gen_weight_path=args.gen_weights,
+        threshold_tune_fraction=args.threshold_tune_fraction,
     )
+    if args.training_profile == "weighted_v4_x4":
+        validate_shared_data_contract(
+            ae_ckpt, train_dataset.provenance,
+            train_dataset.split_indices, args.code_commit)
     log.debug(f"Train: {len(train_dataset)}  Val: {len(val_dataset)}")
     log.debug(f"Generator weights: {gen_weight_metadata}")
 
@@ -1782,7 +1872,20 @@ def main():
         "val_dataset":   val_dataset,
         "sampling_correction": sampling_correction,
         "qcd_label": args.qcd_label,
+        "classification_weight_normalizer": float(
+            (train_dataset.sample_weights
+             * train_dataset.gen_weights).mean().item()),
+        "generator_weight_normalizer": float(
+            train_dataset.gen_weights.mean().item()),
     }
+    critic_scope_train_mask = critic_scope_mask(
+        train_dataset.labels.long(), {
+            "critic_scope": args.critic_scope,
+            "qcd_label": args.qcd_label,
+            "baseline_labels": args.baseline_labels_values,
+        })
+    critic_weight_normalizer = float(
+        train_dataset.gen_weights[critic_scope_train_mask].mean().item())
     critic_chance_ce = math.log(2)
     if args.critic_type == "bin_pred":
         chance_values = []
@@ -1815,6 +1918,7 @@ def main():
         "n_bins":           args.n_bins,
         "critic_bin_resolutions": args.critic_bin_resolutions_values,
         "critic_chance_ce": critic_chance_ce,
+        "critic_weight_normalizer": critic_weight_normalizer,
         "critic_train_frac": args.critic_train_frac,
         "critic_optimizer": (torch.optim.Adam(critic_model.parameters(),
                                               lr=args.lr * args.critic_lr_multiplier,
@@ -1842,6 +1946,11 @@ def main():
             "nuisance_bin_edges": train_dataset.bin_edges,
             "nurd_weight_table": train_dataset.weights,
             "gen_weight_metadata": gen_weight_metadata,
+            "data_provenance": train_dataset.provenance,
+            "data_split_indices": train_dataset.split_indices,
+            "data_split_metadata": train_dataset.split_metadata,
+            "ae_checkpoint_sha256": file_sha256(args.ae_ckpt),
+            "checkpoint_contract_version": 2,
             "md_proxy_state": (
                 None if md_proxy is None else md_proxy.state_dict()),
         }
@@ -1917,6 +2026,12 @@ def main():
         if np.isfinite(val_abcd_score):
             abcd_score_history.append(float(val_abcd_score))
             smoothed_abcd_score = float(np.median(abcd_score_history))
+            # A rolling median alone can improve when an old bad epoch leaves
+            # the window even if the current model is poor. Requiring the
+            # candidate to pay its own raw score keeps the saved weights tied
+            # to the metric used for selection.
+            robust_abcd_score = max(
+                float(val_abcd_score), smoothed_abcd_score)
             loss_ok = (
                 best_loss is None
                 or val_loss <= args.abcd_ckpt_loss_tol * best_loss
@@ -1927,17 +2042,15 @@ def main():
                 and loss_ok
                 and (
                     best_abcd_score is None
-                    or val_abcd_score < best_abcd_score
+                    or robust_abcd_score < best_abcd_score
                 )
             ):
-                # Save the exact epoch whose score improved. The weighted-V4
-                # anchor uses the lagged EMA MD and a one-epoch history.
-                best_abcd_score = float(val_abcd_score)
+                best_abcd_score = float(robust_abcd_score)
                 state = checkpoint_state(epoch)
                 state.update({
                     "selection_metric": (
                         f"{val_abcd.get('selection_mode', 'qcd_md_grid')}_score"),
-                    "selection_value": float(val_abcd_score),
+                    "selection_value": float(robust_abcd_score),
                     "selection_raw_value": float(val_abcd_score),
                     "selection_rolling_median": float(smoothed_abcd_score),
                     "selection_history": list(abcd_score_history),
