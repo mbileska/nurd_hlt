@@ -155,8 +155,8 @@ Success requires `SMOKE DONE`, a main checkpoint, and no traceback.
 
 ## Launch training and both evaluations
 
-The recommended command generates one run tag in the login shell and submits
-an evaluation with an `afterok` dependency on that exact training job:
+The recommended command generates one fresh run tag and submits an evaluation
+with an `afterok` dependency on that exact training job:
 
 ```bash
 cd ~/nurd_hlt
@@ -165,9 +165,12 @@ bash slurm/launch_v4x4_campaign.sh
 ```
 
 The launcher prints the exact run tag, checkpoint directory, output directory,
-training job ID, and evaluation job ID. Training has an 18-hour allocation so
-a roughly 12-hour run is not killed at the boundary. Evaluation has eight hours
-for both protocols.
+training job ID, and evaluation job ID. It always trains a fresh weighted AE and
+ignores old exported run names, checkpoints, and hyperparameters. This is
+intentional: a bare launch is a sealed V4x4 campaign and cannot silently write
+into an earlier run. Training has an 18-hour allocation so a roughly 12-hour
+run is not killed at the boundary. Evaluation has eight hours for both
+protocols.
 
 Monitor the IDs printed by the launcher:
 
@@ -180,19 +183,13 @@ sacct -X -j <train_job>,<eval_job> \
 Training is complete only when its log contains `TRAINING DONE`. Evaluation is
 complete only when its log contains `DUAL QCD EVAL DONE`.
 
-### Reuse an exact AE
-
-Only reuse an AE produced by this contract from the same code commit, new
-Mequinna sample, generator weights, and exact 90/5/5 row partition:
+The AE SHA256 is embedded in every NURD checkpoint and verified during both
+evaluations. An optional explicit run tag can be supplied as the sole argument;
+the launcher refuses to overwrite an existing checkpoint or output directory:
 
 ```bash
-export SKIP_AE=1
-export AE_CKPT=$BASE/checkpoints/hlt/hlt/<exact_ae_exp>/checkpoint_ae.pth
-bash slurm/launch_v4x4_campaign.sh
+bash slurm/launch_v4x4_campaign.sh weighted_v4_x4_my_tag
 ```
-
-The AE SHA256 is embedded in every NURD checkpoint and verified during both
-evaluations.
 
 ## Launch both evaluations for an existing completed run
 

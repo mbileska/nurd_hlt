@@ -24,6 +24,10 @@ Submit one exact training job and its dependent held-out plus legacy evaluation:
 bash slurm/launch_v4x4_campaign.sh
 ```
 
+This is a fresh, sealed campaign: old exported run names, checkpoint paths, and
+training/evaluation hyperparameters are ignored. The launcher trains a new AE
+and refuses to overwrite an existing campaign directory.
+
 The launcher prints both job IDs and the result directory:
 
 ```text

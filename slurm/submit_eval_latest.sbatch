@@ -17,6 +17,21 @@ set -u
 
 BASE="${BASE:-/scratch/gpfs/IOJALVO/mb7126/nurd_hlt}"
 CODE_DIR="${CODE_DIR:-/home/mb7126/nurd_hlt}"
+
+# Seal the dual-evaluation protocol when invoked by the campaign launcher.
+# In particular, discard a stale CKPT: it would otherwise take precedence over
+# the exact new NURD_EXP even though the launcher supplied the right run name.
+if [[ "${EVAL_CONTRACT:-}" == "dual_qcd_v1" ]]; then
+  unset MEQUINNA_DIR HELDOUT_TEST_PT HELDOUT_REFERENCE_PT
+  unset HELDOUT_TEST_WEIGHTS HELDOUT_REFERENCE_WEIGHTS LEGACY_TEST_PT
+  unset SIGNAL_PT SIGNAL_WEIGHTS EVAL_BATCH_SIZE AE_BATCH_SIZE N_PCA
+  unset DCOR_SAMPLE_SIZE BASELINE_LABELS SCAN_PERCENT_MIN SCAN_PERCENT_MAX
+  unset SCAN_PERCENT_STEPS MIN_A MIN_A_FRAC MIN_D MIN_REGION_FRAC
+  unset MAX_RATIO_UNC SELECTION_FOLDS SELECTION_STAT_WEIGHT
+  unset SELECTION_NEIGHBOR_WEIGHT SELECTION_NEIGHBOR_RADIUS SYNC_WANDB
+  unset CKPT OUTDIR_ROOT
+fi
+
 MEQUINNA_DIR="${MEQUINNA_DIR:-$BASE/data/mequinna_1M_noZB}"
 HELDOUT_TEST_PT="${HELDOUT_TEST_PT:-$MEQUINNA_DIR/hlt_smcocktail_mequinna_test.pt}"
 HELDOUT_REFERENCE_PT="${HELDOUT_REFERENCE_PT:-$MEQUINNA_DIR/hlt_smcocktail_mequinna_train.pt}"
