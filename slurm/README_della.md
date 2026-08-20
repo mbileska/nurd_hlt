@@ -18,6 +18,17 @@ Smoke test:
 sbatch slurm/submit_smoke.sbatch
 ```
 
+Read-only input-data audit (CPU, 96 GB; no training dependency):
+
+```bash
+bash slurm/launch_data_audit.sh
+```
+
+The audit writes `data_plots/data_audit_<job-id>/report.md`, machine-readable
+statistics and flagged row indices, plus HEP-style plots comparing weighted
+and unweighted train, held-out test, and legacy samples. It does not modify the
+input tensors or automatically remove any event.
+
 Submit one exact training job and its dependent held-out plus legacy evaluation:
 
 ```bash

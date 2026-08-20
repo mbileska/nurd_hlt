@@ -1,5 +1,28 @@
 # NURD HLT QCD closure
 
+## Audit the input data before another long training run
+
+From the repository directory, submit the read-only train/test/legacy audit:
+
+```bash
+module load anaconda3/2025.12
+conda activate disco
+export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
+bash slurm/launch_data_audit.sh
+```
+
+The launcher prints the Slurm job ID and writes the result to
+`data_plots/data_audit_<job-id>/`. The folder contains `report.md`, full JSON
+statistics, original event indices grouped by flag, and HEP-style feature,
+weight, quality, and train/test/legacy comparison plots. It never edits or
+filters the `.pt` files. Separate tensor-only weight files are explicitly
+reported as having unverifiable row order; exact verification requires event
+IDs stored in both payloads.
+
+Useful overrides can be exported before launching, for example
+`WRITE_PDF=1`, `INCLUDE_LEGACY=0`, or `AUDIT_NAME=my_data_check`. The default
+job requests 96 GB of CPU memory because the PF train tensor is multi-GB.
+
 This branch contains the corrected weighted V4×4 campaign.
 
 - Axis 1 is object-feature autoencoder reconstruction loss.
