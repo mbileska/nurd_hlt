@@ -1,18 +1,18 @@
 method: grid
 metric:
   goal: maximize
-  name: Val rw_acc
+  name: validation/balanced_accuracy
 parameters:
-  # data
-  n_bins:
-    values: [10]
+  # Training-only weight-density strata; not passed to the critic.
+  balance_strata:
+    values: [20]
   val_split:
     values: [0.1]
   # training
   epochs:
     values: [100]
-  critic_epochs:
-    values: [2]
+  critic_steps:
+    values: [1, 3]
   batch_size:
     values: [2048]
   lr:
@@ -23,16 +23,12 @@ parameters:
     values: [1]
   optimizer:
     values: [adam]
-  # NURD flags
-  reweight:
-    values: [1]
-  joint_indep:
-    values: [1]
-  _lambda:
+  # Continuous density-ratio objective
+  lambda_info:
     values: [1]
   # contrastive
   contrast_weight:
-    values: [0.05]
+    values: [0.0]
   contrast_temp:
     values: [0.05]
   # model architecture

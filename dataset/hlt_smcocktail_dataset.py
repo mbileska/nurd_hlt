@@ -1,190 +1,271 @@
-"""
-HLT SM Cocktail dataset for NURD training.
+"""HLT SM-cocktail datasets for continuous-nuisance NURD training.
 
-The nuisance variable z is the **binned AE reconstruction loss**.
-NURD exact weights w(y,z) = p(y)*p(z)/p(y,z) are pre-computed on load
-so that train_exact.py can look them up with dataset.weights[(y,z)].
-
-Dataset returns (pf_features, label, nuisance_bin) per event.
+The critic receives the continuous, standardized AE reconstruction error. A
+training-only histogram of that continuous value is used solely to estimate
+engineer-style class/nuisance balancing weights.
 """
-import math
-import numpy as np
+
+from __future__ import annotations
+
+from typing import Dict, Mapping, Optional, Sequence
+
 import torch
 from torch.utils.data import Dataset
-from collections import Counter
-from sklearn.model_selection import train_test_split
+
+from utils.hlt_weights import (
+    apply_class_balance_factors,
+    apply_joint_balance,
+    effective_mass_by_class,
+    effective_sample_size_fraction,
+    fit_class_balance_factors,
+    fit_joint_balance,
+    load_generator_weights,
+    sample_signature,
+    stratified_split_indices,
+    weighted_mean_and_std,
+)
 
 
-def _make_nurd_weights(labels, nuisances, max_weight_ratio=10.0):
-    """
-    Exact NURD weights: w(y,z) = p(y)*p(z)/p(y,z) = n_y*n_z / (N*n_yz).
-    Under this weighting, y and z are marginally independent.
-    Normalized so that the per-sample mean weight equals 1, then clipped at
-    max_weight_ratio × mean to prevent extreme weights from destabilising training.
-    """
-    N = len(labels)
-    labels_list    = [int(y) for y in labels.tolist()]
-    nuisances_list = [int(z) for z in nuisances.tolist()]
+def _as_float_tensor(value) -> torch.Tensor:
+    return torch.as_tensor(value, dtype=torch.float32).detach().cpu()
 
-    group_counts    = Counter(zip(labels_list, nuisances_list))
-    label_counts    = Counter(labels_list)
-    nuisance_counts = Counter(nuisances_list)
 
-    weights_raw = {
-        (y, z): (label_counts[y] * nuisance_counts[z]) / (N * n_yz)
-        for (y, z), n_yz in group_counts.items()
-    }
-    # normalize so E[w] = 1 over all training samples
-    mean_w = sum(weights_raw[k] * v for k, v in group_counts.items()) / N
-    weights_norm = {k: v / mean_w for k, v in weights_raw.items()}
-    # clip to max_weight_ratio × 1.0 (since mean is now 1) to reduce variance
-    cap = max_weight_ratio
-    return {k: min(v, cap) for k, v in weights_norm.items()}
+def _compute_ae_reconstruction_error(
+    obj_normalized: torch.Tensor,
+    ae_model,
+    batch_size: int,
+) -> torch.Tensor:
+    ae_model.eval()
+    device = next(ae_model.parameters()).device
+    scores = []
+    with torch.no_grad():
+        for start in range(0, obj_normalized.shape[0], int(batch_size)):
+            batch = obj_normalized[start:start + int(batch_size)].to(device)
+            reconstruction, _ = ae_model(batch)
+            scores.append((reconstruction - batch).square().mean(dim=1).cpu())
+    return torch.cat(scores).float()
 
 
 class HLTSmCocktailDataset(Dataset):
-    """
-    Args:
-        pf_data:      [N, max_cands, n_feats]  PF candidate features
-        obj_data:     [N, obj_feat_dim]        pre-normalised object-level AE inputs
-        labels:       [N] long
-        ae_model:     frozen pre-trained Autoencoder (eval mode)
-        n_bins:       number of quantile bins for the AE reco nuisance
-        split:        "train" | "val"
-        val_split:    fraction held out for validation
-        seed:         random seed for the train/val split
-        gen_weights:  [N] float per-event physics weights (genWeight × scale for QCD, 1.0 otherwise)
-    """
-    def __init__(self, pf_data, obj_data, labels, ae_model, n_bins=10,
-                 split="train", val_split=0.1, seed=42, bin_edges=None, gen_weights=None):
-        super().__init__()
+    """A view over shared event tensors and precomputed training quantities."""
 
-        # ── compute AE reco loss per event ────────────────────────────────────
-        ae_model.eval()
-        device = next(ae_model.parameters()).device
-        mse = torch.nn.MSELoss(reduction='none')
-        ae_reco_all = []
-        bs = 4096
-        with torch.no_grad():
-            for i in range(0, obj_data.shape[0], bs):
-                batch = obj_data[i:i+bs].to(device)
-                recon, _ = ae_model(batch)
-                ae_reco_all.append(mse(recon, batch).mean(dim=1).cpu())
-        ae_reco_all = torch.cat(ae_reco_all)
+    def __init__(
+        self,
+        pf_data: torch.Tensor,
+        labels: torch.Tensor,
+        nuisance: torch.Tensor,
+        ae_reco: torch.Tensor,
+        effective_weights: torch.Tensor,
+        physics_weights: torch.Tensor,
+        indices: torch.Tensor,
+        split: str,
+    ):
+        self.features_all = pf_data
+        self.indices = torch.as_tensor(indices, dtype=torch.long)
+        self.labels = labels[self.indices].long()
+        self.nuisance = nuisance[self.indices].float()
+        self.ae_reco = ae_reco[self.indices].float()
+        self.effective_weights = effective_weights.float()
+        self.physics_weights = physics_weights[self.indices].float()
+        self.split = str(split)
+        self.num_tokens = int(pf_data.shape[1])
 
-        # ── quantile binning of the nuisance ─────────────────────────────────
-        if bin_edges is None:
-            quantiles = torch.linspace(0, 1, n_bins + 1)
-            bin_edges = torch.quantile(ae_reco_all, quantiles)
-        self.bin_edges = bin_edges
-        nuisances_all = torch.bucketize(ae_reco_all, bin_edges[1:-1]).long()
-
-        # ── train / val split ─────────────────────────────────────────────────
-        idx_all = np.arange(len(labels))
-        idx_tr, idx_val = train_test_split(
-            idx_all, test_size=val_split, random_state=seed,
-            stratify=labels.cpu().numpy()
-        )
-        idx = idx_tr if split == "train" else idx_val
-        idx = torch.tensor(idx, dtype=torch.long)
-
-        self.features     = pf_data[idx]
-        self.obj          = obj_data[idx]
-        self.labels       = labels[idx].float()
-        self.nuisances    = nuisances_all[idx].float()
-        self.ae_reco      = ae_reco_all[idx].float()
-        self.gen_weights  = gen_weights[idx].float() if gen_weights is not None else None
-        self.split        = split
-
-        # ── NURD exact weights ────────────────────────────────────────────────
-        self.weights = _make_nurd_weights(labels[idx], nuisances_all[idx])
-        _w = list(self.weights.values())
-        import statistics
-        _w_mean = sum(_w) / len(_w)
-        _w_std  = statistics.stdev(_w)
-        print(f"[{split}] NURD weight groups={len(_w)}  mean={_w_mean:.3f}  "
-              f"std={_w_std:.3f}  min={min(_w):.3f}  max={max(_w):.3f}")
+        expected = self.indices.numel()
+        for name, value in (
+            ("effective_weights", self.effective_weights),
+            ("physics_weights", self.physics_weights),
+        ):
+            if value.numel() != expected:
+                raise ValueError(
+                    f"{name} has {value.numel()} entries for {expected} events.")
 
     def __len__(self):
-        return len(self.features)
+        return self.indices.numel()
 
-    def __getitem__(self, idx):
-        out = (self.features[idx], self.labels[idx], self.nuisances[idx], self.ae_reco[idx])
-        if self.gen_weights is not None:
-            out += (self.gen_weights[idx],)
-        return out
-
-    def get_label_prior(self):
-        total = len(self.labels)
-        counts = Counter(int(y) for y in self.labels.tolist())
-        return {k: v / total for k, v in counts.items()}
-
-    def get_nuisance_prior(self):
-        total = len(self.nuisances)
-        counts = Counter(int(z) for z in self.nuisances.tolist())
-        return {k: v / total for k, v in counts.items()}
+    def __getitem__(self, item):
+        event_index = self.indices[item]
+        return (
+            self.features_all[event_index],
+            self.labels[item],
+            self.nuisance[item],
+            self.ae_reco[item],
+            self.effective_weights[item],
+            self.physics_weights[item],
+        )
 
 
-def build_hlt_datasets(pt_path, ae_model, n_bins=10, val_split=0.1, seed=42, max_events=-1, exclude_labels=None, gen_weight_path=None, gen_weight_clip=None, qcd_label=1):
+def build_hlt_datasets(
+    pt_path: str,
+    ae_model,
+    val_split: float = 0.1,
+    seed: int = 42,
+    max_events: int = -1,
+    exclude_labels: Optional[Sequence[int]] = None,
+    gen_weight_path: Optional[str] = None,
+    qcd_label: int = 1,
+    ae_scaler: Optional[Mapping[str, torch.Tensor]] = None,
+    balance_strata: int = 20,
+    ae_batch_size: int = 4096,
+):
+    """Build leakage-free train/validation datasets.
+
+    Returns ``(train, validation, preprocessing)``. All fitted quantities in
+    ``preprocessing`` come from the training split and are saved in the model
+    checkpoint for exact evaluation reuse.
     """
-    Load the HLT .pt file, pre-normalise obj features, and return
-    (train_dataset, val_dataset).  Call once; pass the same bin_edges
-    to both splits so nuisance definitions are consistent.
+    raw = torch.load(pt_path, map_location="cpu", weights_only=False)
+    for key in ("pf", "obj", "label"):
+        if key not in raw:
+            raise KeyError(f"Training file is missing required key {key!r}.")
 
-    exclude_labels: list of integer labels to drop before training (e.g. [2] to drop TTBar).
-    Remaining labels are remapped to be contiguous starting from 0.
-    """
-    raw = torch.load(pt_path, map_location="cpu")
-    pf     = raw["pf"]
-    labels = raw["label"].long()
-    obj    = raw["obj"]
+    data_signature = sample_signature(raw, max_events=max_events)
+    pf = raw["pf"]
+    obj = raw["obj"]
+    labels_original = raw["label"].long().reshape(-1)
+    if not (pf.shape[0] == obj.shape[0] == labels_original.numel()):
+        raise ValueError("PF, object, and label arrays do not have equal lengths.")
+
     if max_events > 0:
-        pf, labels, obj = pf[:max_events], labels[:max_events], obj[:max_events]
-    pf = torch.nan_to_num(pf, nan=0.0, posinf=0.0, neginf=0.0)
-
-    gen_weights = None
-    if gen_weight_path is not None:
-        gen_weights = torch.load(gen_weight_path, map_location="cpu").float()
-        if max_events > 0:
-            gen_weights = gen_weights[:max_events]
-        if gen_weight_clip is not None:
-            qcd_mask = (labels == qcd_label)
-            qcd_mean = gen_weights[qcd_mask].mean()
-            gen_weights = gen_weights / qcd_mean
-            gen_weights = torch.clamp(gen_weights, max=gen_weight_clip)
-            print(f"[gen_weight_clip={gen_weight_clip}] QCD mean before clip: {qcd_mean:.3e}  "
-                  f"After clip: min={gen_weights[qcd_mask].min():.3e} "
-                  f"max={gen_weights[qcd_mask].max():.3e} "
-                  f"mean={gen_weights[qcd_mask].mean():.3f}")
+        pf = pf[:max_events]
+        obj = obj[:max_events]
+        labels_original = labels_original[:max_events]
+    physics_weights, generator_metadata = load_generator_weights(
+        gen_weight_path,
+        labels_original,
+        qcd_label=qcd_label,
+        max_events=max_events,
+        sample=raw,
+    )
+    del raw
 
     if exclude_labels:
-        mask = torch.ones(len(labels), dtype=torch.bool)
-        for lbl in exclude_labels:
-            mask &= (labels != lbl)
-        pf, labels, obj = pf[mask], labels[mask], obj[mask]
-        if gen_weights is not None:
-            gen_weights = gen_weights[mask]
-        unique_lbls = sorted(labels.unique().tolist())
-        remap = {old: new for new, old in enumerate(unique_lbls)}
-        labels = torch.tensor([remap[l.item()] for l in labels], dtype=torch.long)
-        print(f"[exclude_labels={exclude_labels}] Remapped labels: {remap}. Remaining events: {len(labels)}")
+        keep = torch.ones(labels_original.numel(), dtype=torch.bool)
+        for label in exclude_labels:
+            keep &= labels_original != int(label)
+        pf, obj = pf[keep], obj[keep]
+        physics_weights = physics_weights[keep]
+        labels_original = labels_original[keep]
 
-    # flatten + z-score normalise obj features (first 4 features per cand)
-    obj_flat = obj[:, :, :4].reshape(obj.shape[0], -1).float().numpy()
-    mu  = obj_flat.mean(axis=0).astype(np.float32)
-    std = obj_flat.std(axis=0).astype(np.float32)
-    std = np.where(std < 1e-8, 1.0, std)
-    obj_norm = torch.from_numpy((obj_flat - mu) / std)
-    obj_scaler = {"mu": torch.from_numpy(mu), "std": torch.from_numpy(std)}
+    unique_labels = sorted(int(value) for value in labels_original.unique().tolist())
+    label_map = {old: new for new, old in enumerate(unique_labels)}
+    if int(qcd_label) not in label_map:
+        raise ValueError(f"QCD label {qcd_label} was excluded or is absent.")
+    labels = torch.empty_like(labels_original)
+    for old_label, new_label in label_map.items():
+        labels[labels_original == old_label] = new_label
+    remapped_qcd_label = label_map[int(qcd_label)]
 
-    # build train split first to get bin_edges from training data
-    ds_train = HLTSmCocktailDataset(pf, obj_norm, labels, ae_model,
-                                    n_bins=n_bins, split="train",
-                                    val_split=val_split, seed=seed,
-                                    gen_weights=gen_weights)
-    ds_val   = HLTSmCocktailDataset(pf, obj_norm, labels, ae_model,
-                                    n_bins=n_bins, split="val",
-                                    val_split=val_split, seed=seed,
-                                    bin_edges=ds_train.bin_edges,
-                                    gen_weights=gen_weights)
-    return ds_train, ds_val, obj_scaler
+    pf = torch.nan_to_num(pf.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    obj_flat = torch.nan_to_num(
+        obj[:, :, :4].reshape(obj.shape[0], -1).float(),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    del obj
+
+    train_indices, val_indices = stratified_split_indices(
+        labels, val_fraction=val_split, seed=seed,
+        weights=physics_weights)
+
+    class_factors = fit_class_balance_factors(
+        labels[train_indices], physics_weights[train_indices])
+    scaler_weights = apply_class_balance_factors(
+        labels[train_indices],
+        physics_weights[train_indices],
+        class_factors,
+        normalize_mean=False,
+    )
+    if ae_scaler is None:
+        obj_mean, obj_std = weighted_mean_and_std(
+            obj_flat[train_indices], scaler_weights)
+        obj_std = torch.where(obj_std < 1e-8, torch.ones_like(obj_std), obj_std)
+        scaler_source = "training_split_class_balanced_physics"
+    else:
+        obj_mean = _as_float_tensor(ae_scaler["mu"]).reshape(-1)
+        obj_std = _as_float_tensor(ae_scaler["std"]).reshape(-1)
+        if obj_mean.numel() != obj_flat.shape[1] or obj_std.numel() != obj_flat.shape[1]:
+            raise ValueError(
+                "AE checkpoint scaler is incompatible with the object feature shape.")
+        obj_std = torch.where(obj_std < 1e-8, torch.ones_like(obj_std), obj_std)
+        scaler_source = "ae_checkpoint"
+
+    obj_normalized = (obj_flat - obj_mean.view(1, -1)) / obj_std.view(1, -1)
+    del obj_flat
+    ae_reco = _compute_ae_reconstruction_error(
+        obj_normalized, ae_model, batch_size=ae_batch_size)
+    del obj_normalized
+
+    nuisance_mean, nuisance_std = weighted_mean_and_std(
+        ae_reco[train_indices].view(-1, 1), scaler_weights)
+    nuisance_mean = nuisance_mean.reshape(())
+    nuisance_std = nuisance_std.reshape(()).clamp(min=1e-8)
+    nuisance = (ae_reco - nuisance_mean) / nuisance_std
+
+    train_effective_weights, balance_spec = fit_joint_balance(
+        labels[train_indices],
+        ae_reco[train_indices],
+        physics_weights[train_indices],
+        n_strata=balance_strata,
+    )
+    val_effective_weights = apply_joint_balance(
+        labels[val_indices],
+        ae_reco[val_indices],
+        physics_weights[val_indices],
+        balance_spec,
+    )
+
+    train_dataset = HLTSmCocktailDataset(
+        pf, labels, nuisance, ae_reco,
+        train_effective_weights, physics_weights,
+        train_indices, split="train")
+    val_dataset = HLTSmCocktailDataset(
+        pf, labels, nuisance, ae_reco,
+        val_effective_weights, physics_weights,
+        val_indices, split="validation")
+
+    train_mass = effective_mass_by_class(
+        train_dataset.labels, train_dataset.effective_weights)
+    val_mass = effective_mass_by_class(
+        val_dataset.labels, val_dataset.effective_weights)
+    train_ess = effective_sample_size_fraction(train_effective_weights)
+    val_ess = effective_sample_size_fraction(val_effective_weights)
+    print(
+        "Unified training weights: "
+        f"class_mass={train_mass} ESS/N={train_ess:.4f}",
+        flush=True,
+    )
+    print(
+        "Unified validation weights (training fit): "
+        f"class_mass={val_mass} ESS/N={val_ess:.4f}",
+        flush=True,
+    )
+
+    preprocessing: Dict[str, object] = {
+        "ae_scaler": {"mu": obj_mean.cpu(), "std": obj_std.cpu()},
+        "ae_scaler_source": scaler_source,
+        "nuisance_transform": {
+            "kind": "standardize_continuous_ae_reconstruction_error",
+            "mean": nuisance_mean.cpu(),
+            "std": nuisance_std.cpu(),
+        },
+        "weighting": {
+            "method": "generator_weighted_uniform_class_and_nuisance_strata",
+            "balance_spec": balance_spec,
+            "generator": generator_metadata,
+            "train_class_mass": train_mass,
+            "validation_class_mass": val_mass,
+            "train_ess_fraction": train_ess,
+            "validation_ess_fraction": val_ess,
+        },
+        "split": {
+            "seed": int(seed),
+            "validation_fraction": float(val_split),
+            "train_indices": train_indices.cpu(),
+            "validation_indices": val_indices.cpu(),
+        },
+        "label_map": label_map,
+        "qcd_label": int(remapped_qcd_label),
+        "data_signature": data_signature,
+    }
+    return train_dataset, val_dataset, preprocessing

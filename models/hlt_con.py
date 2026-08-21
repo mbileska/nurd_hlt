@@ -8,7 +8,6 @@ We return:      activations = encoder latent  [B, latent_dim]
 The contrastive loss (InfoNCE / SupCon) is computed outside using
 model.get_embeddings(activations).
 """
-from typing import Union
 import math
 import torch
 import torch.nn as nn
@@ -205,80 +204,36 @@ class HLTContrastiveModel(nn.Module):
 # ── Critic model ──────────────────────────────────────────────────────────────
 
 class HLTCritic(nn.Module):
-    """
-    Four modes (--critic_type):
-      bin_pred    (default): predicts discrete AE bin from (latent, y) — [B, n_bins]
-      ae_regress           : regresses continuous AE reco score from (latent, y) — [B]
-      density_ratio        : classifies real vs shuffled-z from (latent, y, z) — [B, 2]
-      md_bin_pred          : predicts AE bin from scalar Mahalanobis distance instead of
-                             raw latent — use with --critic_on_md 1 in train_hlt.py
-    """
-    def __init__(self, latent_dim: int, num_classes: int, n_bins: int,
-                 hidden: int = 128, critic_type: str = "bin_pred"):
-        super().__init__()
-        self.critic_type  = critic_type
-        self.label_embed  = nn.Embedding(num_classes, 16)
-        if critic_type == "density_ratio":
-            self.z_embed = nn.Embedding(n_bins, 8)
-            self.net = nn.Sequential(
-                nn.Linear(latent_dim + 16 + 8, hidden), nn.ReLU(),
-                nn.Linear(hidden, hidden),               nn.ReLU(),
-                nn.Linear(hidden, 2),
-            )
-        elif critic_type == "ae_regress":
-            self.net = nn.Sequential(
-                nn.Linear(latent_dim * 2 + 1 + 16, hidden), nn.ReLU(),
-                nn.Linear(hidden, hidden),                    nn.ReLU(),
-                nn.Linear(hidden, hidden),                    nn.ReLU(),
-                nn.Linear(hidden, 1),
-            )
-        elif critic_type == "md_bin_pred":
-            # input is scalar MD + class embedding — much easier than 6D latent
-            self.net = nn.Sequential(
-                nn.Linear(1 + 16, hidden), nn.ReLU(),
-                nn.Linear(hidden, hidden), nn.ReLU(),
-                nn.Linear(hidden, hidden), nn.ReLU(),
-                nn.Linear(hidden, n_bins),
-            )
-        elif critic_type == "aug_bin_pred":
-            # bin_pred augmented with batch-level proxy MD as an extra feature.
-            # MD encodes the covariance-level latent-AE correlation that a pointwise
-            # critic misses; the gradient then flows back through MD -> latent -> encoder.
-            # input = [latent, latent^2, ||latent||, MD, y_emb]
-            self.net = nn.Sequential(
-                nn.Linear(latent_dim * 2 + 2 + 16, hidden), nn.ReLU(),
-                nn.Linear(hidden, hidden),                    nn.ReLU(),
-                nn.Linear(hidden, hidden),                    nn.ReLU(),
-                nn.Linear(hidden, n_bins),
-            )
-        else:  # bin_pred
-            self.net = nn.Sequential(
-                nn.Linear(latent_dim * 2 + 1 + 16, hidden), nn.ReLU(),
-                nn.Linear(hidden, hidden),                    nn.ReLU(),
-                nn.Linear(hidden, hidden),                    nn.ReLU(),
-                nn.Linear(hidden, n_bins),
-            )
+    """Continuous-nuisance density-ratio critic.
 
-    def forward(self, rx: torch.Tensor, y: torch.Tensor,
-                z: torch.Tensor = None) -> torch.Tensor:
-        y_emb = self.label_embed(y.long().squeeze(1))          # [B, 16]
-        if self.critic_type == "density_ratio":
-            z_emb = self.z_embed(z.long())                     # [B, 8]
-            return self.net(torch.cat([rx, y_emb, z_emb], dim=1))
-        if self.critic_type == "md_bin_pred":
-            # rx is scalar MD [B] — view as [B, 1]
-            md = rx.view(-1, 1).float()
-            return self.net(torch.cat([md, y_emb], dim=1))    # [B, n_bins]
-        if self.critic_type == "aug_bin_pred":
-            # rx is [B, latent_dim+1]: last column is the proxy MD
-            rx_lat  = rx[:, :-1].float()                      # [B, latent_dim]
-            md_feat = rx[:, -1:].float()                      # [B, 1]
-            rx_sq   = rx_lat ** 2
-            rx_norm = rx_lat.norm(dim=1, keepdim=True)
-            return self.net(torch.cat([rx_lat, rx_sq, rx_norm, md_feat, y_emb], dim=1))
-        rx_sq   = rx ** 2                                      # [B, latent_dim]
-        rx_norm = rx.norm(dim=1, keepdim=True)                 # [B, 1]
-        out = self.net(torch.cat([rx, rx_sq, rx_norm, y_emb], dim=1))
-        if self.critic_type == "ae_regress":
-            return out.squeeze(1)                              # [B] scalar per sample
-        return out
+    The critic follows the engineer reference: it distinguishes real
+    ``(r(x), z, y)`` tuples from tuples whose continuous nuisance ``z`` was
+    shuffled. Labels are represented explicitly as one-hot values so the four
+    physics classes are not assigned an artificial ordinal relationship.
+    """
+
+    def __init__(self, latent_dim: int, num_classes: int):
+        super().__init__()
+        self.num_classes = int(num_classes)
+        self.net = nn.Sequential(
+            nn.Linear(int(latent_dim) + 1 + self.num_classes, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2),
+        )
+
+    def forward(
+        self,
+        latent: torch.Tensor,
+        labels: torch.Tensor,
+        nuisance: torch.Tensor,
+    ) -> torch.Tensor:
+        labels = labels.long().reshape(-1)
+        nuisance = nuisance.float().reshape(-1, 1)
+        label_features = F.one_hot(
+            labels, num_classes=self.num_classes).to(latent.dtype)
+        return self.net(torch.cat(
+            [latent.float(), nuisance, label_features], dim=1))

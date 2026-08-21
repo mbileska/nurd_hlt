@@ -18,16 +18,26 @@ import logging
 import random
 import numpy as np
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import train_test_split
 
 from models.hlt_autoencoder import HLTAutoencoder
+from utils.hlt_weights import (
+    apply_class_balance_factors,
+    effective_mass_by_class,
+    fit_class_balance_factors,
+    load_generator_weights,
+    sample_signature,
+    stratified_split_indices,
+    weighted_mean_and_std,
+)
 
 # ── Args ──────────────────────────────────────────────────────────────────────
 
 parser = argparse.ArgumentParser(description="Pre-train HLT AE")
 parser.add_argument("--data",       required=True,  type=str)
+parser.add_argument("--gen_weight_path", "--gen_weights", dest="gen_weight_path",
+                    default=None, type=str)
+parser.add_argument("--qcd_label", default=1, type=int)
 parser.add_argument("--epochs",     default=100,    type=int)
 parser.add_argument("-b","--batch_size", default=2048, type=int)
 parser.add_argument("--lr",         default=1e-3,   type=float)
@@ -71,33 +81,64 @@ log.addHandler(fh)
 # ── Load & normalise obj features ─────────────────────────────────────────────
 
 log.debug(f"Loading {args.data}")
-raw = torch.load(args.data, map_location="cpu")
+raw = torch.load(args.data, map_location="cpu", weights_only=False)
+data_signature = sample_signature(raw, max_events=args.max_events)
 obj = raw["obj"]
+labels = raw["label"].long().reshape(-1)
 if args.max_events > 0:
     obj = obj[:args.max_events]
+    labels = labels[:args.max_events]
+physics_weights, generator_metadata = load_generator_weights(
+    args.gen_weight_path,
+    labels,
+    qcd_label=args.qcd_label,
+    max_events=args.max_events,
+    sample=raw,
+)
 del raw
 
 # flatten first 4 features per candidate: [N, n_cands, 4] → [N, n_cands*4]
-obj_flat = obj[:, :, :4].reshape(obj.shape[0], -1).float().numpy()
+obj_flat = torch.nan_to_num(
+    obj[:, :, :4].reshape(obj.shape[0], -1).float(),
+    nan=0.0, posinf=0.0, neginf=0.0)
 del obj
-
-mu  = obj_flat.mean(axis=0).astype(np.float32)
-std = obj_flat.std(axis=0).astype(np.float32)
-std = np.where(std < 1e-8, 1.0, std)
-obj_norm = torch.from_numpy((obj_flat - mu) / std)
-del obj_flat
-n_features = obj_norm.shape[1]
-log.debug(f"AE input: {obj_norm.shape}  ({n_features} features)")
 
 # ── Train / val split ─────────────────────────────────────────────────────────
 
-idx = np.arange(len(obj_norm))
-idx_tr, idx_val = train_test_split(idx, test_size=args.val_split, random_state=args.manualSeed)
-obj_tr  = obj_norm[torch.tensor(idx_tr)]
-obj_val = obj_norm[torch.tensor(idx_val)]
+idx_tr, idx_val = stratified_split_indices(
+    labels, val_fraction=args.val_split, seed=args.manualSeed,
+    weights=physics_weights)
+class_factors = fit_class_balance_factors(
+    labels[idx_tr], physics_weights[idx_tr])
+weights_tr = apply_class_balance_factors(
+    labels[idx_tr], physics_weights[idx_tr], class_factors)
+weights_val = apply_class_balance_factors(
+    labels[idx_val], physics_weights[idx_val], class_factors)
 
-dl_tr  = DataLoader(TensorDataset(obj_tr),  batch_size=args.batch_size, shuffle=True,  drop_last=False)
-dl_val = DataLoader(TensorDataset(obj_val), batch_size=args.batch_size, shuffle=False, drop_last=False)
+mu, std = weighted_mean_and_std(obj_flat[idx_tr], weights_tr)
+std = torch.where(std < 1e-8, torch.ones_like(std), std)
+obj_norm = (obj_flat - mu.view(1, -1)) / std.view(1, -1)
+del obj_flat
+n_features = obj_norm.shape[1]
+log.debug(f"AE input: {obj_norm.shape}  ({n_features} features)")
+log.debug(
+    "AE class-balanced train mass=%s validation mass=%s generator=%s",
+    effective_mass_by_class(labels[idx_tr], weights_tr),
+    effective_mass_by_class(labels[idx_val], weights_val),
+    generator_metadata,
+)
+
+obj_tr = obj_norm[idx_tr]
+obj_val = obj_norm[idx_val]
+labels_tr = labels[idx_tr]
+labels_val = labels[idx_val]
+
+dl_tr = DataLoader(
+    TensorDataset(obj_tr, weights_tr, labels_tr),
+    batch_size=args.batch_size, shuffle=True, drop_last=False)
+dl_val = DataLoader(
+    TensorDataset(obj_val, weights_val, labels_val),
+    batch_size=args.batch_size, shuffle=False, drop_last=False)
 
 # ── Build AE ──────────────────────────────────────────────────────────────────
 
@@ -112,7 +153,6 @@ ae_config = {
 ae = HLTAutoencoder(ae_config).to(device)
 log.debug(f"AE: latent={args.latent_dim}  enc={args.enc_nodes}  dec={dec_nodes}")
 
-mse    = nn.MSELoss()
 optim  = torch.optim.Adam(ae.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 n_steps = args.epochs * len(dl_tr)
 
@@ -132,26 +172,36 @@ ckpt_path = os.path.join(directory, "checkpoint_ae.pth")
 
 for epoch in range(args.epochs):
     ae.train()
-    tr_loss = 0.0
-    for (batch,) in dl_tr:
+    tr_numerator = 0.0
+    tr_denominator = 0.0
+    for batch, weights, _labels in dl_tr:
         batch = batch.to(device)
+        weights = weights.to(device)
         optim.zero_grad()
         recon, _ = ae(batch)
-        loss = mse(recon, batch)
+        per_event = (recon - batch).square().mean(dim=1)
+        # Full-split weights are normalized to mean one. A fixed denominator
+        # avoids the stochastic bias caused by random per-batch weight sums.
+        loss = (per_event * weights).mean()
         loss.backward()
         optim.step()
         scheduler.step()
-        tr_loss += loss.item() * batch.size(0)
-    tr_loss /= len(dl_tr.dataset)
+        tr_numerator += float((per_event.detach() * weights).sum())
+        tr_denominator += float(weights.sum())
+    tr_loss = tr_numerator / max(tr_denominator, 1e-12)
 
     ae.eval()
-    val_loss = 0.0
+    val_numerator = 0.0
+    val_denominator = 0.0
     with torch.no_grad():
-        for (batch,) in dl_val:
+        for batch, weights, _labels in dl_val:
             batch = batch.to(device)
+            weights = weights.to(device)
             recon, _ = ae(batch)
-            val_loss += mse(recon, batch).item() * batch.size(0)
-    val_loss /= len(dl_val.dataset)
+            per_event = (recon - batch).square().mean(dim=1)
+            val_numerator += float((per_event * weights).sum())
+            val_denominator += float(weights.sum())
+    val_loss = val_numerator / max(val_denominator, 1e-12)
 
     log.debug(f"Epoch {epoch+1}/{args.epochs}  train={tr_loss:.6f}  val={val_loss:.6f}  lr={scheduler.get_last_lr()[0]:.2e}")
     if not args.local_testing:
@@ -164,9 +214,17 @@ for epoch in range(args.epochs):
             "ae":        ae.state_dict(),
             "ae_config": ae_config,
             "ae_scaler": {
-                "mu":  torch.from_numpy(mu),
-                "std": torch.from_numpy(std),
+                "mu":  mu.cpu(),
+                "std": std.cpu(),
             },
+            "weighting": {
+                "method": "generator_weighted_uniform_class",
+                "class_factors": class_factors,
+                "generator": generator_metadata,
+                "split_seed": args.manualSeed,
+                "validation_fraction": args.val_split,
+            },
+            "data_signature": data_signature,
             "epoch": epoch + 1,
         }, ckpt_path)
         log.debug(f"  → saved best checkpoint ({ckpt_path})")

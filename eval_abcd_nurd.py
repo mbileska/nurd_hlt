@@ -25,7 +25,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import wandb
-from sklearn.metrics import roc_auc_score
 import matplotlib.pyplot as plt
 from matplotlib.colors import LogNorm
 from scipy.stats import binned_statistic, gaussian_kde
@@ -34,6 +33,7 @@ from matplotlib.lines import Line2D
 
 from models.hlt_con import HLTContrastiveModel
 from models.hlt_autoencoder import HLTAutoencoder
+from utils.hlt_weights import file_sha256, load_generator_weights, sample_signature
 
 
 # ── ABCD helpers (identical to eval_abcd.py) ─────────────────────────────────
@@ -68,6 +68,22 @@ def abcd_counts(loss_1, loss_2, percent_1, percent_2, weights=None):
         C = int(((loss_1 <= thresh_1) & (loss_2 > thresh_2)).sum())
         D = int(((loss_1 <= thresh_1) & (loss_2 <= thresh_2)).sum())
     return thresh_1, thresh_2, A, B, C, D
+
+
+def abcd_counts_at_thresholds(loss_1, loss_2, thresh_1, thresh_2, weights=None):
+    """ABCD yields at fixed thresholds selected on another sample."""
+    if weights is None:
+        weights = np.ones(len(loss_1), dtype=np.float64)
+    else:
+        weights = np.asarray(weights, dtype=np.float64)
+    high_1 = loss_1 > thresh_1
+    high_2 = loss_2 > thresh_2
+    return tuple(float(weights[mask].sum()) for mask in (
+        high_1 & high_2,
+        high_1 & ~high_2,
+        ~high_1 & high_2,
+        ~high_1 & ~high_2,
+    ))
 
 
 def nonclosure_A(A, B, C, D, eps=1e-8):
@@ -132,6 +148,7 @@ def load_nurd_model(ckpt_path, device):
         dim_ff=cfg["dim_ff"],
         linear_dim=cfg["linear_dim"],
         num_tokens=num_tokens,
+        dropout=cfg.get("dropout", 0.1),
     ).to(device)
     model.load_state_dict(sd)
     model.eval()
@@ -168,7 +185,9 @@ def compute_ae_scores(ae, ae_scaler, pt_path, device, batch_size=4096):
     std = ae_scaler["std"].cpu().numpy()
 
     raw = torch.load(pt_path, map_location="cpu")
-    obj = raw["obj"][:, :, :4].reshape(raw["obj"].shape[0], -1).float().numpy()
+    obj = torch.nan_to_num(
+        raw["obj"][:, :, :4].reshape(raw["obj"].shape[0], -1).float(),
+        nan=0.0, posinf=0.0, neginf=0.0).numpy()
     obj_norm = torch.from_numpy(((obj - mu) / (std + 1e-8)).astype(np.float32))
     N = obj_norm.shape[0]
     print(f"  AE inference on {N} events...", flush=True)
@@ -213,13 +232,23 @@ def compute_logit_axis2(logits, qcd_label=1):
     return (1.0 - probs[:, qcd_label]).astype(np.float32)
 
 
-def _fit_class_transform(embeddings, mask, n_pca, class_name):
+def _fit_class_transform(embeddings, mask, n_pca, class_name, weights=None):
     """Fit PCA whitening on embeddings[mask]. Returns (mu, W)."""
     ref = embeddings[mask]
     print(f"  Fitting PCA whitening on {mask.sum()} {class_name} events (dim={ref.shape[1]})...", flush=True)
-    mu = ref.mean(axis=0)
+    if weights is None:
+        ref_weights = np.ones(ref.shape[0], dtype=np.float64)
+    else:
+        ref_weights = np.asarray(weights, dtype=np.float64)[mask]
+        if not np.isfinite(ref_weights).all() or np.any(ref_weights < 0):
+            raise ValueError("Reference weights must be finite and non-negative.")
+    weight_sum = ref_weights.sum()
+    if weight_sum <= 0:
+        raise ValueError(f"Reference class {class_name} has zero total weight.")
+    ref_weights = ref_weights / weight_sum
+    mu = np.sum(ref * ref_weights[:, None], axis=0)
     centered = ref - mu
-    cov = (centered.T @ centered) / ref.shape[0]
+    cov = (centered * ref_weights[:, None]).T @ centered
     L, V = np.linalg.eigh(cov)
     if n_pca is not None:
         V = V[:, -n_pca:]
@@ -230,7 +259,9 @@ def _fit_class_transform(embeddings, mask, n_pca, class_name):
     return mu, W
 
 
-def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None, bkg_labels=None):
+def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None,
+                      bkg_labels=None, reference_pt=None,
+                      reference_weights=None, reference_fit_indices=None):
     """
     Embed all events, fit PCA whitening per background class, return MD scores.
 
@@ -246,14 +277,34 @@ def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None, bkg_la
         bkg_labels = [1]
 
     latents, labels = embed_pf(model, pt_path, device, batch_size)
+    if reference_pt:
+        print(f"  Fitting MD reference on independent sample: {reference_pt}", flush=True)
+        reference_latents, reference_labels = embed_pf(
+            model, reference_pt, device, batch_size)
+    else:
+        reference_latents, reference_labels = latents, labels
+
+    if reference_weights is not None:
+        reference_weights = np.asarray(reference_weights, dtype=np.float64)
+        if reference_weights.shape[0] != reference_labels.shape[0]:
+            raise ValueError(
+                "Reference-weight length does not match the reference sample.")
+
+    fit_mask = np.ones(reference_labels.shape[0], dtype=bool)
+    if reference_fit_indices is not None:
+        fit_mask[:] = False
+        fit_mask[np.asarray(reference_fit_indices, dtype=np.int64)] = True
 
     class_transforms = []
     for cls in bkg_labels:
-        mask = (labels == cls)
+        mask = (reference_labels == cls) & fit_mask
         if mask.sum() < 10:
             print(f"  WARNING: class {cls} has only {mask.sum()} events — skipping", flush=True)
             continue
-        mu, W = _fit_class_transform(latents, mask, n_pca, _CLASS_NAMES.get(cls, str(cls)))
+        mu, W = _fit_class_transform(
+            reference_latents, mask, n_pca,
+            _CLASS_NAMES.get(cls, str(cls)),
+            weights=reference_weights)
         class_transforms.append((cls, mu, W))
 
     if not class_transforms:
@@ -271,14 +322,53 @@ def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None, bkg_la
     qcd_entry = next((t for t in class_transforms if t[0] == 1), class_transforms[0])
     mu_qcd, W_qcd = qcd_entry[1], qcd_entry[2]
 
-    return md, labels, mu_qcd, W_qcd, latents, class_transforms
+    return (md, labels, mu_qcd, W_qcd, latents, class_transforms,
+            reference_latents, reference_labels)
+
+
+def load_physics_weights(weight_path, pt_path, qcd_label):
+    """Load evaluation weights through the same validated training contract."""
+    raw = torch.load(pt_path, map_location="cpu", weights_only=False)
+    labels = raw["label"].long().reshape(-1)
+    weights, metadata = load_generator_weights(
+        weight_path, labels, qcd_label=qcd_label, sample=raw)
+    signature = sample_signature(raw)
+    return weights.numpy().astype(np.float64), metadata, signature
+
+
+def checkpoint_reference_indices(checkpoint, signature, weight_metadata):
+    """Validate and recover disjoint MD-fit and threshold-selection roles."""
+    preprocessing = checkpoint.get("preprocessing", {})
+    if preprocessing.get("data_signature") != signature:
+        raise ValueError(
+            "Held-out reference sample does not match the training checkpoint.")
+    expected_checksum = preprocessing.get(
+        "weighting", {}).get("generator", {}).get(
+            "effective_physics_weight_sha256")
+    actual_checksum = weight_metadata.get("effective_physics_weight_sha256")
+    if not expected_checksum or expected_checksum != actual_checksum:
+        raise ValueError(
+            "Held-out reference weights do not match the training checkpoint.")
+    split = preprocessing.get("split", {})
+    fit_indices = np.asarray(split.get("train_indices", []), dtype=np.int64)
+    selection_indices = np.asarray(
+        split.get("validation_indices", []), dtype=np.int64)
+    combined = np.concatenate([fit_indices, selection_indices])
+    if (combined.size != signature["n_events"]
+            or np.unique(combined).size != combined.size
+            or combined.min(initial=0) < 0
+            or combined.max(initial=-1) >= signature["n_events"]):
+        raise ValueError(
+            "Checkpoint train/validation indices do not partition the reference sample.")
+    return fit_indices, selection_indices
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def ABCD(config):
-    print("Logging in to wandb...", flush=True)
-    wandb.login()
+    if os.environ.get("WANDB_MODE", "").lower() != "offline":
+        print("Logging in to wandb...", flush=True)
+        wandb.login()
     resume_id = config.get("resume_run_id", None)
     wandb.init(project=config.get("wandb_project", "AE vs. Contrastive ABCD"),
                name=config.get("wandb_run_name", None),
@@ -297,12 +387,44 @@ def ABCD(config):
 
     # ── load models ───────────────────────────────────────────────────────────
     model, main_ckpt = load_nurd_model(config["ckpt"], device)
+    expected_ae_sha256 = main_ckpt.get("ae_checkpoint_sha256")
+    if not expected_ae_sha256 or file_sha256(
+            config["ae_ckpt"]) != expected_ae_sha256:
+        raise ValueError(
+            "AE checkpoint does not match the exact AE used for NURD training.")
     ae_scaler = main_ckpt["ae_scaler"]
     ae = load_ae(config["ae_ckpt"], ae_scaler, device)
+    qcd_label = int(config.get("qcd_label", 1))
+
+    reference_pt = config.get("reference_pt")
+    reference_physics = reference_signature = None
+    reference_fit_indices = selection_indices = None
+    if reference_pt:
+        if not config.get("reference_weight_path"):
+            raise ValueError(
+                "Held-out evaluation requires --reference_weight_path.")
+        if os.path.realpath(reference_pt) == os.path.realpath(config["test_pt"]):
+            raise ValueError(
+                "Held-out reference and report files must be different samples.")
+        reference_physics, reference_metadata, reference_signature = (
+            load_physics_weights(
+                config["reference_weight_path"], reference_pt, qcd_label))
+        reference_fit_indices, selection_indices = checkpoint_reference_indices(
+            main_ckpt, reference_signature, reference_metadata)
+
+    test_physics = None
+    if config.get("gen_weight_path"):
+        test_physics, _test_metadata, _test_signature = load_physics_weights(
+            config["gen_weight_path"], config["test_pt"], qcd_label)
 
     # ── AE scores ─────────────────────────────────────────────────────────────
     print("Computing AE scores (bkg)...", flush=True)
     ae_bkg = compute_ae_scores(ae, ae_scaler, config["test_pt"], device)
+    ae_reference = None
+    if reference_pt:
+        print("Computing AE scores (threshold-selection reference)...", flush=True)
+        ae_reference = compute_ae_scores(
+            ae, ae_scaler, reference_pt, device)
 
     # free AE GPU memory before running encoder
     del ae
@@ -320,19 +442,34 @@ def ABCD(config):
         print("Axis 2 = 1-P(QCD) logit mode.", flush=True)
         latents_all, logits_all, labels = embed_pf(
             model, config["test_pt"], device, return_logits=True)
-        con_bkg = compute_logit_axis2(logits_all, qcd_label=config.get("qcd_label", 1))
+        con_bkg = compute_logit_axis2(logits_all, qcd_label=qcd_label)
         class_transforms = []   # not used in logit mode
         md_mu = md_W = None
+        if reference_pt:
+            reference_latents, reference_logits, reference_labels = embed_pf(
+                model, reference_pt, device, return_logits=True)
+            reference_axis2 = compute_logit_axis2(
+                reference_logits, qcd_label=qcd_label)
     else:
         bkg_labels = [0, 1, 3] if config.get("min_md") else [1]
         if config.get("min_md"):
             print("Min-MD mode: axis 2 = min(MD_DY, MD_QCD, MD_WJets)", flush=True)
         print("Computing contrastive MD scores (bkg)...", flush=True)
-        con_bkg, labels, md_mu, md_W, latents_all, class_transforms = compute_md_scores(
+        (con_bkg, labels, md_mu, md_W, latents_all, class_transforms,
+         reference_latents, reference_labels) = compute_md_scores(
             model, config["test_pt"], device,
             n_pca=config.get("n_pca"),
             bkg_labels=bkg_labels,
+            reference_pt=reference_pt,
+            reference_weights=reference_physics,
+            reference_fit_indices=reference_fit_indices,
         )
+        if reference_pt:
+            reference_md = []
+            for _cls, mu_c, W_c in class_transforms:
+                transformed = (reference_latents - mu_c) @ W_c
+                reference_md.append((transformed * transformed).sum(axis=1))
+            reference_axis2 = np.stack(reference_md, axis=0).min(axis=0)
 
     if len(con_bkg) != len(ae_bkg):
         raise ValueError(f"Length mismatch: contrastive {len(con_bkg)} vs AE {len(ae_bkg)}")
@@ -358,22 +495,36 @@ def ABCD(config):
         n_pca     = emb_pca.shape[1]
         axis2_pca = axis2_bkg   # same axis in logit mode
 
-    qcd_only  = labels_masked == 1
+    qcd_only  = labels_masked == qcd_label
     axis1_qcd = axis1_bkg[qcd_only]
     axis2_qcd = axis2_bkg[qcd_only]
     print(f"QCD events for ABCD: {qcd_only.sum()}", flush=True)
 
     # ── gen weights (QCD only, for weighted ABCD) ─────────────────────────────
     gen_weights_qcd = None
-    if config.get("gen_weight_path"):
-        gw_all = torch.load(config["gen_weight_path"], map_location="cpu").float().numpy()
-        n_test = len(ae_bkg)
-        if len(gw_all) != n_test:
-            raise ValueError(
-                f"gen_weight_path has {len(gw_all)} entries but test file has {n_test} events")
-        gen_weights_qcd = gw_all[mask][qcd_only]
+    if test_physics is not None:
+        gen_weights_qcd = test_physics[mask][qcd_only]
         print(f"Gen weights loaded: {len(gen_weights_qcd)} QCD weights "
               f"(min={gen_weights_qcd.min():.3e}, max={gen_weights_qcd.max():.3e})", flush=True)
+
+    selection_axis1 = selection_axis2 = selection_weights = None
+    if reference_pt:
+        selection_mask = np.zeros(len(reference_axis2), dtype=bool)
+        selection_mask[selection_indices] = True
+        selection_mask &= (
+            np.isfinite(ae_reference)
+            & np.isfinite(reference_axis2)
+            & (ae_reference > 0)
+            & (reference_labels == qcd_label)
+        )
+        selection_axis1 = ae_reference[selection_mask]
+        selection_axis2 = reference_axis2[selection_mask]
+        selection_weights = reference_physics[selection_mask]
+        print(
+            "Held-out protocol: MD fit on "
+            f"{len(reference_fit_indices)} saved training rows; thresholds selected "
+            f"on {selection_mask.sum()} saved validation QCD rows; independent test "
+            "is report-only.", flush=True)
 
     # ── signal (optional) ─────────────────────────────────────────────────────
     sig_axis1 = sig_axis2 = sig_axis2_pca = None
@@ -414,12 +565,11 @@ def ABCD(config):
 
     # ── ABCD scan ─────────────────────────────────────────────────────────────
     percent = np.linspace(0.50, 0.98, 48)
-    best    = {"nonclosure": np.inf}
     min_A   = int(config.get("min_A", 50))
     min_D   = int(config.get("min_D", 500))
-
     nc_grid = np.full((len(percent), len(percent)), np.nan)
 
+    oracle_best = {"nonclosure": np.inf}
     for i, p1 in enumerate(percent):
         for j, p2 in enumerate(percent):
             t1, t2, A, B, C, D = abcd_counts(axis1_qcd, axis2_qcd, p1, p2, weights=gen_weights_qcd)
@@ -427,17 +577,64 @@ def ABCD(config):
                 continue
             nc, A_hat = nonclosure_A(A, B, C, D)
             nc_grid[i, j] = nc
-            if np.isfinite(nc) and abs(nc) < abs(best["nonclosure"]):
-                best.update(dict(p1=p1, p2=p2, t1=t1, t2=t2,
-                                 A=A, B=B, C=C, D=D, A_hat=A_hat, nonclosure=nc))
+            if np.isfinite(nc) and abs(nc) < abs(oracle_best["nonclosure"]):
+                oracle_best.update(dict(
+                    p1=p1, p2=p2, t1=t1, t2=t2,
+                    A=A, B=B, C=C, D=D, A_hat=A_hat, nonclosure=nc))
+
+    if selection_axis1 is not None:
+        selection_best = {"nonclosure": np.inf}
+        for p1 in percent:
+            for p2 in percent:
+                t1, t2, A, B, C, D = abcd_counts(
+                    selection_axis1, selection_axis2, p1, p2,
+                    weights=selection_weights)
+                if A < min_A or D < min_D:
+                    continue
+                nc, A_hat = nonclosure_A(A, B, C, D)
+                if np.isfinite(nc) and abs(nc) < abs(
+                        selection_best["nonclosure"]):
+                    selection_best.update(dict(
+                        p1=p1, p2=p2, t1=t1, t2=t2,
+                        A=A, B=B, C=C, D=D, A_hat=A_hat,
+                        nonclosure=nc))
+        if "t1" not in selection_best:
+            raise RuntimeError(
+                "No validation ABCD working point found. Try lowering min_A/min_D.")
+        t1_opt, t2_opt = selection_best["t1"], selection_best["t2"]
+        A, B, C, D = abcd_counts_at_thresholds(
+            axis1_qcd, axis2_qcd, t1_opt, t2_opt,
+            weights=gen_weights_qcd)
+        report_nc, report_A_hat = nonclosure_A(A, B, C, D)
+        best = dict(selection_best)
+        best.update({
+            "selection_nonclosure": float(selection_best["nonclosure"]),
+            "A": A, "B": B, "C": C, "D": D,
+            "A_hat": report_A_hat,
+            "nonclosure": report_nc,
+            "selection_source": "saved_training_validation_split",
+        })
+        report_weights = (
+            np.ones(len(axis1_qcd), dtype=np.float64)
+            if gen_weights_qcd is None else gen_weights_qcd)
+        report_p1 = float(report_weights[axis1_qcd <= t1_opt].sum()
+                          / report_weights.sum())
+        report_p2 = float(report_weights[axis2_qcd <= t2_opt].sum()
+                          / report_weights.sum())
+    else:
+        best = oracle_best
+        best["selection_source"] = "legacy_same_sample_oracle"
+        t1_opt, t2_opt = best.get("t1"), best.get("t2")
+        report_p1, report_p2 = best.get("p1"), best.get("p2")
 
     if "t1" not in best:
         raise RuntimeError("No ABCD working point found. Try lowering min_A/min_D.")
 
-    t1_opt, t2_opt = best["t1"], best["t2"]
-    print(f"Optimized: p1={best['p1']:.3f}, p2={best['p2']:.3f}", flush=True)
+    print(
+        f"Threshold source: {best['selection_source']} "
+        f"(selection p1={best['p1']:.3f}, p2={best['p2']:.3f})", flush=True)
     print(f"Thresholds: t1={t1_opt:.4g}, t2={t2_opt:.4g}", flush=True)
-    print(f"Nonclosure: {100.0*best['nonclosure']:.2f}%", flush=True)
+    print(f"Independent-report nonclosure: {100.0*best['nonclosure']:.2f}%", flush=True)
 
     wandb.log({
         "ABCD/opt_p1":     best["p1"],
@@ -464,10 +661,11 @@ def ABCD(config):
                          vmin=0.0, vmax=vmax, shading="auto")
     cb = fig.colorbar(mesh, ax=ax)
     cb.set_label("|Non-closure| (%)", fontsize=fs_leg)
-    ax.scatter([best["p1"]], [best["p2"]], marker="*", s=400, color="red",
+    ax.scatter([report_p1], [report_p2], marker="*", s=400, color="red",
                edgecolor="black", linewidth=1.0, zorder=5,
-               label=f"Optimized: p1={best['p1']:.3f}, p2={best['p2']:.3f}\n"
-                     f"|non-closure|={100.0*abs(best['nonclosure']):.2f}%")
+               label=f"Fixed threshold: test p1={report_p1:.3f}, "
+                     f"p2={report_p2:.3f}\n"
+                     f"|test non-closure|={100.0*abs(best['nonclosure']):.2f}%")
     ax.set_xlabel("Percentile threshold, axis 1 (AE reco loss)", fontsize=fs_leg)
     ax.set_ylabel("Percentile threshold, axis 2 (NURD contrastive MD)", fontsize=fs_leg)
     ax.set_title("ABCD closure scan (full grid)", fontsize=fs_leg)
@@ -731,7 +929,7 @@ def ABCD(config):
         wandb.log({f"Profiles/{key}": wandb.Image(out_p)})
 
     # 1D closure scan
-    effs, closure_ratio, closure_unc = [], [], []
+    effs, closure_ratio, closure_unc, curve_abs_nonclosure = [], [], [], []
     Ntot_bkg = float(gen_weights_qcd.sum()) if gen_weights_qcd is not None else float(len(axis1_qcd))
 
     for p in percent:
@@ -747,6 +945,8 @@ def ABCD(config):
         effs.append(A / max(Ntot_bkg, 1.0))
         closure_ratio.append(ratio)
         closure_unc.append(sigma)
+        curve_nc, _ = nonclosure_A(A, B, C, D)
+        curve_abs_nonclosure.append(abs(curve_nc))
 
     effs          = np.array(effs)
     closure_ratio = np.array(closure_ratio)
@@ -766,7 +966,7 @@ def ABCD(config):
     ax.plot(effs, np.ones_like(effs),       linestyle="-",  color="black")
     ax.plot(effs, np.full_like(effs, 0.95), linestyle="--", color="black")
     ax.plot(effs, np.full_like(effs, 1.05), linestyle="--", color="black")
-    ax.plot([eff_opt], [ratio_opt], marker="o", c="red", label="Optimized")
+    ax.plot([eff_opt], [ratio_opt], marker="o", c="red", label="Fixed threshold")
     ax.set_xlabel("Selection Efficiency (bkg A/Ntot)", fontsize=fs)
     ax.set_ylabel("Predicted Bkg. / True Bkg.",        fontsize=fs)
     ax.set_ylim([0.0, 1.5]); ax.set_xscale("log")
@@ -776,6 +976,41 @@ def ABCD(config):
     closure_path = os.path.join(plot_dir, "cut_and_count_bkg_check.png")
     plt.savefig(closure_path, dpi=200, bbox_inches="tight"); plt.close()
     wandb.log({"Closure/plot": wandb.Image(closure_path)})
+
+    finite_grid = np.abs(nc_grid[np.isfinite(nc_grid)])
+    finite_curve = np.asarray([
+        value for value in curve_abs_nonclosure if np.isfinite(value)])
+    diagnostics = {
+        "evaluation_protocol": best["selection_source"],
+        "qcd_events": int(len(axis1_qcd)),
+        "weighted_qcd": bool(gen_weights_qcd is not None),
+        "working_point": {
+            "nonclosure": float(best["nonclosure"]),
+            "absolute_nonclosure": float(abs(best["nonclosure"])),
+            "selection_nonclosure": float(
+                best.get("selection_nonclosure", best["nonclosure"])),
+            "A": float(best["A"]), "B": float(best["B"]),
+            "C": float(best["C"]), "D": float(best["D"]),
+        },
+        "heldout_grid": {
+            "points": int(finite_grid.size),
+            "median_absolute_nonclosure": (
+                float(np.median(finite_grid)) if finite_grid.size else None),
+            "p90_absolute_nonclosure": (
+                float(np.percentile(finite_grid, 90)) if finite_grid.size else None),
+        },
+        "heldout_diagonal_curve": {
+            "points": int(finite_curve.size),
+            "median_absolute_nonclosure": (
+                float(np.median(finite_curve)) if finite_curve.size else None),
+            "p90_absolute_nonclosure": (
+                float(np.percentile(finite_curve, 90)) if finite_curve.size else None),
+        },
+    }
+    diagnostics_path = os.path.join(outdir, "diagnostics.json")
+    with open(diagnostics_path, "w", encoding="utf-8") as output:
+        json.dump(diagnostics, output, indent=2)
+    print(f"Diagnostics saved to: {diagnostics_path}", flush=True)
 
     # Save thresholds JSON so make_datacard_ttbar.py can skip the scan
     thresholds_path = os.path.join(outdir, "abcd_thresholds.json")
@@ -787,6 +1022,11 @@ def ABCD(config):
             "p2":    float(best["p2"]),
             "n_pca": config.get("n_pca", None),
             "nonclosure": float(best["nonclosure"]),
+            "selection_nonclosure": float(
+                best.get("selection_nonclosure", best["nonclosure"])),
+            "selection_source": best["selection_source"],
+            "report_p1": report_p1,
+            "report_p2": report_p2,
         }, f, indent=2)
     print(f"Thresholds saved to: {thresholds_path}", flush=True)
 
@@ -801,6 +1041,11 @@ if __name__ == "__main__":
                         help="Path to AE checkpoint (checkpoint_ae.pth)")
     parser.add_argument("--test_pt",      required=True,
                         help="Path to test .pt file (SM cocktail)")
+    parser.add_argument("--reference_pt", default=None,
+                        help="Independent sample used only to fit the MD reference. "
+                             "If omitted, preserves the legacy same-sample behavior.")
+    parser.add_argument("--reference_weight_path", default=None,
+                        help="Optional per-event physics weights for --reference_pt.")
     parser.add_argument("--signal_pt",    default=None,
                         help="Optional signal .pt file")
     parser.add_argument("--gen_weight_path", default=None,

@@ -12,14 +12,27 @@ An MLP autoencoder trained on object-level features (pT, η, φ). Its reconstruc
 
 ### Axis 2 — Contrastive encoder (clustering)
 
-A Linformer-based Transformer encodes PF candidates into a low-dimensional latent vector, trained with SupCon + cross-entropy to cluster events by class.
+A Linformer-based Transformer encodes PF candidates into a low-dimensional
+latent vector. The baseline uses class-balanced cross-entropy to learn all four
+background classes; SupCon is optional and disabled for the first faithful
+engineer-style run.
 
 ### NURD decorrelation
 
-NURD enforces independence between the two axes via two mechanisms:
+The nuisance passed to the critic is the **continuous AE reconstruction error**.
+The training-only nuisance histogram is used only to estimate event weights; no
+nuisance-bin index is passed to the network.
 
-- **Reweighting** — computes sample weights `w(y,z) = p(y)·p(z)/p(y,z)` so that under the weighted distribution the class label `y` and the binned AE reco loss `z` are statistically independent. Applied to the CE loss each batch.
-- **Critic** — a small MLP trained to predict the nuisance bin `z` from `(latent, y)`. The encoder is penalised when the critic succeeds, pushing it to drop information about `z`. The critic is retrained for `--critic_epochs` epochs at the start of each encoder epoch.
+- **Unified weighting** — physics generator weights are retained within each
+  class/nuisance stratum, while every occupied stratum and every background
+  class receive equal total training mass. The same effective event weight is
+  used for AE training, classification, critic training, and the encoder
+  information loss. Full-split normalization avoids biased random-batch
+  normalization for the broad Mequinna weights.
+- **Density-ratio critic** — distinguishes real `(latent, nuisance, label)`
+  tuples from tuples with a shuffled continuous nuisance. The encoder minimizes
+  `log P(real) - log P(shuffled)` on real tuples, following the engineer
+  reference implementation.
 
 ---
 
@@ -39,35 +52,54 @@ Training is two steps — the AE must be trained first since its checkpoint is r
 
 ```bash
 python train_ae.py \
-    --data /eos/user/e/escheull/smcocktail_1M_noZB/hlt_smcocktail_train.pt
+    --data /path/to/hlt_smcocktail_mequinna_train.pt \
+    --gen_weight_path /path/to/weight_train.pt
 ```
 
-The checkpoint is saved to `checkpoints/hlt/ae/checkpoint_ae.pth`.
+The checkpoint is saved under
+`checkpoints/hlt/<project_name>/<exp_name>/checkpoint_ae.pth`.
 
 ### Step 2 — Train the NURD contrastive model
 
 ```bash
 python train_hlt.py \
-    --data    /eos/user/e/escheull/smcocktail_1M_noZB/hlt_smcocktail_train.pt \
-    --ae_ckpt checkpoints/hlt/ae/checkpoint_ae.pth \
-    --reweight 1 \
-    --joint_indep 1 \
-    --critic_epochs 2 \
-    --_lambda 1.0
+    --data    /path/to/hlt_smcocktail_mequinna_train.pt \
+    --gen_weight_path /path/to/weight_train.pt \
+    --ae_ckpt checkpoints/hlt/hlt/ae_run/checkpoint_ae.pth \
+    --balance_strata 20 \
+    --critic_steps 3 \
+    --lambda_info 1.0 \
+    --contrast_weight 0.0
 ```
 
 Key flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--reweight` | 1 | Enable NURD sample reweighting |
-| `--joint_indep` | 1 | Enable adversarial critic |
-| `--critic_epochs` | 2 | Critic training steps per encoder epoch |
-| `--_lambda` | 0.01 | Weight on the critic loss |
-| `--n_bins` | 10 | Number of quantile bins for the AE reco nuisance |
-| `--contrast_weight` | 0.05 | Balance between contrastive and CE loss |
+| `--balance_strata` | 20 | Training-only strata for estimating unified weights; not a critic input |
+| `--critic_steps` | 1 | Independent critic batches per encoder batch |
+| `--lambda_info` | 1.0 | Weight on the engineer log-density-ratio penalty |
+| `--contrast_weight` | 0.0 | Optional SupCon weight; disabled in the faithful engineer baseline |
 
 Checkpoints are saved to `checkpoints/hlt/<project_name>/<exp_name>/`.
+
+### Della campaign
+
+From the repository root on `main`:
+
+```bash
+export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
+bash slurm/launch_engineer_campaign.sh
+```
+
+The launcher submits fresh AE and NURD training followed by one dependent dual
+evaluation. Results are written to
+`$BASE/outputs/<run_tag>_eval/{held-out,legacy}`. An optional explicit run tag
+may be passed as the first argument. The held-out protocol fits the MD reference
+on saved training indices, selects thresholds on saved validation indices, and
+only then reports closure on the independent Mequinna test file. The legacy
+folder intentionally preserves main's same-sample comparison. A compact result
+is printed and saved as `<run_tag>_eval/evaluation_summary.json`.
 
 ---
 
@@ -76,14 +108,18 @@ Checkpoints are saved to `checkpoints/hlt/<project_name>/<exp_name>/`.
 ```bash
 python eval_abcd_nurd.py \
     --ckpt       checkpoints/hlt/hlt/hlt_nurd_run/checkpoint_main.pth.tar \
-    --ae_ckpt    checkpoints/hlt/ae/checkpoint_ae.pth \
-    --test_pt    /eos/user/e/escheull/smcocktail_1M_noZB/hlt_smcocktail_test.pt \
-    --signal_pt  /eos/user/e/escheull/smcocktail_1M_noZB/hlt_signal_TpTp.pt \
+    --ae_ckpt    checkpoints/hlt/hlt/ae_run/checkpoint_ae.pth \
+    --test_pt    /path/to/hlt_smcocktail_mequinna_test.pt \
+    --gen_weight_path /path/to/weight_test.pt \
+    --reference_pt /path/to/hlt_smcocktail_mequinna_train.pt \
+    --reference_weight_path /path/to/weight_train.pt \
     --outdir     outputs_abcd/<run> \
     --n_pca      6
 ```
 
-This also saves `<outdir>/abcd_thresholds.json` with the optimised t1/t2 thresholds for use with the datacard script.
+This saves `<outdir>/abcd_thresholds.json` and `<outdir>/diagnostics.json`.
+Omitting both reference arguments intentionally invokes the historical
+same-sample threshold scan and should only be used for the legacy comparison.
 
 ---
 
