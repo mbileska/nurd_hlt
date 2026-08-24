@@ -124,7 +124,9 @@ def profile_plot(ax, x, y, nbins=30, logx=False, min_per_bin=20, label="mean ± 
 
 def load_nurd_model(ckpt_path, device):
     """Load HLTContrastiveModel from NURD main checkpoint."""
-    ckpt = torch.load(ckpt_path, map_location=device)
+    # Keep checkpoint metadata (especially saved split indices) on CPU. Model
+    # parameters are copied to ``device`` by load_state_dict below.
+    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     cfg  = ckpt["config"]
 
     # num_tokens: infer from state dict (linear attn projection shape)
@@ -350,9 +352,12 @@ def checkpoint_reference_indices(checkpoint, signature, weight_metadata):
         raise ValueError(
             "Held-out reference weights do not match the training checkpoint.")
     split = preprocessing.get("split", {})
-    fit_indices = np.asarray(split.get("train_indices", []), dtype=np.int64)
-    selection_indices = np.asarray(
-        split.get("validation_indices", []), dtype=np.int64)
+    fit_indices = torch.as_tensor(
+        split.get("train_indices", []), dtype=torch.long
+    ).detach().cpu().numpy().astype(np.int64, copy=False)
+    selection_indices = torch.as_tensor(
+        split.get("validation_indices", []), dtype=torch.long
+    ).detach().cpu().numpy().astype(np.int64, copy=False)
     combined = np.concatenate([fit_indices, selection_indices])
     if (combined.size != signature["n_events"]
             or np.unique(combined).size != combined.size
