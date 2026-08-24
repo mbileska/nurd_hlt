@@ -101,6 +101,13 @@ only then reports closure on the independent Mequinna test file. The legacy
 folder intentionally preserves main's same-sample comparison. A compact result
 is printed and saved as `<run_tag>_eval/evaluation_summary.json`.
 
+If training completed but its dependent evaluation failed, reuse the existing
+checkpoints without resubmitting training:
+
+```bash
+bash slurm/launch_engineer_eval.sh <existing_run_tag>
+```
+
 ---
 
 ## Evaluation
