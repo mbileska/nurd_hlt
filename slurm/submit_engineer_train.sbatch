@@ -96,7 +96,7 @@ python train_hlt.py \
   --critic_lr 1e-3 \
   --critic_steps 3 \
   --lambda_info 1.0 \
-  --contrast_weight 0.0 \
+  --contrast_weight 0.2 \
   --weight_decay 5e-3 \
   --embed_size 128 \
   --latent_dim 6 \
