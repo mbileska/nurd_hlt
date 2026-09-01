@@ -22,6 +22,7 @@ TRAIN_PT="${TRAIN_PT:-$MEQUINNA_DIR/hlt_smcocktail_mequinna_train.pt}"
 GEN_WEIGHT_TRAIN="${GEN_WEIGHT_TRAIN:-$MEQUINNA_DIR/weight_train.pt}"
 RUN_TAG="${RUN_TAG:?RUN_TAG must be supplied by the launcher}"
 CODE_COMMIT="${CODE_COMMIT:?CODE_COMMIT must be supplied by the launcher}"
+CONTRAST_WEIGHT="${CONTRAST_WEIGHT:?CONTRAST_WEIGHT must be supplied by the launcher}"
 AE_EXP="${AE_EXP:-ae_engineer_$RUN_TAG}"
 NURD_EXP="${NURD_EXP:-hlt_nurd_engineer_$RUN_TAG}"
 AE_CKPT="$BASE/checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth"
@@ -63,6 +64,7 @@ echo "Data: $TRAIN_PT"
 echo "Weights: $GEN_WEIGHT_TRAIN"
 echo "AE experiment: $AE_EXP"
 echo "NURD experiment: $NURD_EXP"
+echo "SupCon weight: $CONTRAST_WEIGHT"
 
 python train_ae.py \
   --data "$TRAIN_PT" \
@@ -96,7 +98,7 @@ python train_hlt.py \
   --critic_lr 1e-3 \
   --critic_steps 3 \
   --lambda_info 1.0 \
-  --contrast_weight 0.1 \
+  --contrast_weight "$CONTRAST_WEIGHT" \
   --weight_decay 5e-3 \
   --embed_size 128 \
   --latent_dim 6 \

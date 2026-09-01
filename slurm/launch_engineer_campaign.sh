@@ -7,8 +7,9 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 CODE_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 cd "$CODE_DIR"
 
-if (( $# > 1 )); then
-  echo "Usage: bash slurm/launch_engineer_campaign.sh [run_tag]"
+if (( $# != 2 )); then
+  echo "Usage: bash slurm/launch_engineer_campaign.sh RUN_TAG SUPCON_WEIGHT"
+  echo "Example: bash slurm/launch_engineer_campaign.sh engineer_continuous_supcon040 0.4"
   exit 2
 fi
 if ! git diff --quiet || ! git diff --cached --quiet; then
@@ -17,9 +18,14 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 CODE_COMMIT="$(git rev-parse HEAD)"
-RUN_TAG="${1:-engineer_continuous_$(date +%Y%m%d_%H%M%S)}"
+RUN_TAG="$1"
+CONTRAST_WEIGHT="$2"
 if [[ ! "$RUN_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "ERROR: run tag may contain only letters, numbers, dot, underscore, and dash."
+  exit 2
+fi
+if [[ ! "$CONTRAST_WEIGHT" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$ ]]; then
+  echo "ERROR: SUPCON_WEIGHT must be a non-negative number."
   exit 2
 fi
 AE_EXP="ae_engineer_$RUN_TAG"
@@ -37,7 +43,7 @@ done
 
 TRAIN_JOB="$(sbatch --parsable \
   --job-name="${RUN_TAG}_train" \
-  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",CODE_COMMIT="$CODE_COMMIT",RUN_TAG="$RUN_TAG",AE_EXP="$AE_EXP",NURD_EXP="$NURD_EXP" \
+  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",CODE_COMMIT="$CODE_COMMIT",RUN_TAG="$RUN_TAG",AE_EXP="$AE_EXP",NURD_EXP="$NURD_EXP",CONTRAST_WEIGHT="$CONTRAST_WEIGHT" \
   slurm/submit_engineer_train.sbatch)"
 
 EVAL_JOB="$(sbatch --parsable \
@@ -50,6 +56,7 @@ echo "Run tag:       $RUN_TAG"
 echo "Commit:        $CODE_COMMIT"
 echo "AE experiment: $AE_EXP"
 echo "NURD:          $NURD_EXP"
+echo "SupCon weight: $CONTRAST_WEIGHT"
 echo "Outputs:       $BASE/outputs/${RUN_TAG}_eval/{held-out,legacy}"
 echo "Training job:  $TRAIN_JOB"
 echo "Evaluation job: $EVAL_JOB"
