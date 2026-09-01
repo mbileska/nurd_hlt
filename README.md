@@ -79,7 +79,10 @@ Key flags:
 | `--balance_strata` | 20 | Training-only strata for estimating unified weights; not a critic input |
 | `--critic_steps` | 1 | Independent critic batches per encoder batch |
 | `--lambda_info` | 1.0 | Weight on the engineer log-density-ratio penalty |
+| `--info_warmup_epochs` | 0 | Epochs with no encoder information penalty; the critic still trains |
+| `--info_ramp_epochs` | 0 | Cosine-ramp epochs from zero to `lambda_info`; zero restores immediate application |
 | `--contrast_weight` | 0.0 | Optional SupCon weight; disabled in the faithful engineer baseline |
+| `--lr_schedule_epochs` | 0 | Cosine LR horizon; zero follows `epochs`, otherwise LR stays at its minimum after this horizon |
 
 Checkpoints are saved to `checkpoints/hlt/<project_name>/<exp_name>/`.
 
@@ -89,8 +92,24 @@ From the repository root on `main`:
 
 ```bash
 export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
-bash slurm/launch_engineer_campaign.sh
+bash slurm/launch_engineer_campaign.sh <run_tag> <supcon_weight>
 ```
+
+The scheduled SupCon-0.3 comparison (five warm-up epochs, cosine ramp over
+epochs 6--15, full information weight thereafter) is launched with:
+
+```bash
+INFO_WARMUP_EPOCHS=5 INFO_RAMP_EPOCHS=10 \
+NURD_EPOCHS=80 LR_SCHEDULE_EPOCHS=40 \
+  bash slurm/launch_engineer_campaign.sh engineer_continuous_supcon030_ramp 0.3
+```
+
+This keeps the original 40-epoch cosine learning-rate trajectory, holds its
+minimum afterward, and leaves a high 80-epoch ceiling so patience-based early
+stopping determines the endpoint. Omitting those environment variables exactly
+restores the previous immediate information penalty and 40-epoch limit.
+Checkpoint selection and early stopping are disabled until the ramp reaches its
+target; the critic itself continues to train throughout warm-up.
 
 The launcher submits fresh AE and NURD training followed by one dependent dual
 evaluation. Results are written to

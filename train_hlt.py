@@ -169,10 +169,22 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Independent critic batches trained before each encoder batch.")
     parser.add_argument("--lambda_info", "--_lambda", dest="lambda_info",
                         type=float, default=1.0)
+    parser.add_argument(
+        "--info_warmup_epochs", type=int, default=0,
+        help=("Epochs with zero encoder information penalty. The critic is "
+              "still trained during this warm-up."))
+    parser.add_argument(
+        "--info_ramp_epochs", type=int, default=0,
+        help=("Epochs used for a cosine ramp from zero to --lambda_info. "
+              "Zero preserves the original immediate-penalty behavior."))
     parser.add_argument("--contrast_weight", type=float, default=0.0)
     parser.add_argument("--contrast_temp", type=float, default=0.05)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--cosine", type=int, default=1)
+    parser.add_argument(
+        "--lr_schedule_epochs", type=int, default=0,
+        help=("Cosine-decay horizon. Zero uses --epochs. When shorter than "
+              "--epochs, the learning rate remains at eta_min afterward."))
 
     parser.add_argument("--embed_size", type=int, default=128)
     parser.add_argument("--latent_dim", type=int, default=6)
@@ -189,6 +201,62 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--manualSeed", type=int, default=42)
     parser.add_argument("--code_commit", default="")
     return parser
+
+
+def information_schedule_end_epoch(
+    warmup_epochs: int,
+    ramp_epochs: int,
+) -> int:
+    """First epoch eligible for checkpoint selection and early stopping.
+
+    A ten-epoch ramp after five warm-up epochs occupies epochs 6--15, so the
+    full target weight is reached and selection becomes eligible at epoch 15.
+    The immediate schedule remains eligible at epoch 1.
+    """
+    if warmup_epochs < 0 or ramp_epochs < 0:
+        raise ValueError("Information warm-up and ramp epochs must be non-negative.")
+    if ramp_epochs:
+        return warmup_epochs + ramp_epochs
+    return warmup_epochs + 1
+
+
+def effective_information_weight(
+    epoch: int,
+    target: float,
+    warmup_epochs: int,
+    ramp_epochs: int,
+) -> float:
+    """Return the encoder information-penalty weight for a one-based epoch."""
+    if epoch < 1:
+        raise ValueError("Epochs are one-based and must be positive.")
+    if target < 0.0:
+        raise ValueError("The target information weight must be non-negative.")
+    end_epoch = information_schedule_end_epoch(warmup_epochs, ramp_epochs)
+    if epoch <= warmup_epochs:
+        return 0.0
+    if ramp_epochs == 0 or ramp_epochs == 1:
+        return float(target)
+
+    # The first ramp epoch is exactly zero and the last is exactly the target.
+    progress = (epoch - warmup_epochs - 1) / float(ramp_epochs - 1)
+    progress = min(max(progress, 0.0), 1.0)
+    multiplier = 0.5 * (1.0 - math.cos(math.pi * progress))
+    if epoch >= end_epoch:
+        multiplier = 1.0
+    return float(target) * multiplier
+
+
+def cosine_lr_multiplier(
+    completed_epochs: int,
+    schedule_epochs: int,
+    eta_min_ratio: float = 1e-3,
+) -> float:
+    """Cosine decay that stays at its minimum after the chosen horizon."""
+    if schedule_epochs < 1:
+        raise ValueError("The LR schedule horizon must be positive.")
+    progress = min(max(completed_epochs / float(schedule_epochs), 0.0), 1.0)
+    return eta_min_ratio + (1.0 - eta_min_ratio) * 0.5 * (
+        1.0 + math.cos(math.pi * progress))
 
 
 def set_random_seed(seed: int):
@@ -277,6 +345,7 @@ def train_epoch(
     device: torch.device,
     args,
     contrastive_loss,
+    information_weight: float,
 ) -> Dict[str, object]:
     metrics = EpochMetrics(model.classifier.out_features)
     critic_iterator = iter(train_loader)
@@ -315,7 +384,7 @@ def train_epoch(
             contrast_loss = latent.sum() * 0.0
         total_loss = (
             ce_loss
-            + args.lambda_info * information_loss
+            + information_weight * information_loss
             + args.contrast_weight * contrast_loss
         )
 
@@ -370,6 +439,16 @@ def main(argv=None):
         raise ValueError("critic_steps must be at least one.")
     if args.lambda_info < 0.0 or args.contrast_weight < 0.0:
         raise ValueError("Loss weights must be non-negative.")
+    if args.info_warmup_epochs < 0 or args.info_ramp_epochs < 0:
+        raise ValueError("Information warm-up and ramp epochs must be non-negative.")
+    if args.lr_schedule_epochs < 0:
+        raise ValueError("lr_schedule_epochs must be non-negative.")
+    selection_start_epoch = information_schedule_end_epoch(
+        args.info_warmup_epochs, args.info_ramp_epochs)
+    if selection_start_epoch > args.epochs:
+        raise ValueError(
+            "The information schedule must finish within the requested epochs: "
+            f"selection starts at epoch {selection_start_epoch}, epochs={args.epochs}.")
 
     set_random_seed(args.manualSeed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -449,11 +528,23 @@ def main(argv=None):
     critic_optimizer = torch.optim.Adam(
         critic.parameters(), lr=args.critic_lr,
         weight_decay=args.critic_weight_decay)
-    model_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        model_optimizer,
-        T_max=max(args.epochs, 1),
-        eta_min=args.lr * 1e-3,
-    ) if args.cosine else None
+    lr_schedule_epochs = args.lr_schedule_epochs or args.epochs
+    if not args.cosine:
+        model_scheduler = None
+    elif lr_schedule_epochs == args.epochs:
+        # Preserve the original campaign behavior exactly when no independent
+        # LR horizon is requested.
+        model_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            model_optimizer,
+            T_max=max(args.epochs, 1),
+            eta_min=args.lr * 1e-3,
+        )
+    else:
+        model_scheduler = torch.optim.lr_scheduler.LambdaLR(
+            model_optimizer,
+            lr_lambda=lambda completed: cosine_lr_multiplier(
+                completed, lr_schedule_epochs),
+        )
     contrastive_loss = SupConLoss(args.contrast_temp)
 
     logger.info(
@@ -461,6 +552,15 @@ def main(argv=None):
         "balance_strata=%d lambda_info=%.3f critic_steps=%d",
         len(train_dataset), len(val_dataset), num_classes,
         args.balance_strata, args.lambda_info, args.critic_steps)
+    logger.info(
+        "Information schedule: warmup_epochs=%d ramp_epochs=%d "
+        "selection_start_epoch=%d",
+        args.info_warmup_epochs, args.info_ramp_epochs,
+        selection_start_epoch)
+    logger.info(
+        "Optimization schedule: maximum_epochs=%d lr_schedule_epochs=%d "
+        "patience=%d",
+        args.epochs, lr_schedule_epochs, args.patience)
     logger.info("Weighting metadata: %s", preprocessing["weighting"])
 
     best_val = math.inf
@@ -470,23 +570,37 @@ def main(argv=None):
     history = []
 
     for epoch in range(1, args.epochs + 1):
+        information_weight = effective_information_weight(
+            epoch,
+            args.lambda_info,
+            args.info_warmup_epochs,
+            args.info_ramp_epochs,
+        )
         train_metrics = train_epoch(
             model, critic, train_loader,
             model_optimizer, critic_optimizer,
-            device, args, contrastive_loss)
+            device, args, contrastive_loss, information_weight)
         val_metrics = validate(model, critic, val_loader, device)
         if model_scheduler is not None:
             model_scheduler.step()
         logger.info(format_metrics("train", epoch, train_metrics))
         logger.info(format_metrics("validation", epoch, val_metrics))
+        logger.info(
+            "information schedule epoch=%d effective_lambda_info=%.6f",
+            epoch, information_weight)
         history.append({
             "epoch": epoch,
+            "effective_lambda_info": information_weight,
             "train": train_metrics,
             "validation": val_metrics,
         })
 
         if wandb is not None:
-            flat = {"epoch": epoch, "lr": model_optimizer.param_groups[0]["lr"]}
+            flat = {
+                "epoch": epoch,
+                "lr": model_optimizer.param_groups[0]["lr"],
+                "effective_lambda_info": information_weight,
+            }
             for split, values in (("train", train_metrics), ("validation", val_metrics)):
                 for key, value in values.items():
                     if key == "per_class_accuracy":
@@ -495,6 +609,12 @@ def main(argv=None):
                     else:
                         flat[f"{split}/{key}"] = value
             wandb.log(flat, step=epoch)
+
+        if epoch < selection_start_epoch:
+            logger.info(
+                "Checkpoint selection and early stopping disabled until epoch %d.",
+                selection_start_epoch)
+            continue
 
         if val_metrics["weighted_ce"] < best_val:
             best_val = float(val_metrics["weighted_ce"])
@@ -509,6 +629,7 @@ def main(argv=None):
                 "ae_checkpoint_sha256": ae_checkpoint_sha256,
                 "selection_metric": "training-fit-weighted_validation_ce",
                 "selection_value": best_val,
+                "effective_lambda_info": information_weight,
                 "train_metrics": train_metrics,
                 "validation_metrics": val_metrics,
             }
@@ -518,6 +639,20 @@ def main(argv=None):
                 "state_dict_critic": critic.state_dict(),
                 "config": vars(args),
             }, critic_checkpoint_path)
+            if wandb is not None:
+                wandb.run.summary["selected_epoch"] = epoch
+                wandb.run.summary[
+                    "selected_validation_balanced_accuracy"
+                ] = val_metrics["balanced_accuracy"]
+                wandb.run.summary[
+                    "selected_validation_weighted_accuracy"
+                ] = val_metrics["weighted_accuracy"]
+                wandb.run.summary[
+                    "selected_weighted_validation_ce"
+                ] = val_metrics["weighted_ce"]
+                wandb.run.summary[
+                    "selected_effective_lambda_info"
+                ] = information_weight
             logger.info("Saved best checkpoint: %s", main_checkpoint_path)
         else:
             bad_epochs += 1

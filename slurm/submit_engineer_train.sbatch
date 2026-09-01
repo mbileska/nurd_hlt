@@ -2,7 +2,7 @@
 #SBATCH --job-name=nurd_engineer_train
 #SBATCH --output=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/%x-%j.out
 #SBATCH --error=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/logs/%x-%j.err
-#SBATCH --time=18:00:00
+#SBATCH --time=20:00:00
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:a100:1
@@ -23,6 +23,10 @@ GEN_WEIGHT_TRAIN="${GEN_WEIGHT_TRAIN:-$MEQUINNA_DIR/weight_train.pt}"
 RUN_TAG="${RUN_TAG:?RUN_TAG must be supplied by the launcher}"
 CODE_COMMIT="${CODE_COMMIT:?CODE_COMMIT must be supplied by the launcher}"
 CONTRAST_WEIGHT="${CONTRAST_WEIGHT:?CONTRAST_WEIGHT must be supplied by the launcher}"
+NURD_EPOCHS="${NURD_EPOCHS:-40}"
+LR_SCHEDULE_EPOCHS="${LR_SCHEDULE_EPOCHS:-$NURD_EPOCHS}"
+INFO_WARMUP_EPOCHS="${INFO_WARMUP_EPOCHS:-0}"
+INFO_RAMP_EPOCHS="${INFO_RAMP_EPOCHS:-0}"
 AE_EXP="${AE_EXP:-ae_engineer_$RUN_TAG}"
 NURD_EXP="${NURD_EXP:-hlt_nurd_engineer_$RUN_TAG}"
 AE_CKPT="$BASE/checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth"
@@ -65,6 +69,9 @@ echo "Weights: $GEN_WEIGHT_TRAIN"
 echo "AE experiment: $AE_EXP"
 echo "NURD experiment: $NURD_EXP"
 echo "SupCon weight: $CONTRAST_WEIGHT"
+echo "NURD maximum epochs: $NURD_EPOCHS"
+echo "NURD LR schedule epochs: $LR_SCHEDULE_EPOCHS"
+echo "Information warm-up/ramp: $INFO_WARMUP_EPOCHS/$INFO_RAMP_EPOCHS"
 
 python train_ae.py \
   --data "$TRAIN_PT" \
@@ -91,13 +98,16 @@ python train_hlt.py \
   --ae_ckpt "$AE_CKPT" \
   --qcd_label 1 \
   --balance_strata 20 \
-  --epochs 40 \
+  --epochs "$NURD_EPOCHS" \
+  --lr_schedule_epochs "$LR_SCHEDULE_EPOCHS" \
   --batch_size 4096 \
   --num_workers 0 \
   --lr 1e-4 \
   --critic_lr 1e-3 \
   --critic_steps 3 \
   --lambda_info 1.0 \
+  --info_warmup_epochs "$INFO_WARMUP_EPOCHS" \
+  --info_ramp_epochs "$INFO_RAMP_EPOCHS" \
   --contrast_weight "$CONTRAST_WEIGHT" \
   --weight_decay 5e-3 \
   --embed_size 128 \
