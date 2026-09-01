@@ -127,6 +127,18 @@ checkpoints without resubmitting training:
 bash slurm/launch_engineer_eval.sh <existing_run_tag>
 ```
 
+To preserve the original evaluation and write a separate statistically
+filtered result, require adequate statistics in all four ABCD regions with:
+
+```bash
+bash slurm/launch_engineer_eval.sh <existing_run_tag> stat-valid
+```
+
+This writes to `$BASE/outputs/<run_tag>_eval_stat_valid/{held-out,legacy}`.
+Legacy filtering uses raw region counts. Weighted held-out filtering uses
+effective counts, `(sum w)^2/sum(w^2)`, and its closure uncertainty uses
+`sum(w^2)`. The original one-argument command and output remain unchanged.
+
 ---
 
 ## Evaluation

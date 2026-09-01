@@ -29,7 +29,8 @@ REFERENCE_PT="${REFERENCE_PT:-$MEQUINNA_DIR/hlt_smcocktail_mequinna_train.pt}"
 REFERENCE_WEIGHTS="${REFERENCE_WEIGHTS:-$MEQUINNA_DIR/weight_train.pt}"
 LEGACY_PT="${LEGACY_PT:-$BASE/data/hlt_smcocktail_test.pt}"
 SIGNAL_PT="${SIGNAL_PT:-$BASE/data/hlt_signal_TpTp.pt}"
-OUTPUT_ROOT="$BASE/outputs/${RUN_TAG}_eval"
+OUTPUT_ROOT="${OUTPUT_ROOT:-$BASE/outputs/${RUN_TAG}_eval}"
+STATISTICALLY_VALID_CLOSURE="${STATISTICALLY_VALID_CLOSURE:-0}"
 
 mkdir -p "$BASE/logs" "$BASE/outputs" "$BASE/wandb" "$OUTPUT_ROOT/held-out" "$OUTPUT_ROOT/legacy"
 export WANDB_DIR="$BASE/wandb"
@@ -55,6 +56,13 @@ if [[ -s "$SIGNAL_PT" ]]; then
   SIGNAL_ARGS=(--signal_pt "$SIGNAL_PT")
 fi
 
+STATISTICS_ARGS=()
+WANDB_EVAL_SUFFIX=""
+if [[ "$STATISTICALLY_VALID_CLOSURE" == "1" ]]; then
+  STATISTICS_ARGS=(--statistically_valid_closure)
+  WANDB_EVAL_SUFFIX="_stat_valid"
+fi
+
 python eval_abcd_nurd.py \
   --ckpt "$NURD_CKPT" \
   --ae_ckpt "$AE_CKPT" \
@@ -65,7 +73,8 @@ python eval_abcd_nurd.py \
   --outdir "$OUTPUT_ROOT/held-out" \
   --n_pca 6 \
   --qcd_label 1 \
-  --wandb_run_name "${RUN_TAG}_held_out" \
+  --wandb_run_name "${RUN_TAG}_held_out${WANDB_EVAL_SUFFIX}" \
+  "${STATISTICS_ARGS[@]}" \
   "${SIGNAL_ARGS[@]}"
 
 python eval_abcd_nurd.py \
@@ -75,7 +84,8 @@ python eval_abcd_nurd.py \
   --outdir "$OUTPUT_ROOT/legacy" \
   --n_pca 6 \
   --qcd_label 1 \
-  --wandb_run_name "${RUN_TAG}_legacy" \
+  --wandb_run_name "${RUN_TAG}_legacy${WANDB_EVAL_SUFFIX}" \
+  "${STATISTICS_ARGS[@]}" \
   "${SIGNAL_ARGS[@]}"
 
 python scripts/summarize_dual_eval.py \

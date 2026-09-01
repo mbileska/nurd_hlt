@@ -48,42 +48,101 @@ def weighted_quantile(values, q, weights):
     return sv[np.clip(idx, 0, len(sv) - 1)]
 
 
-def abcd_counts(loss_1, loss_2, percent_1, percent_2, weights=None):
+ABCD_REGIONS = ("A", "B", "C", "D")
+
+
+def abcd_region_statistics_at_thresholds(
+        loss_1, loss_2, thresh_1, thresh_2, weights=None):
+    """Return yield, sumw2, raw count and effective count in each region.
+
+    For unit-weight legacy samples, ``effective_count`` is exactly the raw
+    event count.  For weighted samples it is ``(sum w)^2 / sum(w^2)``, which is
+    the count relevant to statistical precision.
+    """
+    loss_1 = np.asarray(loss_1)
+    loss_2 = np.asarray(loss_2)
+    if weights is None:
+        event_weights = np.ones(len(loss_1), dtype=np.float64)
+    else:
+        event_weights = np.asarray(weights, dtype=np.float64)
+    if loss_1.shape != loss_2.shape or event_weights.shape != loss_1.shape:
+        raise ValueError("ABCD scores and weights must have identical shapes.")
+
+    high_1 = loss_1 > thresh_1
+    high_2 = loss_2 > thresh_2
+    masks = {
+        "A": high_1 & high_2,
+        "B": high_1 & ~high_2,
+        "C": ~high_1 & high_2,
+        "D": ~high_1 & ~high_2,
+    }
+    statistics = {}
+    for region, mask in masks.items():
+        selected = event_weights[mask]
+        event_yield = float(selected.sum())
+        sumw2 = float(np.square(selected).sum())
+        effective_count = (
+            event_yield * event_yield / sumw2 if sumw2 > 0.0 else 0.0)
+        statistics[region] = {
+            "yield": event_yield,
+            "sumw2": sumw2,
+            "raw_count": int(mask.sum()),
+            "effective_count": float(effective_count),
+        }
+    return statistics
+
+
+def abcd_statistics(loss_1, loss_2, percent_1, percent_2, weights=None):
+    """Select percentile thresholds and return per-region statistics."""
     if weights is not None:
         thresh_1 = weighted_quantile(loss_1, percent_1, weights)
         thresh_2 = weighted_quantile(loss_2, percent_2, weights)
-        m_A = (loss_1 > thresh_1) & (loss_2 > thresh_2)
-        m_B = (loss_1 > thresh_1) & (loss_2 <= thresh_2)
-        m_C = (loss_1 <= thresh_1) & (loss_2 > thresh_2)
-        m_D = (loss_1 <= thresh_1) & (loss_2 <= thresh_2)
-        A = float(weights[m_A].sum())
-        B = float(weights[m_B].sum())
-        C = float(weights[m_C].sum())
-        D = float(weights[m_D].sum())
     else:
         thresh_1 = np.quantile(loss_1, percent_1)
         thresh_2 = np.quantile(loss_2, percent_2)
-        A = int(((loss_1 > thresh_1) & (loss_2 > thresh_2)).sum())
-        B = int(((loss_1 > thresh_1) & (loss_2 <= thresh_2)).sum())
-        C = int(((loss_1 <= thresh_1) & (loss_2 > thresh_2)).sum())
-        D = int(((loss_1 <= thresh_1) & (loss_2 <= thresh_2)).sum())
+    statistics = abcd_region_statistics_at_thresholds(
+        loss_1, loss_2, thresh_1, thresh_2, weights=weights)
+    return thresh_1, thresh_2, statistics
+
+
+def abcd_yields(statistics):
+    return tuple(statistics[region]["yield"] for region in ABCD_REGIONS)
+
+
+def statistically_valid_regions(statistics, minimums):
+    """Require adequate effective statistics independently in A, B, C and D."""
+    return all(
+        statistics[region]["effective_count"] >= float(minimums[region])
+        for region in ABCD_REGIONS)
+
+
+def closure_ratio_and_uncertainty(statistics):
+    """ABCD predicted/observed ratio with weighted-Poisson sumw2 error."""
+    A, B, C, D = abcd_yields(statistics)
+    if min(A, B, C, D) <= 0.0:
+        return np.nan, np.nan
+    ratio = (B * C) / (D * A)
+    relative_variance = sum(
+        statistics[region]["sumw2"]
+        / (statistics[region]["yield"] ** 2)
+        for region in ABCD_REGIONS)
+    return ratio, abs(ratio) * np.sqrt(relative_variance)
+
+
+def abcd_counts(loss_1, loss_2, percent_1, percent_2, weights=None):
+    thresh_1, thresh_2, statistics = abcd_statistics(
+        loss_1, loss_2, percent_1, percent_2, weights=weights)
+    A, B, C, D = abcd_yields(statistics)
+    if weights is None:
+        A, B, C, D = (int(A), int(B), int(C), int(D))
     return thresh_1, thresh_2, A, B, C, D
 
 
 def abcd_counts_at_thresholds(loss_1, loss_2, thresh_1, thresh_2, weights=None):
     """ABCD yields at fixed thresholds selected on another sample."""
-    if weights is None:
-        weights = np.ones(len(loss_1), dtype=np.float64)
-    else:
-        weights = np.asarray(weights, dtype=np.float64)
-    high_1 = loss_1 > thresh_1
-    high_2 = loss_2 > thresh_2
-    return tuple(float(weights[mask].sum()) for mask in (
-        high_1 & high_2,
-        high_1 & ~high_2,
-        ~high_1 & high_2,
-        ~high_1 & ~high_2,
-    ))
+    statistics = abcd_region_statistics_at_thresholds(
+        loss_1, loss_2, thresh_1, thresh_2, weights=weights)
+    return abcd_yields(statistics)
 
 
 def nonclosure_A(A, B, C, D, eps=1e-8):
@@ -571,30 +630,60 @@ def ABCD(config):
     # ── ABCD scan ─────────────────────────────────────────────────────────────
     percent = np.linspace(0.50, 0.98, 48)
     min_A   = int(config.get("min_A", 50))
+    min_B   = int(config.get("min_B", 50))
+    min_C   = int(config.get("min_C", 50))
     min_D   = int(config.get("min_D", 500))
+    statistically_valid_closure = bool(
+        config.get("statistically_valid_closure", False))
+    region_minimums = {
+        "A": min_A, "B": min_B, "C": min_C, "D": min_D,
+    }
+    if statistically_valid_closure:
+        count_basis = (
+            "effective event counts (sumw)^2/sumw2"
+            if gen_weights_qcd is not None else "raw event counts")
+        print(
+            "Statistically valid closure enabled: requiring "
+            f"A>={min_A}, B>={min_B}, C>={min_C}, D>={min_D} using "
+            f"{count_basis}.", flush=True)
     nc_grid = np.full((len(percent), len(percent)), np.nan)
+    grid_rejected_points = 0
 
     oracle_best = {"nonclosure": np.inf}
     for i, p1 in enumerate(percent):
         for j, p2 in enumerate(percent):
-            t1, t2, A, B, C, D = abcd_counts(axis1_qcd, axis2_qcd, p1, p2, weights=gen_weights_qcd)
-            if A < min_A or D < min_D:
+            t1, t2, statistics = abcd_statistics(
+                axis1_qcd, axis2_qcd, p1, p2,
+                weights=gen_weights_qcd)
+            A, B, C, D = abcd_yields(statistics)
+            valid = (
+                statistically_valid_regions(statistics, region_minimums)
+                if statistically_valid_closure
+                else A >= min_A and D >= min_D)
+            if not valid:
+                grid_rejected_points += 1
                 continue
             nc, A_hat = nonclosure_A(A, B, C, D)
             nc_grid[i, j] = nc
             if np.isfinite(nc) and abs(nc) < abs(oracle_best["nonclosure"]):
                 oracle_best.update(dict(
                     p1=p1, p2=p2, t1=t1, t2=t2,
-                    A=A, B=B, C=C, D=D, A_hat=A_hat, nonclosure=nc))
+                    A=A, B=B, C=C, D=D, A_hat=A_hat, nonclosure=nc,
+                    region_statistics=statistics))
 
     if selection_axis1 is not None:
         selection_best = {"nonclosure": np.inf}
         for p1 in percent:
             for p2 in percent:
-                t1, t2, A, B, C, D = abcd_counts(
+                t1, t2, statistics = abcd_statistics(
                     selection_axis1, selection_axis2, p1, p2,
                     weights=selection_weights)
-                if A < min_A or D < min_D:
+                A, B, C, D = abcd_yields(statistics)
+                valid = (
+                    statistically_valid_regions(statistics, region_minimums)
+                    if statistically_valid_closure
+                    else A >= min_A and D >= min_D)
+                if not valid:
                     continue
                 nc, A_hat = nonclosure_A(A, B, C, D)
                 if np.isfinite(nc) and abs(nc) < abs(
@@ -602,14 +691,16 @@ def ABCD(config):
                     selection_best.update(dict(
                         p1=p1, p2=p2, t1=t1, t2=t2,
                         A=A, B=B, C=C, D=D, A_hat=A_hat,
-                        nonclosure=nc))
+                        nonclosure=nc, region_statistics=statistics))
         if "t1" not in selection_best:
             raise RuntimeError(
-                "No validation ABCD working point found. Try lowering min_A/min_D.")
+                "No validation ABCD working point found. Try lowering the "
+                "minimum ABCD region counts.")
         t1_opt, t2_opt = selection_best["t1"], selection_best["t2"]
-        A, B, C, D = abcd_counts_at_thresholds(
+        report_statistics = abcd_region_statistics_at_thresholds(
             axis1_qcd, axis2_qcd, t1_opt, t2_opt,
             weights=gen_weights_qcd)
+        A, B, C, D = abcd_yields(report_statistics)
         report_nc, report_A_hat = nonclosure_A(A, B, C, D)
         best = dict(selection_best)
         best.update({
@@ -617,6 +708,7 @@ def ABCD(config):
             "A": A, "B": B, "C": C, "D": D,
             "A_hat": report_A_hat,
             "nonclosure": report_nc,
+            "region_statistics": report_statistics,
             "selection_source": "saved_training_validation_split",
         })
         report_weights = (
@@ -633,13 +725,23 @@ def ABCD(config):
         report_p1, report_p2 = best.get("p1"), best.get("p2")
 
     if "t1" not in best:
-        raise RuntimeError("No ABCD working point found. Try lowering min_A/min_D.")
+        raise RuntimeError(
+            "No ABCD working point found. Try lowering the minimum ABCD "
+            "region counts.")
+
+    working_point_statistically_valid = statistically_valid_regions(
+        best["region_statistics"], region_minimums)
 
     print(
         f"Threshold source: {best['selection_source']} "
         f"(selection p1={best['p1']:.3f}, p2={best['p2']:.3f})", flush=True)
     print(f"Thresholds: t1={t1_opt:.4g}, t2={t2_opt:.4g}", flush=True)
     print(f"Independent-report nonclosure: {100.0*best['nonclosure']:.2f}%", flush=True)
+    if statistically_valid_closure and not working_point_statistically_valid:
+        print(
+            "WARNING: the independently reported fixed working point does not "
+            "meet the minimum effective statistics in every ABCD region.",
+            flush=True)
 
     wandb.log({
         "ABCD/opt_p1":     best["p1"],
@@ -649,6 +751,11 @@ def ABCD(config):
         "ABCD/nonclosure": float(best["nonclosure"]),
         "ABCD/A": int(best["A"]), "ABCD/B": int(best["B"]),
         "ABCD/C": int(best["C"]), "ABCD/D": int(best["D"]),
+        "ABCD/A_neff": best["region_statistics"]["A"]["effective_count"],
+        "ABCD/B_neff": best["region_statistics"]["B"]["effective_count"],
+        "ABCD/C_neff": best["region_statistics"]["C"]["effective_count"],
+        "ABCD/D_neff": best["region_statistics"]["D"]["effective_count"],
+        "ABCD/statistically_valid": int(working_point_statistically_valid),
     })
 
     # ── Plots ─────────────────────────────────────────────────────────────────
@@ -666,11 +773,15 @@ def ABCD(config):
                          vmin=0.0, vmax=vmax, shading="auto")
     cb = fig.colorbar(mesh, ax=ax)
     cb.set_label("|Non-closure| (%)", fontsize=fs_leg)
+    wp_validity_label = (
+        "valid statistics" if working_point_statistically_valid
+        else "insufficient statistics")
     ax.scatter([report_p1], [report_p2], marker="*", s=400, color="red",
                edgecolor="black", linewidth=1.0, zorder=5,
                label=f"Fixed threshold: test p1={report_p1:.3f}, "
                      f"p2={report_p2:.3f}\n"
-                     f"|test non-closure|={100.0*abs(best['nonclosure']):.2f}%")
+                     f"|test non-closure|={100.0*abs(best['nonclosure']):.2f}%\n"
+                     f"{wp_validity_label}")
     ax.set_xlabel("Percentile threshold, axis 1 (AE reco loss)", fontsize=fs_leg)
     ax.set_ylabel("Percentile threshold, axis 2 (NURD contrastive MD)", fontsize=fs_leg)
     ax.set_title("ABCD closure scan (full grid)", fontsize=fs_leg)
@@ -935,18 +1046,29 @@ def ABCD(config):
 
     # 1D closure scan
     effs, closure_ratio, closure_unc, curve_abs_nonclosure = [], [], [], []
+    curve_rejected_points = 0
     Ntot_bkg = float(gen_weights_qcd.sum()) if gen_weights_qcd is not None else float(len(axis1_qcd))
 
     for p in percent:
-        t1, t2, A, B, C, D = abcd_counts(axis1_qcd, axis2_qcd, p, p, weights=gen_weights_qcd)
-        A_hat  = (B * C) / max(D, 1e-8)
-        ratio  = A_hat / max(A, 1e-8)
-        invA   = 0.0 if A == 0 else 1.0 / A
-        invB   = 0.0 if B == 0 else 1.0 / B
-        invC   = 0.0 if C == 0 else 1.0 / C
-        invD   = 0.0 if D == 0 else 1.0 / D
-        rel_var = invA + invB + invC + invD
-        sigma  = abs(ratio) * np.sqrt(rel_var) if rel_var > 0 else 0.0
+        _t1, _t2, statistics = abcd_statistics(
+            axis1_qcd, axis2_qcd, p, p, weights=gen_weights_qcd)
+        A, B, C, D = abcd_yields(statistics)
+        if (statistically_valid_closure
+                and not statistically_valid_regions(
+                    statistics, region_minimums)):
+            curve_rejected_points += 1
+            continue
+        if statistically_valid_closure:
+            ratio, sigma = closure_ratio_and_uncertainty(statistics)
+        else:
+            A_hat = (B * C) / max(D, 1e-8)
+            ratio = A_hat / max(A, 1e-8)
+            invA = 0.0 if A == 0 else 1.0 / A
+            invB = 0.0 if B == 0 else 1.0 / B
+            invC = 0.0 if C == 0 else 1.0 / C
+            invD = 0.0 if D == 0 else 1.0 / D
+            rel_var = invA + invB + invC + invD
+            sigma = abs(ratio) * np.sqrt(rel_var) if rel_var > 0 else 0.0
         effs.append(A / max(Ntot_bkg, 1.0))
         closure_ratio.append(ratio)
         closure_unc.append(sigma)
@@ -971,7 +1093,12 @@ def ABCD(config):
     ax.plot(effs, np.ones_like(effs),       linestyle="-",  color="black")
     ax.plot(effs, np.full_like(effs, 0.95), linestyle="--", color="black")
     ax.plot(effs, np.full_like(effs, 1.05), linestyle="--", color="black")
-    ax.plot([eff_opt], [ratio_opt], marker="o", c="red", label="Fixed threshold")
+    fixed_marker = "o" if working_point_statistically_valid else "X"
+    fixed_label = (
+        "Fixed threshold" if working_point_statistically_valid
+        else "Fixed threshold (insufficient statistics)")
+    ax.plot([eff_opt], [ratio_opt], marker=fixed_marker, c="red",
+            label=fixed_label)
     ax.set_xlabel("Selection Efficiency (bkg A/Ntot)", fontsize=fs)
     ax.set_ylabel("Predicted Bkg. / True Bkg.",        fontsize=fs)
     ax.set_ylim([0.0, 1.5]); ax.set_xscale("log")
@@ -989,6 +1116,20 @@ def ABCD(config):
         "evaluation_protocol": best["selection_source"],
         "qcd_events": int(len(axis1_qcd)),
         "weighted_qcd": bool(gen_weights_qcd is not None),
+        "statistical_filter": {
+            "enabled": statistically_valid_closure,
+            "count_basis": (
+                "effective_count" if gen_weights_qcd is not None
+                else "raw_count"),
+            "minimums": region_minimums,
+            "uncertainty_method": (
+                "weighted_sumw2" if statistically_valid_closure
+                and gen_weights_qcd is not None
+                else "unweighted_poisson" if statistically_valid_closure
+                else "original_evaluator"),
+            "grid_rejected_points": int(grid_rejected_points),
+            "diagonal_curve_rejected_points": int(curve_rejected_points),
+        },
         "working_point": {
             "nonclosure": float(best["nonclosure"]),
             "absolute_nonclosure": float(abs(best["nonclosure"])),
@@ -996,6 +1137,8 @@ def ABCD(config):
                 best.get("selection_nonclosure", best["nonclosure"])),
             "A": float(best["A"]), "B": float(best["B"]),
             "C": float(best["C"]), "D": float(best["D"]),
+            "statistically_valid": bool(working_point_statistically_valid),
+            "regions": best["region_statistics"],
         },
         "heldout_grid": {
             "points": int(finite_grid.size),
@@ -1059,7 +1202,14 @@ if __name__ == "__main__":
                              "Applied to QCD events only for weighted ABCD counts.")
     parser.add_argument("--outdir",       default="outputs_abcd")
     parser.add_argument("--min_A",        type=int, default=50)
+    parser.add_argument("--min_B",        type=int, default=50)
+    parser.add_argument("--min_C",        type=int, default=50)
     parser.add_argument("--min_D",        type=int, default=500)
+    parser.add_argument(
+        "--statistically_valid_closure", action="store_true",
+        help="Mask scan/curve points that fail minimum statistics in any "
+             "ABCD region. Uses raw counts for unit-weight data, effective "
+             "counts for weighted data, and sumw2 uncertainties.")
     parser.add_argument("--n_pca",        type=int, default=None,
                         help="Number of PCA components for MD (default: keep all latent dims)")
     parser.add_argument("--wandb_run_name", default=None)
