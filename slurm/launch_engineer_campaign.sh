@@ -24,6 +24,9 @@ NURD_EPOCHS="${NURD_EPOCHS:-40}"
 LR_SCHEDULE_EPOCHS="${LR_SCHEDULE_EPOCHS:-$NURD_EPOCHS}"
 INFO_WARMUP_EPOCHS="${INFO_WARMUP_EPOCHS:-0}"
 INFO_RAMP_EPOCHS="${INFO_RAMP_EPOCHS:-0}"
+CRITIC_SHUFFLE_MODE="${CRITIC_SHUFFLE_MODE:-weighted_within_class}"
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
+STATISTICALLY_VALID_CLOSURE="${STATISTICALLY_VALID_CLOSURE:-1}"
 if [[ ! "$RUN_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "ERROR: run tag may contain only letters, numbers, dot, underscore, and dash."
   exit 2
@@ -32,13 +35,23 @@ if [[ ! "$CONTRAST_WEIGHT" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$
   echo "ERROR: SUPCON_WEIGHT must be a non-negative number."
   exit 2
 fi
-for value_name in NURD_EPOCHS LR_SCHEDULE_EPOCHS INFO_WARMUP_EPOCHS INFO_RAMP_EPOCHS; do
+for value_name in NURD_EPOCHS LR_SCHEDULE_EPOCHS INFO_WARMUP_EPOCHS INFO_RAMP_EPOCHS CHECKPOINT_EVERY; do
   value="${!value_name}"
   if [[ ! "$value" =~ ^[0-9]+$ ]]; then
     echo "ERROR: $value_name must be a non-negative integer."
     exit 2
   fi
 done
+if [[ "$CRITIC_SHUFFLE_MODE" != "weighted_within_class" \
+      && "$CRITIC_SHUFFLE_MODE" != "global" ]]; then
+  echo "ERROR: CRITIC_SHUFFLE_MODE must be weighted_within_class or global."
+  exit 2
+fi
+if [[ "$STATISTICALLY_VALID_CLOSURE" != "0" \
+      && "$STATISTICALLY_VALID_CLOSURE" != "1" ]]; then
+  echo "ERROR: STATISTICALLY_VALID_CLOSURE must be zero or one."
+  exit 2
+fi
 if (( NURD_EPOCHS < 1 )); then
   echo "ERROR: NURD_EPOCHS must be at least one."
   exit 2
@@ -71,13 +84,13 @@ done
 
 TRAIN_JOB="$(sbatch --parsable \
   --job-name="${RUN_TAG}_train" \
-  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",CODE_COMMIT="$CODE_COMMIT",RUN_TAG="$RUN_TAG",AE_EXP="$AE_EXP",NURD_EXP="$NURD_EXP",CONTRAST_WEIGHT="$CONTRAST_WEIGHT",NURD_EPOCHS="$NURD_EPOCHS",LR_SCHEDULE_EPOCHS="$LR_SCHEDULE_EPOCHS",INFO_WARMUP_EPOCHS="$INFO_WARMUP_EPOCHS",INFO_RAMP_EPOCHS="$INFO_RAMP_EPOCHS" \
+  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",CODE_COMMIT="$CODE_COMMIT",RUN_TAG="$RUN_TAG",AE_EXP="$AE_EXP",NURD_EXP="$NURD_EXP",CONTRAST_WEIGHT="$CONTRAST_WEIGHT",NURD_EPOCHS="$NURD_EPOCHS",LR_SCHEDULE_EPOCHS="$LR_SCHEDULE_EPOCHS",INFO_WARMUP_EPOCHS="$INFO_WARMUP_EPOCHS",INFO_RAMP_EPOCHS="$INFO_RAMP_EPOCHS",CRITIC_SHUFFLE_MODE="$CRITIC_SHUFFLE_MODE",CHECKPOINT_EVERY="$CHECKPOINT_EVERY" \
   slurm/submit_engineer_train.sbatch)"
 
 EVAL_JOB="$(sbatch --parsable \
   --job-name="${RUN_TAG}_eval" \
   --dependency="afterok:$TRAIN_JOB" \
-  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",CODE_COMMIT="$CODE_COMMIT",RUN_TAG="$RUN_TAG",AE_EXP="$AE_EXP",NURD_EXP="$NURD_EXP" \
+  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",CODE_COMMIT="$CODE_COMMIT",RUN_TAG="$RUN_TAG",AE_EXP="$AE_EXP",NURD_EXP="$NURD_EXP",STATISTICALLY_VALID_CLOSURE="$STATISTICALLY_VALID_CLOSURE" \
   slurm/submit_engineer_dual_eval.sbatch)"
 
 echo "Run tag:       $RUN_TAG"
@@ -88,6 +101,9 @@ echo "SupCon weight: $CONTRAST_WEIGHT"
 echo "NURD maximum epochs: $NURD_EPOCHS"
 echo "NURD LR schedule epochs: $LR_SCHEDULE_EPOCHS"
 echo "Information warm-up/ramp: $INFO_WARMUP_EPOCHS/$INFO_RAMP_EPOCHS"
+echo "Critic shuffle: $CRITIC_SHUFFLE_MODE"
+echo "Checkpoint interval: $CHECKPOINT_EVERY"
+echo "Statistically valid evaluation: $STATISTICALLY_VALID_CLOSURE"
 echo "Outputs:       $BASE/outputs/${RUN_TAG}_eval/{held-out,legacy}"
 echo "Training job:  $TRAIN_JOB"
 echo "Evaluation job: $EVAL_JOB"

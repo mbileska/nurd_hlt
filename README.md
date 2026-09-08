@@ -68,8 +68,10 @@ python train_hlt.py \
     --ae_ckpt checkpoints/hlt/hlt/ae_run/checkpoint_ae.pth \
     --balance_strata 20 \
     --critic_steps 3 \
+    --critic_shuffle_mode weighted_within_class \
     --lambda_info 1.0 \
-    --contrast_weight 0.0
+    --contrast_weight 0.3 \
+    --checkpoint_every 5
 ```
 
 Key flags:
@@ -78,11 +80,13 @@ Key flags:
 |------|---------|-------------|
 | `--balance_strata` | 20 | Training-only strata for estimating unified weights; not a critic input |
 | `--critic_steps` | 1 | Independent critic batches per encoder batch |
+| `--critic_shuffle_mode` | `weighted_within_class` | Draw nuisance donors from the effective weighted distribution within the same class; `global` restores the old shuffle |
 | `--lambda_info` | 1.0 | Weight on the engineer log-density-ratio penalty |
 | `--info_warmup_epochs` | 0 | Epochs with no encoder information penalty; the critic still trains |
 | `--info_ramp_epochs` | 0 | Cosine-ramp epochs from zero to `lambda_info`; zero restores immediate application |
 | `--contrast_weight` | 0.0 | Optional SupCon weight; disabled in the faithful engineer baseline |
 | `--lr_schedule_epochs` | 0 | Cosine LR horizon; zero follows `epochs`, otherwise LR stays at its minimum after this horizon |
+| `--checkpoint_every` | 0 | Save a loadable snapshot every N epochs plus the final state; zero disables snapshots |
 
 Checkpoints are saved to `checkpoints/hlt/<project_name>/<exp_name>/`.
 
@@ -94,6 +98,20 @@ From the repository root on `main`:
 export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
 bash slurm/launch_engineer_campaign.sh <run_tag> <supcon_weight>
 ```
+
+The current controlled follow-up uses SupCon 0.3, immediate information
+pressure, weighted within-class nuisance resampling, five-epoch snapshots, and
+the statistically valid dual evaluation:
+
+```bash
+NURD_EPOCHS=80 LR_SCHEDULE_EPOCHS=40 \
+  bash slurm/launch_engineer_campaign.sh \
+  engineer_continuous_supcon030_conditional_shuffle_v1 0.3
+```
+
+The launcher defaults to the corrected `weighted_within_class` critic shuffle,
+`CHECKPOINT_EVERY=5`, and `STATISTICALLY_VALID_CLOSURE=1`. For an exact old
+critic comparison, set `CRITIC_SHUFFLE_MODE=global CHECKPOINT_EVERY=0`.
 
 The scheduled SupCon-0.3 comparison (five warm-up epochs, cosine ramp over
 epochs 6--15, full information weight thereafter) is launched with:

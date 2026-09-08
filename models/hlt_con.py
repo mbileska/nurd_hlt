@@ -206,9 +206,10 @@ class HLTContrastiveModel(nn.Module):
 class HLTCritic(nn.Module):
     """Continuous-nuisance density-ratio critic.
 
-    The critic follows the engineer reference: it distinguishes real
-    ``(r(x), z, y)`` tuples from tuples whose continuous nuisance ``z`` was
-    shuffled. Labels are represented explicitly as one-hot values so the four
+    The critic distinguishes real ``(r(x), z, y)`` tuples from tuples whose
+    continuous nuisance ``z`` was independently resampled. The training
+    objective controls whether that resampling is global or weighted within
+    class. Labels are represented explicitly as one-hot values so the four
     physics classes are not assigned an artificial ordinal relationship.
     """
 

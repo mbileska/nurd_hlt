@@ -4,7 +4,8 @@ This implementation follows the engineer density-ratio method:
 
 * the critic sees continuous AE reconstruction error, never a bin index;
 * balancing strata are used only to estimate event weights;
-* the critic distinguishes real from shuffled-nuisance tuples;
+* the critic distinguishes real tuples from weighted, within-class nuisance
+  resamples, with the global engineer-reference shuffle retained as an option;
 * the encoder minimizes the critic log density ratio on real tuples; and
 * CE, critic, encoder-information, and optional SupCon losses use one common
   class-balanced, generator-aware event weight.
@@ -32,9 +33,11 @@ from dataset.hlt_smcocktail_dataset import build_hlt_datasets
 from models.hlt_autoencoder import HLTAutoencoder
 from models.hlt_con import HLTContrastiveModel, HLTCritic
 from utils.hlt_density_ratio import (
+    critic_context_only_accuracy,
     density_ratio_critic_loss,
     engineer_information_penalty,
     frozen_parameters,
+    sample_nuisance_donor_indices,
     weighted_mean,
 )
 from utils.hlt_weights import file_sha256
@@ -92,6 +95,7 @@ class EpochMetrics:
         self.contrast_sum = 0.0
         self.critic_loss_sum = 0.0
         self.critic_accuracy_sum = 0.0
+        self.critic_context_accuracy_sum = 0.0
         self.critic_updates = 0
 
     def update_main(
@@ -120,9 +124,15 @@ class EpochMetrics:
             self.correct_by_class[label] += int((predictions[mask] == labels[mask]).sum())
             self.count_by_class[label] += int(mask.sum())
 
-    def update_critic(self, loss: torch.Tensor, accuracy: torch.Tensor):
+    def update_critic(
+        self,
+        loss: torch.Tensor,
+        accuracy: torch.Tensor,
+        context_accuracy: torch.Tensor,
+    ):
         self.critic_loss_sum += float(loss.detach())
         self.critic_accuracy_sum += float(accuracy.detach())
+        self.critic_context_accuracy_sum += float(context_accuracy.detach())
         self.critic_updates += 1
 
     def summary(self) -> Dict[str, object]:
@@ -140,6 +150,8 @@ class EpochMetrics:
             "contrastive_loss": self.contrast_sum / max(self.events, 1),
             "critic_loss": self.critic_loss_sum / max(self.critic_updates, 1),
             "critic_accuracy": self.critic_accuracy_sum / max(self.critic_updates, 1),
+            "critic_context_only_accuracy": (
+                self.critic_context_accuracy_sum / max(self.critic_updates, 1)),
         }
 
 
@@ -167,6 +179,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--critic_weight_decay", type=float, default=0.0)
     parser.add_argument("--critic_steps", type=int, default=1,
                         help="Independent critic batches trained before each encoder batch.")
+    parser.add_argument(
+        "--critic_shuffle_mode",
+        choices=("weighted_within_class", "global"),
+        default="weighted_within_class",
+        help=("Fake-sample construction. weighted_within_class targets "
+              "conditional independence under the effective event measure; "
+              "global restores the engineer-reference shuffle."))
     parser.add_argument("--lambda_info", "--_lambda", dest="lambda_info",
                         type=float, default=1.0)
     parser.add_argument(
@@ -180,6 +199,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--contrast_weight", type=float, default=0.0)
     parser.add_argument("--contrast_temp", type=float, default=0.05)
     parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument(
+        "--checkpoint_every", type=int, default=0,
+        help=("Save a loadable epoch snapshot every N epochs; zero disables "
+              "periodic snapshots. A final-state snapshot is also saved when enabled."))
     parser.add_argument("--cosine", type=int, default=1)
     parser.add_argument(
         "--lr_schedule_epochs", type=int, default=0,
@@ -320,7 +343,8 @@ def critic_update(
     optimizer,
     batch,
     device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    shuffle_mode: str,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     inputs, labels, nuisance, _ae_reco, weights, _physics = _move_batch(batch, device)
     model.eval()
     critic.train()
@@ -328,12 +352,18 @@ def critic_update(
         parameter.requires_grad_(True)
     with torch.no_grad():
         latent, _ = model(inputs)
+    donor_indices = sample_nuisance_donor_indices(
+        labels, weights, shuffle_mode=shuffle_mode)
     loss, accuracy, _ = density_ratio_critic_loss(
-        critic, latent.detach(), labels, nuisance, weights)
+        critic, latent.detach(), labels, nuisance, weights,
+        permutation=donor_indices, shuffle_mode=shuffle_mode)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
     optimizer.step()
-    return loss.detach(), accuracy.detach()
+    context_accuracy = critic_context_only_accuracy(
+        critic, latent.detach(), labels, nuisance, weights,
+        permutation=donor_indices, shuffle_mode=shuffle_mode)
+    return loss.detach(), accuracy.detach(), context_accuracy.detach()
 
 
 def train_epoch(
@@ -357,9 +387,11 @@ def train_epoch(
             except StopIteration:
                 critic_iterator = iter(train_loader)
                 critic_batch = next(critic_iterator)
-            critic_loss, critic_accuracy = critic_update(
-                model, critic, critic_optimizer, critic_batch, device)
-            metrics.update_critic(critic_loss, critic_accuracy)
+            critic_loss, critic_accuracy, context_accuracy = critic_update(
+                model, critic, critic_optimizer, critic_batch, device,
+                args.critic_shuffle_mode)
+            metrics.update_critic(
+                critic_loss, critic_accuracy, context_accuracy)
 
         inputs, labels, nuisance, _ae_reco, weights, _physics = _move_batch(
             batch, device)
@@ -399,7 +431,13 @@ def train_epoch(
 
 
 @torch.no_grad()
-def validate(model, critic, loader, device: torch.device) -> Dict[str, object]:
+def validate(
+    model,
+    critic,
+    loader,
+    device: torch.device,
+    critic_shuffle_mode: str,
+) -> Dict[str, object]:
     model.eval()
     critic.eval()
     metrics = EpochMetrics(model.classifier.out_features)
@@ -412,9 +450,18 @@ def validate(model, critic, loader, device: torch.device) -> Dict[str, object]:
             engineer_information_penalty(critic, latent, labels, nuisance),
             weights,
         )
+        donor_indices = sample_nuisance_donor_indices(
+            labels, weights, shuffle_mode=critic_shuffle_mode)
         critic_loss, critic_accuracy, _ = density_ratio_critic_loss(
-            critic, latent, labels, nuisance, weights)
-        metrics.update_critic(critic_loss, critic_accuracy)
+            critic, latent, labels, nuisance, weights,
+            permutation=donor_indices,
+            shuffle_mode=critic_shuffle_mode)
+        context_accuracy = critic_context_only_accuracy(
+            critic, latent, labels, nuisance, weights,
+            permutation=donor_indices,
+            shuffle_mode=critic_shuffle_mode)
+        metrics.update_critic(
+            critic_loss, critic_accuracy, context_accuracy)
         metrics.update_main(
             logits, labels, weights, ce,
             weighted_mean(ce, weights), information,
@@ -428,6 +475,7 @@ def format_metrics(split: str, epoch: int, metrics: Dict[str, object]) -> str:
         f"weighted_acc={metrics['weighted_accuracy']:.4f} "
         f"balanced_acc={metrics['balanced_accuracy']:.4f} "
         f"critic_acc={metrics['critic_accuracy']:.4f} "
+        f"critic_context_acc={metrics['critic_context_only_accuracy']:.4f} "
         f"info={metrics['information_penalty']:.6f} "
         f"per_class={metrics['per_class_accuracy']}"
     )
@@ -441,6 +489,8 @@ def main(argv=None):
         raise ValueError("Loss weights must be non-negative.")
     if args.info_warmup_epochs < 0 or args.info_ramp_epochs < 0:
         raise ValueError("Information warm-up and ramp epochs must be non-negative.")
+    if args.checkpoint_every < 0:
+        raise ValueError("checkpoint_every must be non-negative.")
     if args.lr_schedule_epochs < 0:
         raise ValueError("lr_schedule_epochs must be non-negative.")
     selection_start_epoch = information_schedule_end_epoch(
@@ -549,9 +599,10 @@ def main(argv=None):
 
     logger.info(
         "Continuous density-ratio training: events=%d/%d classes=%d "
-        "balance_strata=%d lambda_info=%.3f critic_steps=%d",
+        "balance_strata=%d lambda_info=%.3f critic_steps=%d shuffle_mode=%s",
         len(train_dataset), len(val_dataset), num_classes,
-        args.balance_strata, args.lambda_info, args.critic_steps)
+        args.balance_strata, args.lambda_info, args.critic_steps,
+        args.critic_shuffle_mode)
     logger.info(
         "Information schedule: warmup_epochs=%d ramp_epochs=%d "
         "selection_start_epoch=%d",
@@ -559,8 +610,9 @@ def main(argv=None):
         selection_start_epoch)
     logger.info(
         "Optimization schedule: maximum_epochs=%d lr_schedule_epochs=%d "
-        "patience=%d",
-        args.epochs, lr_schedule_epochs, args.patience)
+        "patience=%d checkpoint_every=%d",
+        args.epochs, lr_schedule_epochs, args.patience,
+        args.checkpoint_every)
     logger.info("Weighting metadata: %s", preprocessing["weighting"])
 
     best_val = math.inf
@@ -568,6 +620,7 @@ def main(argv=None):
     main_checkpoint_path = os.path.join(directory, "checkpoint_main.pth.tar")
     critic_checkpoint_path = os.path.join(directory, "checkpoint_critic.pth.tar")
     history = []
+    last_payload = None
 
     for epoch in range(1, args.epochs + 1):
         information_weight = effective_information_weight(
@@ -580,7 +633,8 @@ def main(argv=None):
             model, critic, train_loader,
             model_optimizer, critic_optimizer,
             device, args, contrastive_loss, information_weight)
-        val_metrics = validate(model, critic, val_loader, device)
+        val_metrics = validate(
+            model, critic, val_loader, device, args.critic_shuffle_mode)
         if model_scheduler is not None:
             model_scheduler.step()
         logger.info(format_metrics("train", epoch, train_metrics))
@@ -610,6 +664,29 @@ def main(argv=None):
                         flat[f"{split}/{key}"] = value
             wandb.log(flat, step=epoch)
 
+        current_payload = {
+            "epoch": epoch,
+            "state_dict_model": model.state_dict(),
+            "state_dict_critic": critic.state_dict(),
+            "config": vars(args),
+            "ae_scaler": preprocessing["ae_scaler"],
+            "preprocessing": preprocessing,
+            "ae_checkpoint_sha256": ae_checkpoint_sha256,
+            "selection_metric": "training-fit-weighted_validation_ce",
+            "selection_value": float(val_metrics["weighted_ce"]),
+            "effective_lambda_info": information_weight,
+            "train_metrics": train_metrics,
+            "validation_metrics": val_metrics,
+        }
+        last_payload = current_payload
+        if args.checkpoint_every and epoch % args.checkpoint_every == 0:
+            snapshot = dict(current_payload)
+            snapshot["checkpoint_role"] = "periodic_snapshot"
+            snapshot_path = os.path.join(
+                directory, f"checkpoint_epoch_{epoch:03d}.pth.tar")
+            torch.save(snapshot, snapshot_path)
+            logger.info("Saved periodic checkpoint: %s", snapshot_path)
+
         if epoch < selection_start_epoch:
             logger.info(
                 "Checkpoint selection and early stopping disabled until epoch %d.",
@@ -619,20 +696,8 @@ def main(argv=None):
         if val_metrics["weighted_ce"] < best_val:
             best_val = float(val_metrics["weighted_ce"])
             bad_epochs = 0
-            payload = {
-                "epoch": epoch,
-                "state_dict_model": model.state_dict(),
-                "state_dict_critic": critic.state_dict(),
-                "config": vars(args),
-                "ae_scaler": preprocessing["ae_scaler"],
-                "preprocessing": preprocessing,
-                "ae_checkpoint_sha256": ae_checkpoint_sha256,
-                "selection_metric": "training-fit-weighted_validation_ce",
-                "selection_value": best_val,
-                "effective_lambda_info": information_weight,
-                "train_metrics": train_metrics,
-                "validation_metrics": val_metrics,
-            }
+            payload = dict(current_payload)
+            payload["checkpoint_role"] = "best_weighted_validation_ce"
             torch.save(payload, main_checkpoint_path)
             torch.save({
                 "epoch": epoch,
@@ -659,6 +724,14 @@ def main(argv=None):
             if bad_epochs >= args.patience:
                 logger.info("Early stopping after %d non-improving epochs.", bad_epochs)
                 break
+
+    if args.checkpoint_every and last_payload is not None:
+        final_payload = dict(last_payload)
+        final_payload["checkpoint_role"] = "final_state"
+        final_checkpoint_path = os.path.join(
+            directory, "checkpoint_final.pth.tar")
+        torch.save(final_payload, final_checkpoint_path)
+        logger.info("Saved final-state checkpoint: %s", final_checkpoint_path)
 
     history_path = os.path.join(directory, "training_history.json")
     with open(history_path, "w", encoding="utf-8") as output:

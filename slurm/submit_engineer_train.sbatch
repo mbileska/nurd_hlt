@@ -27,6 +27,8 @@ NURD_EPOCHS="${NURD_EPOCHS:-40}"
 LR_SCHEDULE_EPOCHS="${LR_SCHEDULE_EPOCHS:-$NURD_EPOCHS}"
 INFO_WARMUP_EPOCHS="${INFO_WARMUP_EPOCHS:-0}"
 INFO_RAMP_EPOCHS="${INFO_RAMP_EPOCHS:-0}"
+CRITIC_SHUFFLE_MODE="${CRITIC_SHUFFLE_MODE:-weighted_within_class}"
+CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
 AE_EXP="${AE_EXP:-ae_engineer_$RUN_TAG}"
 NURD_EXP="${NURD_EXP:-hlt_nurd_engineer_$RUN_TAG}"
 AE_CKPT="$BASE/checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth"
@@ -72,6 +74,8 @@ echo "SupCon weight: $CONTRAST_WEIGHT"
 echo "NURD maximum epochs: $NURD_EPOCHS"
 echo "NURD LR schedule epochs: $LR_SCHEDULE_EPOCHS"
 echo "Information warm-up/ramp: $INFO_WARMUP_EPOCHS/$INFO_RAMP_EPOCHS"
+echo "Critic shuffle: $CRITIC_SHUFFLE_MODE"
+echo "Checkpoint interval: $CHECKPOINT_EVERY"
 
 python train_ae.py \
   --data "$TRAIN_PT" \
@@ -105,6 +109,7 @@ python train_hlt.py \
   --lr 1e-4 \
   --critic_lr 1e-3 \
   --critic_steps 3 \
+  --critic_shuffle_mode "$CRITIC_SHUFFLE_MODE" \
   --lambda_info 1.0 \
   --info_warmup_epochs "$INFO_WARMUP_EPOCHS" \
   --info_ramp_epochs "$INFO_RAMP_EPOCHS" \
@@ -118,6 +123,7 @@ python train_hlt.py \
   --dim_ff 512 \
   --linear_dim 16 \
   --patience 15 \
+  --checkpoint_every "$CHECKPOINT_EVERY" \
   --exp_name "$NURD_EXP" \
   --project_name hlt \
   --manualSeed 42 \
