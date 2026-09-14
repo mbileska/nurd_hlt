@@ -18,13 +18,14 @@ BASE="${BASE:-/scratch/gpfs/IOJALVO/mb7126/nurd_hlt}"
 CODE_DIR="${CODE_DIR:-/home/mb7126/nurd_hlt}"
 ANALYSIS_COMMIT="${ANALYSIS_COMMIT:?ANALYSIS_COMMIT must be supplied}"
 RUN_TAG="${RUN_TAG:?RUN_TAG must be supplied}"
+SCAN_TAG="${SCAN_TAG:?SCAN_TAG must be supplied}"
 EPOCHS_CSV="${EPOCHS_CSV:-}"
 MEQUINNA_DIR="${MEQUINNA_DIR:-$BASE/data/mequinna_1M_noZB}"
 AE_CKPT="$BASE/checkpoints/hlt/hlt/ae_engineer_$RUN_TAG/checkpoint_ae.pth"
 NURD_DIR="$BASE/checkpoints/hlt/hlt/hlt_nurd_engineer_$RUN_TAG"
 TRAIN_PT="$MEQUINNA_DIR/hlt_smcocktail_mequinna_train.pt"
 TRAIN_WEIGHTS="$MEQUINNA_DIR/weight_train.pt"
-OUTDIR="$BASE/outputs/${RUN_TAG}_validation_checkpoint_scan"
+OUTDIR="$BASE/outputs/${RUN_TAG}_${SCAN_TAG}"
 
 mkdir -p "$BASE/logs" "$BASE/outputs" "$BASE/matplotlib"
 export MPLCONFIGDIR="$BASE/matplotlib"
@@ -46,7 +47,7 @@ if [[ -n "$EPOCHS_CSV" ]]; then
   EPOCH_ARGS=(--epochs "${EPOCH_VALUES[@]}")
 fi
 
-python scripts/scan_validation_checkpoints.py \
+python -m scripts.scan_validation_checkpoints \
   --checkpoint-dir "$NURD_DIR" \
   --ae-ckpt "$AE_CKPT" \
   --data "$TRAIN_PT" \

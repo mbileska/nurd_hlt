@@ -32,6 +32,11 @@ if (( $# > 0 )); then
   done
   EPOCHS_CSV="$(IFS=,; echo "$*")"
 fi
+SCAN_TAG="${SCAN_TAG:-validation_checkpoint_scan_$(date +%Y%m%d_%H%M%S)}"
+if [[ ! "$SCAN_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+  echo "ERROR: SCAN_TAG may contain only letters, numbers, dot, underscore, and dash."
+  exit 2
+fi
 
 for input in \
   "$BASE/checkpoints/hlt/hlt/ae_engineer_$RUN_TAG/checkpoint_ae.pth" \
@@ -41,7 +46,7 @@ for input in \
     exit 2
   fi
 done
-OUTDIR="$BASE/outputs/${RUN_TAG}_validation_checkpoint_scan"
+OUTDIR="$BASE/outputs/${RUN_TAG}_${SCAN_TAG}"
 if [[ -e "$OUTDIR" ]]; then
   echo "ERROR: refusing to overwrite existing scan output: $OUTDIR"
   exit 2
@@ -50,7 +55,7 @@ fi
 ANALYSIS_COMMIT="$(git rev-parse HEAD)"
 JOB_ID="$(sbatch --parsable \
   --job-name="${RUN_TAG}_valscan" \
-  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",ANALYSIS_COMMIT="$ANALYSIS_COMMIT",RUN_TAG="$RUN_TAG",EPOCHS_CSV="$EPOCHS_CSV" \
+  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",ANALYSIS_COMMIT="$ANALYSIS_COMMIT",RUN_TAG="$RUN_TAG",SCAN_TAG="$SCAN_TAG",EPOCHS_CSV="$EPOCHS_CSV" \
   slurm/submit_validation_checkpoint_scan.sbatch)"
 
 echo "Run tag:        $RUN_TAG"
