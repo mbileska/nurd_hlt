@@ -20,13 +20,13 @@ def weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
 def sample_nuisance_donor_indices(
     labels: torch.Tensor,
     weights: torch.Tensor,
-    shuffle_mode: str = "weighted_within_class",
+    shuffle_mode: str = "global",
 ) -> torch.Tensor:
     """Sample nuisance donors for the shuffled density-ratio population.
 
+    ``global`` is the engineer-reference random permutation.
     ``weighted_within_class`` samples an independent nuisance value from the
-    batch's weighted conditional distribution p_w(z | y).  ``global`` keeps
-    the engineer-reference permutation available for exact comparisons.
+    batch's weighted conditional distribution p_w(z | y).
     """
     labels = labels.reshape(-1)
     weights = weights.reshape(-1).to(dtype=torch.float32)
@@ -61,14 +61,14 @@ def make_density_ratio_examples(
     nuisance: torch.Tensor,
     weights: torch.Tensor,
     permutation: torch.Tensor | None = None,
-    shuffle_mode: str = "weighted_within_class",
+    shuffle_mode: str = "global",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return real and conditionally resampled-nuisance critic examples.
 
     The fake example retains the anchor event's latent, label, and weight; only
-    its nuisance is replaced. By default the donor is sampled from the same
-    class according to the effective training measure. The old global shuffle
-    remains selectable for controlled comparisons.
+    its nuisance is replaced. By default the nuisance is globally permuted,
+    matching the engineer-reference implementation. Weighted same-class donor
+    sampling remains selectable for controlled comparisons.
     """
     batch_size = latent.shape[0]
     if permutation is None:
@@ -107,7 +107,7 @@ def density_ratio_critic_loss(
     nuisance: torch.Tensor,
     weights: torch.Tensor,
     permutation: torch.Tensor | None = None,
-    shuffle_mode: str = "weighted_within_class",
+    shuffle_mode: str = "global",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     examples = make_density_ratio_examples(
         latent, labels, nuisance, weights, permutation=permutation,
@@ -133,7 +133,7 @@ def critic_context_only_accuracy(
     nuisance: torch.Tensor,
     weights: torch.Tensor,
     permutation: torch.Tensor | None = None,
-    shuffle_mode: str = "weighted_within_class",
+    shuffle_mode: str = "global",
 ) -> torch.Tensor:
     """Ablate event-level latent information and measure critic shortcuts.
 

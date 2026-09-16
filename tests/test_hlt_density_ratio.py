@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 
 from models.hlt_con import HLTCritic
+from train_hlt import build_parser
 from utils.hlt_density_ratio import (
     critic_context_only_accuracy,
     density_ratio_critic_loss,
@@ -10,6 +11,11 @@ from utils.hlt_density_ratio import (
     make_density_ratio_examples,
     sample_nuisance_donor_indices,
 )
+
+
+def test_global_shuffle_is_the_training_default():
+    args = build_parser().parse_args(["--data", "sample.pt", "--ae_ckpt", "ae.pth"])
+    assert args.critic_shuffle_mode == "global"
 
 
 def test_critic_accepts_continuous_nuisance_and_has_engineer_dimensions():
@@ -43,7 +49,8 @@ def test_weighted_within_class_donors_preserve_labels_and_weights():
     # A zero-weight row must never donate; the positive row in each class is
     # therefore selected deterministically.
     weights = torch.tensor([0.0, 2.0, 0.0, 5.0])
-    donors = sample_nuisance_donor_indices(labels, weights)
+    donors = sample_nuisance_donor_indices(
+        labels, weights, shuffle_mode="weighted_within_class")
     assert donors.tolist() == [1, 1, 3, 3]
     assert torch.equal(labels, labels[donors])
 
@@ -56,7 +63,8 @@ def test_weighted_within_class_rejects_cross_class_explicit_donors():
     with pytest.raises(ValueError, match="must preserve class labels"):
         make_density_ratio_examples(
             latent, labels, nuisance, weights,
-            permutation=torch.tensor([2, 3, 0, 1]))
+            permutation=torch.tensor([2, 3, 0, 1]),
+            shuffle_mode="weighted_within_class")
 
 
 def test_density_ratio_loss_has_no_two_b_vs_b_weight_mismatch():

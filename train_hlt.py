@@ -4,8 +4,8 @@ This implementation follows the engineer density-ratio method:
 
 * the critic sees continuous AE reconstruction error, never a bin index;
 * balancing strata are used only to estimate event weights;
-* the critic distinguishes real tuples from weighted, within-class nuisance
-  resamples, with the global engineer-reference shuffle retained as an option;
+* the critic distinguishes real tuples from globally shuffled nuisance tuples
+  by default, with weighted within-class resampling retained as an option;
 * the encoder minimizes the critic log density ratio on real tuples; and
 * CE, critic, encoder-information, and optional SupCon losses use one common
   class-balanced, generator-aware event weight.
@@ -182,10 +182,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--critic_shuffle_mode",
         choices=("weighted_within_class", "global"),
-        default="weighted_within_class",
-        help=("Fake-sample construction. weighted_within_class targets "
-              "conditional independence under the effective event measure; "
-              "global restores the engineer-reference shuffle."))
+        default="global",
+        help=("Fake-sample construction. global is the engineer-reference "
+              "shuffle; weighted_within_class targets conditional independence "
+              "under the effective event measure."))
     parser.add_argument("--lambda_info", "--_lambda", dest="lambda_info",
                         type=float, default=1.0)
     parser.add_argument(
