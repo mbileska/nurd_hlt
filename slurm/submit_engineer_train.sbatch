@@ -8,10 +8,10 @@
 #SBATCH --gres=gpu:a100:1
 #SBATCH --exclude=della-i12g[1-2],della-i14g[1-20]
 
+export PS1="${PS1-}"
 set -euo pipefail
 
 module load anaconda3/2025.12
-export PS1="${PS1:-}"
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate disco
 
