@@ -68,7 +68,7 @@ python train_hlt.py \
     --ae_ckpt checkpoints/hlt/hlt/ae_run/checkpoint_ae.pth \
     --balance_strata 20 \
     --critic_steps 3 \
-    --critic_shuffle_mode global \
+    --critic_shuffle_mode weighted_global \
     --lambda_info 1.0 \
     --contrast_weight 0.3 \
     --checkpoint_every 5
@@ -80,7 +80,7 @@ Key flags:
 |------|---------|-------------|
 | `--balance_strata` | 20 | Training-only strata for estimating unified weights; not a critic input |
 | `--critic_steps` | 1 | Independent critic batches per encoder batch |
-| `--critic_shuffle_mode` | `global` | Engineer-reference global nuisance shuffle; `weighted_within_class` enables the conditional donor experiment |
+| `--critic_shuffle_mode` | `weighted_global` | Global nuisance donors sampled from the effective-weight marginal; `global` retains the legacy uniform shuffle and `weighted_within_class` retains the conditional experiment |
 | `--lambda_info` | 1.0 | Weight on the engineer log-density-ratio penalty |
 | `--info_warmup_epochs` | 0 | Epochs with no encoder information penalty; the critic still trains |
 | `--info_ramp_epochs` | 0 | Cosine-ramp epochs from zero to `lambda_info`; zero restores immediate application |
@@ -110,9 +110,13 @@ NURD_EPOCHS=80 LR_SCHEDULE_EPOCHS=40 \
   engineer_continuous_supcon030_conditional_shuffle_v1 0.3
 ```
 
-The launcher defaults to the engineer-reference `global` critic shuffle,
-`CHECKPOINT_EVERY=5`, and `STATISTICALLY_VALID_CLOSURE=1`. The conditional
-experiment remains available with `CRITIC_SHUFFLE_MODE=weighted_within_class`.
+The launcher defaults to the corrected `weighted_global` critic shuffle,
+`CHECKPOINT_EVERY=5`, and `STATISTICALLY_VALID_CLOSURE=1`. This keeps donors
+global across all classes while sampling the nuisance marginal according to
+the effective event weights. Exact reproduction of the engineer-reference
+uniform permutation remains available with `CRITIC_SHUFFLE_MODE=global`; the
+conditional experiment remains available with
+`CRITIC_SHUFFLE_MODE=weighted_within_class`.
 
 The scheduled SupCon-0.3 comparison (five warm-up epochs, cosine ramp over
 epochs 6--15, full information weight thereafter) is launched with:
