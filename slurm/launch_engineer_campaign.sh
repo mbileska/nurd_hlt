@@ -24,7 +24,7 @@ NURD_EPOCHS="${NURD_EPOCHS:-40}"
 LR_SCHEDULE_EPOCHS="${LR_SCHEDULE_EPOCHS:-$NURD_EPOCHS}"
 INFO_WARMUP_EPOCHS="${INFO_WARMUP_EPOCHS:-0}"
 INFO_RAMP_EPOCHS="${INFO_RAMP_EPOCHS:-0}"
-CRITIC_SHUFFLE_MODE="${CRITIC_SHUFFLE_MODE:-weighted_global}"
+CRITIC_SHUFFLE_MODE="${CRITIC_SHUFFLE_MODE:-global}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
 STATISTICALLY_VALID_CLOSURE="${STATISTICALLY_VALID_CLOSURE:-1}"
 if [[ ! "$RUN_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
@@ -42,10 +42,9 @@ for value_name in NURD_EPOCHS LR_SCHEDULE_EPOCHS INFO_WARMUP_EPOCHS INFO_RAMP_EP
     exit 2
   fi
 done
-if [[ "$CRITIC_SHUFFLE_MODE" != "weighted_global" \
-      && "$CRITIC_SHUFFLE_MODE" != "weighted_within_class" \
+if [[ "$CRITIC_SHUFFLE_MODE" != "weighted_within_class" \
       && "$CRITIC_SHUFFLE_MODE" != "global" ]]; then
-  echo "ERROR: CRITIC_SHUFFLE_MODE must be weighted_global, weighted_within_class, or global."
+  echo "ERROR: CRITIC_SHUFFLE_MODE must be weighted_within_class or global."
   exit 2
 fi
 if [[ "$STATISTICALLY_VALID_CLOSURE" != "0" \

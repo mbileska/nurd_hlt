@@ -13,27 +13,9 @@ from utils.hlt_density_ratio import (
 )
 
 
-def test_weighted_global_shuffle_is_the_training_default():
+def test_global_shuffle_is_the_training_default():
     args = build_parser().parse_args(["--data", "sample.pt", "--ae_ckpt", "ae.pth"])
-    assert args.critic_shuffle_mode == "weighted_global"
-
-
-def test_weighted_global_donors_follow_weights_without_preserving_class():
-    labels = torch.tensor([0, 0, 1, 1])
-    # Only the final, class-1 event has positive target-distribution weight.
-    # It must therefore donate to every anchor, including class-0 anchors.
-    weights = torch.tensor([0.0, 0.0, 0.0, 5.0])
-    donors = sample_nuisance_donor_indices(
-        labels, weights, shuffle_mode="weighted_global")
-    assert donors.tolist() == [3, 3, 3, 3]
-    assert not torch.equal(labels, labels[donors])
-
-
-def test_weighted_global_rejects_zero_total_weight():
-    with pytest.raises(ValueError, match="positive finite weight"):
-        sample_nuisance_donor_indices(
-            torch.tensor([0, 1]), torch.zeros(2),
-            shuffle_mode="weighted_global")
+    assert args.critic_shuffle_mode == "global"
 
 
 def test_critic_accepts_continuous_nuisance_and_has_engineer_dimensions():

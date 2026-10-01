@@ -20,13 +20,11 @@ def weighted_mean(values: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
 def sample_nuisance_donor_indices(
     labels: torch.Tensor,
     weights: torch.Tensor,
-    shuffle_mode: str = "weighted_global",
+    shuffle_mode: str = "global",
 ) -> torch.Tensor:
     """Sample nuisance donors for the shuffled density-ratio population.
 
-    ``weighted_global`` samples an independent nuisance value from the
-    weighted marginal p_w(z) across every class. ``global`` retains the
-    engineer-reference unweighted random permutation for exact reproduction.
+    ``global`` is the engineer-reference random permutation.
     ``weighted_within_class`` samples an independent nuisance value from the
     batch's weighted conditional distribution p_w(z | y).
     """
@@ -34,23 +32,11 @@ def sample_nuisance_donor_indices(
     weights = weights.reshape(-1).to(dtype=torch.float32)
     if labels.numel() != weights.numel():
         raise ValueError("labels and weights must contain the same number of events.")
-    if shuffle_mode == "weighted_global":
-        probabilities = weights.clamp(min=0.0)
-        if not torch.isfinite(probabilities).all() or float(
-                probabilities.sum()) <= 0.0:
-            raise ValueError(
-                "Weighted-global nuisance donors require positive finite weight.")
-        return torch.multinomial(
-            probabilities,
-            num_samples=labels.numel(),
-            replacement=True,
-        )
     if shuffle_mode == "global":
         return torch.randperm(labels.numel(), device=labels.device)
     if shuffle_mode != "weighted_within_class":
         raise ValueError(
-            "shuffle_mode must be 'weighted_global', 'global', or "
-            "'weighted_within_class'.")
+            "shuffle_mode must be 'global' or 'weighted_within_class'.")
 
     donors = torch.empty(labels.numel(), dtype=torch.long, device=labels.device)
     for label in labels.unique():
@@ -75,15 +61,14 @@ def make_density_ratio_examples(
     nuisance: torch.Tensor,
     weights: torch.Tensor,
     permutation: torch.Tensor | None = None,
-    shuffle_mode: str = "weighted_global",
+    shuffle_mode: str = "global",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return real and conditionally resampled-nuisance critic examples.
 
     The fake example retains the anchor event's latent, label, and weight; only
-    its nuisance is replaced. By default the nuisance donor is sampled from
-    the weighted global marginal. The engineer-reference uniform permutation
-    and weighted same-class sampling remain selectable for controlled
-    comparisons.
+    its nuisance is replaced. By default the nuisance is globally permuted,
+    matching the engineer-reference implementation. Weighted same-class donor
+    sampling remains selectable for controlled comparisons.
     """
     batch_size = latent.shape[0]
     if permutation is None:
@@ -122,7 +107,7 @@ def density_ratio_critic_loss(
     nuisance: torch.Tensor,
     weights: torch.Tensor,
     permutation: torch.Tensor | None = None,
-    shuffle_mode: str = "weighted_global",
+    shuffle_mode: str = "global",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     examples = make_density_ratio_examples(
         latent, labels, nuisance, weights, permutation=permutation,
@@ -148,7 +133,7 @@ def critic_context_only_accuracy(
     nuisance: torch.Tensor,
     weights: torch.Tensor,
     permutation: torch.Tensor | None = None,
-    shuffle_mode: str = "weighted_global",
+    shuffle_mode: str = "global",
 ) -> torch.Tensor:
     """Ablate event-level latent information and measure critic shortcuts.
 
