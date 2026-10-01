@@ -1,4 +1,0 @@
-wandb
-numpy
-scikit-learn
-matplotlib

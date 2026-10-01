@@ -4,6 +4,12 @@ __pycache__/
 *.pyd
 .Python
 checkpoints/
+data/
+local/
+logs/
+matplotlib/
+outputs/
+event_displays/generated/
 condor_logs/*.out
 condor_logs/*.err
 condor_logs/*.log

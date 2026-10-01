@@ -1160,7 +1160,7 @@ def ABCD(config):
         json.dump(diagnostics, output, indent=2)
     print(f"Diagnostics saved to: {diagnostics_path}", flush=True)
 
-    # Save thresholds JSON so make_datacard_ttbar.py can skip the scan
+    # Save thresholds and diagnostics for downstream analyses.
     thresholds_path = os.path.join(outdir, "abcd_thresholds.json")
     with open(thresholds_path, "w") as f:
         json.dump({
