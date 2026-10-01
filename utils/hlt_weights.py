@@ -1,9 +1,10 @@
 """Weighting and split utilities for the HLT AE/NURD workflow.
 
-The physics generator weight defines the within-cell event measure.  Training
-then targets equal total mass for every background class and for every occupied
-continuous-nuisance stratum inside that class.  The strata are used only to
-estimate weights; the critic always receives the continuous nuisance value.
+The AE uses the physics generator measure directly across every class. NURD
+training additionally targets equal total mass for every background class and
+for every occupied continuous-nuisance stratum inside that class. The strata
+are used only to estimate NURD weights; the critic always receives the
+continuous nuisance value.
 """
 
 from __future__ import annotations
@@ -306,6 +307,39 @@ def apply_class_balance_factors(
     if normalize_mean:
         output = output / output.mean().clamp(min=torch.finfo(output.dtype).tiny)
     return output.float()
+
+
+def normalize_generator_weights_for_split(
+    generator_weights: torch.Tensor,
+    train_indices: torch.Tensor,
+    validation_indices: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, float]:
+    """Return generator-only split weights with a single global scale.
+
+    The divisor is the mean generator weight on the training split. Applying
+    the same scalar to both splits keeps the training loss near its unweighted
+    numerical scale without changing any event-to-event or class-to-class
+    generator-weight ratio. No class or nuisance balancing is performed.
+    """
+    generator_weights = torch.as_tensor(
+        generator_weights, dtype=torch.float64).reshape(-1)
+    train_indices = torch.as_tensor(train_indices).long().reshape(-1)
+    validation_indices = torch.as_tensor(validation_indices).long().reshape(-1)
+    if train_indices.numel() == 0 or validation_indices.numel() == 0:
+        raise ValueError("Generator-weight normalization requires non-empty splits.")
+    if not torch.isfinite(generator_weights).all():
+        raise ValueError("Generator weights must be finite.")
+    if (generator_weights < 0).any():
+        raise ValueError("Generator weights must be non-negative.")
+    normalization = float(generator_weights[train_indices].mean())
+    if not math.isfinite(normalization) or normalization <= 0.0:
+        raise ValueError(
+            "Training generator weights must have a positive finite mean.")
+    return (
+        (generator_weights[train_indices] / normalization).float(),
+        (generator_weights[validation_indices] / normalization).float(),
+        normalization,
+    )
 
 
 def weighted_mean_and_std(

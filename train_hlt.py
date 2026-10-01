@@ -308,7 +308,7 @@ def load_ae_checkpoint(path: str, device: torch.device):
 
 
 def validate_ae_training_contract(ae_checkpoint, preprocessing):
-    """Require the AE and NURD stages to use identical rows and weights."""
+    """Require identical rows and generator weights across AE and NURD."""
     expected_signature = ae_checkpoint.get("data_signature")
     actual_signature = preprocessing.get("data_signature")
     if expected_signature is None or expected_signature != actual_signature:

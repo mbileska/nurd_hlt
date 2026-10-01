@@ -2,13 +2,15 @@
 
 This is the HLT-only implementation of the two-axis ABCD anomaly-detection
 pipeline. The branch was cut from the frozen golden implementation
-`golden-supcon030-v1` (`affb2f1`); cleanup removes retired experiments but
-does not change the retained model, training, weighting, or evaluation code.
+`golden-supcon030-v1` (`affb2f1`). The initial cleanup removed retired
+experiments without changing the retained pipeline; subsequent changes are
+documented here, beginning with generator-only all-class AE training.
 
 ## Pipeline
 
-1. `train_ae.py` trains an autoencoder on QCD only. Its weighted
-   reconstruction error is the continuous nuisance/AE axis.
+1. `train_ae.py` trains an autoencoder on events from all four background
+   classes. Its loss uses generator weights only—without class or nuisance
+   balancing—and its reconstruction error is the continuous nuisance/AE axis.
 2. `train_hlt.py` trains the four-background classifier and its latent
    representation from PF-candidate tensors.
 3. A real-vs-shuffled density-ratio critic sees
@@ -17,16 +19,18 @@ does not change the retained model, training, weighting, or evaluation code.
 4. `eval_abcd_nurd.py` converts the latent vector to the Mahalanobis-distance
    (MD) axis and measures weighted QCD ABCD closure against the AE axis.
 
-The default campaign is the golden setup: SupCon 0.3, 20 training-only
-nuisance strata for estimating weights, global uniform nuisance shuffling,
-three critic updates per encoder update, immediate information weight 1, and
-no ramp.
+The NURD-side campaign defaults remain the golden setup: SupCon 0.3, 20
+training-only nuisance strata for estimating weights, global uniform nuisance
+shuffling, three critic updates per encoder update, immediate information
+weight 1, and no ramp. The AE weighting is the explicit all-class,
+generator-only update described above.
 
-Generator weights are loaded from `weight_train.pt`/`weight_test.pt`.
-Training combines them with class and nuisance-stratum balancing through
-`utils/hlt_weights.py`; the resulting effective weights are used consistently
-by AE training, classification, SupCon, critic training, and the encoder
-information loss.
+Generator weights are loaded from `weight_train.pt`/`weight_test.pt`. The AE
+uses those physics weights directly across the full all-class sample (non-QCD
+rows have unit generator weight). NURD training separately combines generator
+weights with class and nuisance-stratum balancing through
+`utils/hlt_weights.py`; those NURD effective weights are used consistently by
+classification, SupCon, critic training, and the encoder information loss.
 
 ## Canonical Della run
 

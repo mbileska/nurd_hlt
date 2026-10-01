@@ -22,10 +22,9 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from models.hlt_autoencoder import HLTAutoencoder
 from utils.hlt_weights import (
-    apply_class_balance_factors,
     effective_mass_by_class,
-    fit_class_balance_factors,
     load_generator_weights,
+    normalize_generator_weights_for_split,
     sample_signature,
     stratified_split_indices,
     weighted_mean_and_std,
@@ -37,7 +36,13 @@ parser = argparse.ArgumentParser(description="Pre-train HLT AE")
 parser.add_argument("--data",       required=True,  type=str)
 parser.add_argument("--gen_weight_path", "--gen_weights", dest="gen_weight_path",
                     default=None, type=str)
-parser.add_argument("--qcd_label", default=1, type=int)
+parser.add_argument(
+    "--generator_weight_label", "--qcd_label",
+    dest="generator_weight_label", default=1, type=int,
+    help=("Class whose rows receive values from the Mequinna generator-weight "
+          "file; all other rows retain unit weight. The AE still trains on "
+          "events from every class."),
+)
 parser.add_argument("--epochs",     default=100,    type=int)
 parser.add_argument("-b","--batch_size", default=2048, type=int)
 parser.add_argument("--lr",         default=1e-3,   type=float)
@@ -91,7 +96,7 @@ if args.max_events > 0:
 physics_weights, generator_metadata = load_generator_weights(
     args.gen_weight_path,
     labels,
-    qcd_label=args.qcd_label,
+    qcd_label=args.generator_weight_label,
     max_events=args.max_events,
     sample=raw,
 )
@@ -108,12 +113,9 @@ del obj
 idx_tr, idx_val = stratified_split_indices(
     labels, val_fraction=args.val_split, seed=args.manualSeed,
     weights=physics_weights)
-class_factors = fit_class_balance_factors(
-    labels[idx_tr], physics_weights[idx_tr])
-weights_tr = apply_class_balance_factors(
-    labels[idx_tr], physics_weights[idx_tr], class_factors)
-weights_val = apply_class_balance_factors(
-    labels[idx_val], physics_weights[idx_val], class_factors)
+weights_tr, weights_val, generator_weight_normalization = (
+    normalize_generator_weights_for_split(
+        physics_weights, idx_tr, idx_val))
 
 mu, std = weighted_mean_and_std(obj_flat[idx_tr], weights_tr)
 std = torch.where(std < 1e-8, torch.ones_like(std), std)
@@ -122,9 +124,11 @@ del obj_flat
 n_features = obj_norm.shape[1]
 log.debug(f"AE input: {obj_norm.shape}  ({n_features} features)")
 log.debug(
-    "AE class-balanced train mass=%s validation mass=%s generator=%s",
+    "AE generator-only all-class train mass=%s validation mass=%s "
+    "normalization=%.8g generator=%s",
     effective_mass_by_class(labels[idx_tr], weights_tr),
     effective_mass_by_class(labels[idx_val], weights_val),
+    generator_weight_normalization,
     generator_metadata,
 )
 
@@ -180,8 +184,9 @@ for epoch in range(args.epochs):
         optim.zero_grad()
         recon, _ = ae(batch)
         per_event = (recon - batch).square().mean(dim=1)
-        # Full-split weights are normalized to mean one. A fixed denominator
-        # avoids the stochastic bias caused by random per-batch weight sums.
+        # One global training-mean normalization preserves every generator-
+        # weight ratio. A fixed denominator avoids stochastic bias from random
+        # per-batch weight sums.
         loss = (per_event * weights).mean()
         loss.backward()
         optim.step()
@@ -218,8 +223,17 @@ for epoch in range(args.epochs):
                 "std": std.cpu(),
             },
             "weighting": {
-                "method": "generator_weighted_uniform_class",
-                "class_factors": class_factors,
+                "method": "generator_only_all_events",
+                "class_balancing": False,
+                "nuisance_balancing": False,
+                "normalization": "divide_by_training_generator_weight_mean",
+                "normalization_divisor": generator_weight_normalization,
+                "included_labels": sorted(
+                    int(value) for value in labels.unique().tolist()),
+                "included_event_counts": {
+                    int(value): int((labels == value).sum())
+                    for value in labels.unique().tolist()
+                },
                 "generator": generator_metadata,
                 "split_seed": args.manualSeed,
                 "validation_fraction": args.val_split,

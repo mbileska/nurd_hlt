@@ -9,6 +9,7 @@ from utils.hlt_weights import (
     effective_mass_by_class,
     fit_joint_balance,
     load_generator_weights,
+    normalize_generator_weights_for_split,
 )
 
 
@@ -73,6 +74,33 @@ def test_generator_weights_apply_only_to_qcd_and_validate_length(tmp_path):
     torch.save(torch.ones(4), short_path)
     with pytest.raises(ValueError, match="does not match"):
         load_generator_weights(str(short_path), labels, qcd_label=1)
+
+
+def test_ae_generator_only_weights_preserve_ratios_without_class_balance():
+    labels = torch.tensor([0, 0, 1, 1, 1, 2, 3, 3])
+    generator_weights = torch.tensor(
+        [1.0, 1.0, 2.0, 8.0, 32.0, 1.0, 1.0, 1.0],
+        dtype=torch.float64,
+    )
+    train_indices = torch.tensor([0, 2, 3, 4, 5, 6])
+    validation_indices = torch.tensor([1, 7])
+
+    train_weights, validation_weights, divisor = (
+        normalize_generator_weights_for_split(
+            generator_weights, train_indices, validation_indices))
+
+    assert divisor == pytest.approx(
+        float(generator_weights[train_indices].mean()))
+    assert train_weights.mean().item() == pytest.approx(1.0)
+    assert train_weights.double() == pytest.approx(
+        generator_weights[train_indices] / divisor)
+    assert validation_weights.double() == pytest.approx(
+        generator_weights[validation_indices] / divisor)
+
+    # A generator-only objective intentionally does not force equal class mass.
+    class_mass = effective_mass_by_class(labels[train_indices], train_weights)
+    assert class_mass[1] > 0.9
+    assert len({round(value, 6) for value in class_mass.values()}) > 1
 
 
 def test_generator_weight_event_ids_are_verified_when_available(tmp_path):

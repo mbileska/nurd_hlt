@@ -80,7 +80,7 @@ echo "Checkpoint interval: $CHECKPOINT_EVERY"
 python train_ae.py \
   --data "$TRAIN_PT" \
   --gen_weight_path "$GEN_WEIGHT_TRAIN" \
-  --qcd_label 1 \
+  --generator_weight_label 1 \
   --epochs 100 \
   --batch_size 4096 \
   --lr 1e-3 \
