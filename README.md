@@ -19,11 +19,13 @@ documented here, beginning with generator-only all-class AE training.
 4. `eval_abcd_nurd.py` converts the latent vector to the Mahalanobis-distance
    (MD) axis and measures weighted QCD ABCD closure against the AE axis.
 
-The NURD-side campaign defaults remain the golden setup: SupCon 0.3, 20
-training-only nuisance strata for estimating weights, global uniform nuisance
+The NURD-side architecture and optimization defaults remain the golden setup:
+SupCon 0.3, 20 training-only nuisance strata, global uniform nuisance
 shuffling, three critic updates per encoder update, immediate information
-weight 1, and no ramp. The AE weighting is the explicit all-class,
-generator-only update described above.
+weight 1, and no ramp. Weight estimation now uses fixed-width bins in a
+training-fitted scaled `log1p(AE loss)` coordinate and clips the top 0.5% of
+effective event weights separately in each class before restoring equal class
+mass. The AE weighting is the all-class, generator-only update described above.
 
 Generator weights are loaded from `weight_train.pt`/`weight_test.pt`. The AE
 uses those physics weights directly across the full all-class sample (non-QCD
@@ -87,16 +89,21 @@ NURD_EPOCHS=80 \
 LR_SCHEDULE_EPOCHS=40 \
 INFO_WARMUP_EPOCHS=5 \
 INFO_RAMP_EPOCHS=10 \
+BALANCE_BINNING=log_fixed \
+BALANCE_CLIP_QUANTILE=0.995 \
 CHECKPOINT_EVERY=5 \
 CRITIC_SHUFFLE_MODE=global \
 STATISTICALLY_VALID_CLOSURE=1 \
   bash slurm/launch_engineer_campaign.sh <new_run_tag> 0.3
 ```
 
-Defaults reproduce the golden run: `NURD_EPOCHS=40`,
-`LR_SCHEDULE_EPOCHS=40`, zero warm-up/ramp,
-`CRITIC_SHUFFLE_MODE=global`, `CHECKPOINT_EVERY=5`, and statistically valid
-closure enabled. `weighted_within_class` remains available only as the recent
+Current defaults use `NURD_EPOCHS=40`, `LR_SCHEDULE_EPOCHS=40`, zero
+warm-up/ramp, `BALANCE_BINNING=log_fixed`,
+`BALANCE_CLIP_QUANTILE=0.995`, `CRITIC_SHUFFLE_MODE=global`,
+`CHECKPOINT_EVERY=5`, and statistically valid closure. To recover the earlier
+weight estimator for a controlled comparison, use
+`BALANCE_BINNING=weighted_quantile BALANCE_CLIP_QUANTILE=1.0`.
+`weighted_within_class` remains available only as the recent
 conditional-shuffle comparison.
 
 To compare saved epochs without touching held-out test data:

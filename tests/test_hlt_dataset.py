@@ -52,6 +52,11 @@ def test_dataset_uses_continuous_nuisance_and_training_fitted_weights(tmp_path):
     assert preprocessing["nuisance_transform"]["kind"].startswith(
         "standardize_continuous")
     assert preprocessing["weighting"]["balance_spec"]["requested_strata"] == 4
+    balance_spec = preprocessing["weighting"]["balance_spec"]
+    assert balance_spec["binning"] == "log_fixed"
+    assert balance_spec["transform"]["kind"] == "scaled_log1p"
+    assert balance_spec["weight_clipping"]["quantile"] == 0.995
+    assert balance_spec["weight_clipping"]["enabled"] is True
     train_mass = effective_mass_by_class(
         train.labels, train.effective_weights)
     assert all(abs(value - 0.25) < 1e-5 for value in train_mass.values())

@@ -105,6 +105,8 @@ def build_hlt_datasets(
     qcd_label: int = 1,
     ae_scaler: Optional[Mapping[str, torch.Tensor]] = None,
     balance_strata: int = 20,
+    balance_binning: str = "log_fixed",
+    balance_clip_quantile: float = 0.995,
     ae_batch_size: int = 4096,
 ):
     """Build leakage-free train/validation datasets.
@@ -207,6 +209,8 @@ def build_hlt_datasets(
         ae_reco[train_indices],
         physics_weights[train_indices],
         n_strata=balance_strata,
+        binning=balance_binning,
+        clip_quantile=balance_clip_quantile,
     )
     val_effective_weights = apply_joint_balance(
         labels[val_indices],
@@ -232,7 +236,9 @@ def build_hlt_datasets(
     val_ess = effective_sample_size_fraction(val_effective_weights)
     print(
         "Unified training weights: "
-        f"class_mass={train_mass} ESS/N={train_ess:.4f}",
+        f"class_mass={train_mass} ESS/N={train_ess:.4f} "
+        f"binning={balance_spec['binning']} "
+        f"clip_quantile={balance_spec['weight_clipping']['quantile']}",
         flush=True,
     )
     print(
@@ -250,7 +256,9 @@ def build_hlt_datasets(
             "std": nuisance_std.cpu(),
         },
         "weighting": {
-            "method": "generator_weighted_uniform_class_and_nuisance_strata",
+            "method": (
+                "generator_weighted_uniform_class_and_nuisance_strata_"
+                f"{balance_spec['binning']}_clipped"),
             "balance_spec": balance_spec,
             "generator": generator_metadata,
             "train_class_mass": train_mass,

@@ -7,6 +7,7 @@ from utils.hlt_weights import (
     _assign_strata,
     apply_joint_balance,
     effective_mass_by_class,
+    effective_sample_size_fraction,
     fit_joint_balance,
     load_generator_weights,
     normalize_generator_weights_for_split,
@@ -135,3 +136,38 @@ def test_large_qcd_generator_normalization_cannot_dominate_class_mass():
     masses = effective_mass_by_class(labels, weights)
     assert all(math.isclose(value, 0.25, abs_tol=1e-6)
                for value in masses.values())
+
+
+def test_log_fixed_strata_and_clipping_reduce_weight_tail():
+    events_per_class = 200
+    labels = torch.tensor(
+        [0] * events_per_class + [1] * events_per_class)
+    nuisance = torch.cat([
+        torch.logspace(-6, 3, events_per_class),
+        torch.logspace(-6, 3, events_per_class),
+    ])
+    base = torch.ones(labels.numel(), dtype=torch.float64)
+    base[labels == 1] = torch.logspace(
+        -8, 8, events_per_class, dtype=torch.float64)
+
+    unclipped, _ = fit_joint_balance(
+        labels, nuisance, base, n_strata=10,
+        binning="log_fixed", clip_quantile=1.0)
+    clipped, spec = fit_joint_balance(
+        labels, nuisance, base, n_strata=10,
+        binning="log_fixed", clip_quantile=0.9)
+
+    assert spec["transform"]["kind"] == "scaled_log1p"
+    assert spec["transform"]["scale"] > 0.0
+    edge_widths = torch.diff(spec["edges"])
+    assert torch.allclose(
+        edge_widths, edge_widths[0].expand_as(edge_widths), rtol=1e-5)
+    assert spec["weight_clipping"]["enabled"] is True
+    assert any(
+        value > 0.0
+        for value in spec["weight_clipping"]["training_fraction_clipped"].values())
+    assert float(clipped.max()) < float(unclipped.max())
+    assert effective_sample_size_fraction(clipped) > (
+        effective_sample_size_fraction(unclipped))
+    assert effective_mass_by_class(labels, clipped) == pytest.approx(
+        {0: 0.5, 1: 0.5}, abs=1e-6)

@@ -25,6 +25,8 @@ LR_SCHEDULE_EPOCHS="${LR_SCHEDULE_EPOCHS:-$NURD_EPOCHS}"
 INFO_WARMUP_EPOCHS="${INFO_WARMUP_EPOCHS:-0}"
 INFO_RAMP_EPOCHS="${INFO_RAMP_EPOCHS:-0}"
 CRITIC_SHUFFLE_MODE="${CRITIC_SHUFFLE_MODE:-global}"
+BALANCE_BINNING="${BALANCE_BINNING:-log_fixed}"
+BALANCE_CLIP_QUANTILE="${BALANCE_CLIP_QUANTILE:-0.995}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
 STATISTICALLY_VALID_CLOSURE="${STATISTICALLY_VALID_CLOSURE:-1}"
 if [[ ! "$RUN_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
@@ -45,6 +47,20 @@ done
 if [[ "$CRITIC_SHUFFLE_MODE" != "weighted_within_class" \
       && "$CRITIC_SHUFFLE_MODE" != "global" ]]; then
   echo "ERROR: CRITIC_SHUFFLE_MODE must be weighted_within_class or global."
+  exit 2
+fi
+if [[ "$BALANCE_BINNING" != "log_fixed" \
+      && "$BALANCE_BINNING" != "weighted_quantile" ]]; then
+  echo "ERROR: BALANCE_BINNING must be log_fixed or weighted_quantile."
+  exit 2
+fi
+if [[ ! "$BALANCE_CLIP_QUANTILE" =~ ^(0([.][0-9]+)?|1([.]0*)?)$ ]]; then
+  echo "ERROR: BALANCE_CLIP_QUANTILE must be a decimal in [0, 1]."
+  exit 2
+fi
+if ! awk -v value="$BALANCE_CLIP_QUANTILE" \
+    'BEGIN { exit !(value >= 0.5 && value <= 1.0) }'; then
+  echo "ERROR: BALANCE_CLIP_QUANTILE must lie in [0.5, 1.0]."
   exit 2
 fi
 if [[ "$STATISTICALLY_VALID_CLOSURE" != "0" \
@@ -84,7 +100,7 @@ done
 
 TRAIN_JOB="$(sbatch --parsable \
   --job-name="${RUN_TAG}_train" \
-  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",CODE_COMMIT="$CODE_COMMIT",RUN_TAG="$RUN_TAG",AE_EXP="$AE_EXP",NURD_EXP="$NURD_EXP",CONTRAST_WEIGHT="$CONTRAST_WEIGHT",NURD_EPOCHS="$NURD_EPOCHS",LR_SCHEDULE_EPOCHS="$LR_SCHEDULE_EPOCHS",INFO_WARMUP_EPOCHS="$INFO_WARMUP_EPOCHS",INFO_RAMP_EPOCHS="$INFO_RAMP_EPOCHS",CRITIC_SHUFFLE_MODE="$CRITIC_SHUFFLE_MODE",CHECKPOINT_EVERY="$CHECKPOINT_EVERY" \
+  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",CODE_COMMIT="$CODE_COMMIT",RUN_TAG="$RUN_TAG",AE_EXP="$AE_EXP",NURD_EXP="$NURD_EXP",CONTRAST_WEIGHT="$CONTRAST_WEIGHT",NURD_EPOCHS="$NURD_EPOCHS",LR_SCHEDULE_EPOCHS="$LR_SCHEDULE_EPOCHS",INFO_WARMUP_EPOCHS="$INFO_WARMUP_EPOCHS",INFO_RAMP_EPOCHS="$INFO_RAMP_EPOCHS",CRITIC_SHUFFLE_MODE="$CRITIC_SHUFFLE_MODE",BALANCE_BINNING="$BALANCE_BINNING",BALANCE_CLIP_QUANTILE="$BALANCE_CLIP_QUANTILE",CHECKPOINT_EVERY="$CHECKPOINT_EVERY" \
   slurm/submit_engineer_train.sbatch)"
 
 EVAL_JOB="$(sbatch --parsable \
@@ -102,6 +118,8 @@ echo "NURD maximum epochs: $NURD_EPOCHS"
 echo "NURD LR schedule epochs: $LR_SCHEDULE_EPOCHS"
 echo "Information warm-up/ramp: $INFO_WARMUP_EPOCHS/$INFO_RAMP_EPOCHS"
 echo "Critic shuffle: $CRITIC_SHUFFLE_MODE"
+echo "Nuisance weight binning: $BALANCE_BINNING"
+echo "Effective-weight clip quantile: $BALANCE_CLIP_QUANTILE"
 echo "Checkpoint interval: $CHECKPOINT_EVERY"
 echo "Statistically valid evaluation: $STATISTICALLY_VALID_CLOSURE"
 echo "Outputs:       $BASE/outputs/${RUN_TAG}_eval/{held-out,legacy}"

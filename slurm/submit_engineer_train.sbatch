@@ -28,6 +28,8 @@ LR_SCHEDULE_EPOCHS="${LR_SCHEDULE_EPOCHS:-$NURD_EPOCHS}"
 INFO_WARMUP_EPOCHS="${INFO_WARMUP_EPOCHS:-0}"
 INFO_RAMP_EPOCHS="${INFO_RAMP_EPOCHS:-0}"
 CRITIC_SHUFFLE_MODE="${CRITIC_SHUFFLE_MODE:-global}"
+BALANCE_BINNING="${BALANCE_BINNING:-log_fixed}"
+BALANCE_CLIP_QUANTILE="${BALANCE_CLIP_QUANTILE:-0.995}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
 AE_EXP="${AE_EXP:-ae_engineer_$RUN_TAG}"
 NURD_EXP="${NURD_EXP:-hlt_nurd_engineer_$RUN_TAG}"
@@ -75,6 +77,8 @@ echo "NURD maximum epochs: $NURD_EPOCHS"
 echo "NURD LR schedule epochs: $LR_SCHEDULE_EPOCHS"
 echo "Information warm-up/ramp: $INFO_WARMUP_EPOCHS/$INFO_RAMP_EPOCHS"
 echo "Critic shuffle: $CRITIC_SHUFFLE_MODE"
+echo "Nuisance weight binning: $BALANCE_BINNING"
+echo "Effective-weight clip quantile: $BALANCE_CLIP_QUANTILE"
 echo "Checkpoint interval: $CHECKPOINT_EVERY"
 
 python train_ae.py \
@@ -102,6 +106,8 @@ python train_hlt.py \
   --ae_ckpt "$AE_CKPT" \
   --qcd_label 1 \
   --balance_strata 20 \
+  --balance_binning "$BALANCE_BINNING" \
+  --balance_clip_quantile "$BALANCE_CLIP_QUANTILE" \
   --epochs "$NURD_EPOCHS" \
   --lr_schedule_epochs "$LR_SCHEDULE_EPOCHS" \
   --batch_size 4096 \

@@ -393,39 +393,100 @@ def _assign_strata(values: torch.Tensor, edges: torch.Tensor) -> torch.Tensor:
     return torch.bucketize(values, edges[1:-1]).long()
 
 
+def _transform_nuisance_for_balance(
+    values: torch.Tensor, transform: Mapping[str, object]
+) -> torch.Tensor:
+    """Apply the training-fitted coordinate used only for weight strata."""
+    values = torch.as_tensor(values).double().reshape(-1)
+    kind = str(transform.get("kind", "identity"))
+    if kind == "identity":
+        return values.float()
+    if kind == "scaled_log1p":
+        if (values < 0).any():
+            raise ValueError("Log-space nuisance balancing requires non-negative values.")
+        scale = float(transform["scale"])
+        if not math.isfinite(scale) or scale <= 0.0:
+            raise ValueError("Log-space nuisance scale must be positive and finite.")
+        return torch.log1p(values / scale).float()
+    raise ValueError(f"Unsupported nuisance-balance transform {kind!r}.")
+
+
 def fit_joint_balance(
     labels: torch.Tensor,
     nuisance: torch.Tensor,
     base_weights: torch.Tensor,
     n_strata: int,
+    binning: str = "weighted_quantile",
+    clip_quantile: float = 1.0,
 ) -> Tuple[torch.Tensor, Dict[str, object]]:
     """Fit engineer-style class/nuisance balancing on the training split.
 
     The generator-weighted mass of every occupied nuisance stratum is equal
-    within a class, and every class receives equal total mass.  Quantile strata
-    are an internal density-estimation device and are never passed to the model.
+    within a class before clipping, and every class receives equal total mass.
+    Strata and clipping are internal weight-estimation devices and are never
+    passed to the model or critic.
     """
     if int(n_strata) < 2:
         raise ValueError("n_strata must be at least two.")
+    if binning not in {"weighted_quantile", "log_fixed"}:
+        raise ValueError(
+            "binning must be 'weighted_quantile' or 'log_fixed'.")
+    if not 0.5 <= float(clip_quantile) <= 1.0:
+        raise ValueError("clip_quantile must lie in [0.5, 1.0].")
     labels = torch.as_tensor(labels).long().reshape(-1)
     nuisance = torch.as_tensor(nuisance).float().reshape(-1)
     base_weights = torch.as_tensor(base_weights).double().reshape(-1)
     if not (labels.numel() == nuisance.numel() == base_weights.numel()):
         raise ValueError("labels, nuisance, and base_weights must align.")
+    if not torch.isfinite(nuisance).all():
+        raise ValueError("Nuisance values must be finite.")
 
     class_factors = fit_class_balance_factors(labels, base_weights)
     quantile_weights = apply_class_balance_factors(
         labels, base_weights, class_factors, normalize_mean=False).double()
-    edges = weighted_quantile(
-        nuisance,
-        torch.linspace(0.0, 1.0, int(n_strata) + 1),
-        quantile_weights,
-    )
-    edges = torch.unique_consecutive(edges)
+    if binning == "weighted_quantile":
+        transform = {"kind": "identity"}
+        transformed_nuisance = nuisance
+        edges = weighted_quantile(
+            transformed_nuisance,
+            torch.linspace(0.0, 1.0, int(n_strata) + 1),
+            quantile_weights,
+        )
+        edges = torch.unique_consecutive(edges)
+        range_quantiles = None
+    else:
+        if (nuisance < 0).any():
+            raise ValueError(
+                "log_fixed binning requires non-negative AE reconstruction loss.")
+        positive = nuisance > 0
+        if not positive.any():
+            raise ValueError(
+                "log_fixed binning requires at least one positive nuisance value.")
+        scale = float(weighted_quantile(
+            nuisance[positive], torch.tensor([0.5]),
+            quantile_weights[positive])[0])
+        transform = {"kind": "scaled_log1p", "scale": scale}
+        transformed_nuisance = _transform_nuisance_for_balance(
+            nuisance, transform)
+        range_quantiles = (0.001, 0.999)
+        lower, upper = weighted_quantile(
+            transformed_nuisance,
+            torch.tensor(range_quantiles),
+            quantile_weights,
+        )
+        if not float(upper) > float(lower):
+            lower = transformed_nuisance.min()
+            upper = transformed_nuisance.max()
+        if not float(upper) > float(lower):
+            raise ValueError(
+                "The nuisance has too few distinct values for log-space bins.")
+        edges = torch.linspace(
+            float(lower), float(upper), int(n_strata) + 1,
+            dtype=torch.float32)
     if edges.numel() < 3:
         raise ValueError(
             "The continuous nuisance has too few distinct values for balancing.")
-    strata = _assign_strata(nuisance, edges)
+    strata = _assign_strata(transformed_nuisance, edges)
 
     classes = sorted(int(value) for value in labels.unique().tolist())
     factors: Dict[Tuple[int, int], float] = {}
@@ -444,14 +505,47 @@ def fit_joint_balance(
                 1.0 / (len(classes) * len(occupied_bins) * mass))
 
     spec = {
-        "version": 1,
+        "version": 2,
         "method": "uniform_class_and_occupied_continuous_nuisance_strata",
+        "binning": binning,
+        "transform": transform,
+        "range_quantiles": range_quantiles,
         "edges": edges.cpu(),
         "factors": factors,
         "occupied": {key: list(value) for key, value in occupied.items()},
         "classes": classes,
         "requested_strata": int(n_strata),
         "effective_strata": int(edges.numel() - 1),
+    }
+    unclipped = apply_joint_balance(
+        labels, nuisance, base_weights, spec, normalize_mean=False)
+    clipping_enabled = float(clip_quantile) < 1.0
+    caps: Dict[int, float] = {}
+    class_scales: Dict[int, float] = {}
+    clipped_fraction: Dict[int, float] = {}
+    if clipping_enabled:
+        for label in classes:
+            mask = labels == label
+            class_weights = unclipped[mask].double()
+            cap = float(torch.quantile(class_weights, float(clip_quantile)))
+            if not math.isfinite(cap) or cap <= 0.0:
+                raise ValueError(
+                    f"Class {label} has an invalid fitted clipping cap {cap}.")
+            clipped = class_weights.clamp(max=cap)
+            clipped_mass = float(clipped.sum())
+            if clipped_mass <= 0.0:
+                raise ValueError(
+                    f"Class {label} has non-positive mass after clipping.")
+            caps[label] = cap
+            class_scales[label] = 1.0 / (len(classes) * clipped_mass)
+            clipped_fraction[label] = float((class_weights > cap).double().mean())
+    spec["weight_clipping"] = {
+        "enabled": clipping_enabled,
+        "quantile": float(clip_quantile),
+        "scope": "per_class_effective_event_weight",
+        "caps": caps,
+        "class_scales": class_scales,
+        "training_fraction_clipped": clipped_fraction,
     }
     weights = apply_joint_balance(labels, nuisance, base_weights, spec)
     return weights, spec
@@ -467,9 +561,12 @@ def apply_joint_balance(
     labels = torch.as_tensor(labels).long().reshape(-1)
     nuisance = torch.as_tensor(nuisance).float().reshape(-1)
     base_weights = torch.as_tensor(base_weights).double().reshape(-1)
-    strata = _assign_strata(nuisance, spec["edges"])
+    transformed_nuisance = _transform_nuisance_for_balance(
+        nuisance, spec.get("transform", {"kind": "identity"}))
+    strata = _assign_strata(transformed_nuisance, spec["edges"])
     factors = spec["factors"]
     occupied = spec["occupied"]
+    clipping = spec.get("weight_clipping", {"enabled": False})
     output = torch.empty_like(base_weights)
     fallback_counts = defaultdict(int)
 
@@ -488,6 +585,12 @@ def apply_joint_balance(
                 fallback_counts[(label, stratum, use_stratum)] += 1
             mask = (labels == label) & (strata == stratum)
             output[mask] = base_weights[mask] * float(factors[key])
+
+        if clipping.get("enabled", False):
+            cap = float(clipping["caps"][label])
+            class_scale = float(clipping["class_scales"][label])
+            label_mask = labels == label
+            output[label_mask] = output[label_mask].clamp(max=cap) * class_scale
 
     if fallback_counts:
         print(

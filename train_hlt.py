@@ -165,6 +165,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--balance_strata", type=int, default=20,
                         help="Training-only histogram strata used to estimate weights; "
                              "never passed to the critic.")
+    parser.add_argument(
+        "--balance_binning",
+        choices=("log_fixed", "weighted_quantile"),
+        default="log_fixed",
+        help=("Nuisance-weight binning. log_fixed uses fixed-width bins in a "
+              "training-fitted scaled log1p(AE loss) coordinate."),
+    )
+    parser.add_argument(
+        "--balance_clip_quantile", type=float, default=0.995,
+        help=("Per-class quantile cap for effective NURD event weights. "
+              "Use 1.0 to disable clipping."),
+    )
     parser.add_argument("--qcd_label", type=int, default=1)
     parser.add_argument("--exclude_labels", type=int, nargs="+", default=None)
     parser.add_argument("--max_events", type=int, default=-1)
@@ -493,6 +505,8 @@ def main(argv=None):
         raise ValueError("checkpoint_every must be non-negative.")
     if args.lr_schedule_epochs < 0:
         raise ValueError("lr_schedule_epochs must be non-negative.")
+    if not 0.5 <= args.balance_clip_quantile <= 1.0:
+        raise ValueError("balance_clip_quantile must lie in [0.5, 1.0].")
     selection_start_epoch = information_schedule_end_epoch(
         args.info_warmup_epochs, args.info_ramp_epochs)
     if selection_start_epoch > args.epochs:
@@ -538,6 +552,8 @@ def main(argv=None):
         qcd_label=args.qcd_label,
         ae_scaler=ae_checkpoint["ae_scaler"],
         balance_strata=args.balance_strata,
+        balance_binning=args.balance_binning,
+        balance_clip_quantile=args.balance_clip_quantile,
         ae_batch_size=args.ae_batch_size,
     )
     validate_ae_training_contract(ae_checkpoint, preprocessing)
@@ -599,9 +615,11 @@ def main(argv=None):
 
     logger.info(
         "Continuous density-ratio training: events=%d/%d classes=%d "
-        "balance_strata=%d lambda_info=%.3f critic_steps=%d shuffle_mode=%s",
+        "balance_strata=%d balance_binning=%s balance_clip_quantile=%.4f "
+        "lambda_info=%.3f critic_steps=%d shuffle_mode=%s",
         len(train_dataset), len(val_dataset), num_classes,
-        args.balance_strata, args.lambda_info, args.critic_steps,
+        args.balance_strata, args.balance_binning,
+        args.balance_clip_quantile, args.lambda_info, args.critic_steps,
         args.critic_shuffle_mode)
     logger.info(
         "Information schedule: warmup_epochs=%d ramp_epochs=%d "
