@@ -131,6 +131,46 @@ To compare saved epochs without touching held-out test data:
 bash slurm/launch_validation_checkpoint_scan.sh <run_tag> 5 10 15 20 25 30 35 40
 ```
 
+## Staged diagnostic mode
+
+Diagnostic mode uses the same AE, encoder, losses, critic, preprocessing, and
+weight code as production, but runs them on a deterministic class-stratified
+subset and saves every short stage. It does not open the held-out test sample
+and it does not submit the normal dual evaluation.
+
+```bash
+bash slurm/launch_engineer_campaign.sh <new_diagnostic_tag> 0.3 --diagnostic
+```
+
+The default sequence is five AE epochs, five classifier/SupCon-only epochs,
+three epochs with the global NURD critic sharply enabled, and a separate
+three-epoch critic probe applied identically to frozen representations before
+and after NURD. Defaults can be changed without editing source, for example:
+
+```bash
+DIAG_MAX_EVENTS=200000 \
+DIAG_AE_EPOCHS=8 \
+DIAG_SUPCON_EPOCHS=6 \
+DIAG_NURD_EPOCHS=4 \
+DIAG_CRITIC_PROBE_EPOCHS=4 \
+  bash slurm/launch_engineer_campaign.sh <new_diagnostic_tag> 0.3 --diagnostic
+```
+
+The complete report is written to
+`$BASE/outputs/<tag>_diagnostic/`. It contains the selected diagnostic inputs,
+`diagnostic_summary.json`, a campaign manifest, and plot groups for data/AE,
+SupCon-only, the frozen critic probe, post-NURD behavior, and direct comparison.
+Nothing is sent to W&B during the run. Upload the completed report later with:
+
+```bash
+python scripts/upload_training_diagnostics.py \
+  "$BASE/outputs/<tag>_diagnostic"
+```
+
+The diagnostic closure plots use only the saved training/validation split and
+are intended to locate bugs, not to select a result after inspecting held-out
+data.
+
 ## Repository map
 
 - `train_ae.py`, `train_hlt.py`: the only training entry points.
@@ -139,8 +179,8 @@ bash slurm/launch_validation_checkpoint_scan.sh <run_tag> 5 10 15 20 25 30 35 40
 - `models/`: AE, classifier/encoder, and critic definitions.
 - `utils/hlt_weights.py`: generator/effective weighting and split metadata.
 - `utils/hlt_density_ratio.py`: critic sampling and density-ratio losses.
-- `slurm/`: canonical training, dual-evaluation, and checkpoint-scan jobs.
-- `scripts/`: dual-evaluation summary and validation checkpoint scan.
+- `slurm/`: canonical training, diagnostic, dual-evaluation, and checkpoint-scan jobs.
+- `scripts/`: diagnostic drivers, dual-evaluation summary, and validation scan.
 - `event_displays/`: matched QCD, false-positive QCD, and TpTp displays.
 - `tests/`: regression tests for data, weights, critic, schedules, evaluation,
   and checkpoint selection.

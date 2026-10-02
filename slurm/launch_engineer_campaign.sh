@@ -7,9 +7,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 CODE_DIR="$(cd "$SCRIPT_DIR/.." && pwd -P)"
 cd "$CODE_DIR"
 
+if (( $# == 3 )) && [[ "$3" == "--diagnostic" ]]; then
+  exec bash "$SCRIPT_DIR/launch_diagnostic_campaign.sh" "$1" "$2"
+fi
 if (( $# != 2 )); then
-  echo "Usage: bash slurm/launch_engineer_campaign.sh RUN_TAG SUPCON_WEIGHT"
+  echo "Usage: bash slurm/launch_engineer_campaign.sh RUN_TAG SUPCON_WEIGHT [--diagnostic]"
   echo "Example: bash slurm/launch_engineer_campaign.sh engineer_continuous_supcon040 0.4"
+  echo "Diagnostic: bash slurm/launch_engineer_campaign.sh chain_check 0.3 --diagnostic"
   exit 2
 fi
 if ! git diff --quiet || ! git diff --cached --quiet; then
