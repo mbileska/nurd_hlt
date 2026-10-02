@@ -16,6 +16,8 @@ from utils.hlt_density_ratio import (
 def test_global_shuffle_is_the_training_default():
     args = build_parser().parse_args(["--data", "sample.pt", "--ae_ckpt", "ae.pth"])
     assert args.critic_shuffle_mode == "global"
+    assert args.nurd_enabled == 0
+    assert args.critic_start_epoch == 0
     assert args.balance_binning == "log_fixed"
     assert args.balance_clip_quantile == pytest.approx(0.995)
 

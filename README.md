@@ -15,17 +15,20 @@ documented here, beginning with generator-only all-class AE training.
    representation from PF-candidate tensors.
 3. A real-vs-shuffled density-ratio critic sees
    `(latent, continuous AE score, class label)`. The encoder is penalized when
-   its latent representation retains AE information.
+   its latent representation retains AE information. A master NURD switch can
+   disable both critic training and this penalty, or activate both sharply at
+   a selected epoch.
 4. `eval_abcd_nurd.py` converts the latent vector to the Mahalanobis-distance
    (MD) axis and measures weighted QCD ABCD closure against the AE axis.
 
-The NURD-side architecture and optimization defaults remain the golden setup:
-SupCon 0.3, 20 training-only nuisance strata, global uniform nuisance
-shuffling, three critic updates per encoder update, immediate information
-weight 1, and no ramp. Weight estimation now uses fixed-width bins in a
-training-fitted scaled `log1p(AE loss)` coordinate and clips the top 0.5% of
-effective event weights separately in each class before restoring equal class
-mass. The AE weighting is the all-class, generator-only update described above.
+The campaign uses SupCon 0.3, 20 training-only nuisance strata, global uniform
+nuisance shuffling, and three critic updates per encoder update when NURD is
+active. NURD is disabled by default. When enabled, start epoch `0` activates it
+in epoch 1; a positive start epoch produces a sharp off-to-on transition with
+no ramp. Weight estimation uses fixed-width bins in a training-fitted scaled
+`log1p(AE loss)` coordinate and clips the top 0.5% of effective event weights
+separately in each class before restoring equal class mass. The AE weighting
+is the all-class, generator-only update described above.
 
 Generator weights are loaded from `weight_train.pt`/`weight_test.pt`. The AE
 uses those physics weights directly across the full all-class sample (non-QCD
@@ -87,8 +90,8 @@ The launcher keeps recent comparisons available without changing source:
 ```bash
 NURD_EPOCHS=80 \
 LR_SCHEDULE_EPOCHS=40 \
-INFO_WARMUP_EPOCHS=5 \
-INFO_RAMP_EPOCHS=10 \
+NURD_ENABLED=1 \
+CRITIC_START_EPOCH=6 \
 BALANCE_BINNING=log_fixed \
 BALANCE_CLIP_QUANTILE=0.995 \
 CHECKPOINT_EVERY=5 \
@@ -97,11 +100,27 @@ STATISTICALLY_VALID_CLOSURE=1 \
   bash slurm/launch_engineer_campaign.sh <new_run_tag> 0.3
 ```
 
-Current defaults use `NURD_EPOCHS=40`, `LR_SCHEDULE_EPOCHS=40`, zero
-warm-up/ramp, `BALANCE_BINNING=log_fixed`,
-`BALANCE_CLIP_QUANTILE=0.995`, `CRITIC_SHUFFLE_MODE=global`,
-`CHECKPOINT_EVERY=5`, and statistically valid closure. To recover the earlier
-weight estimator for a controlled comparison, use
+Current defaults use `NURD_EPOCHS=40`, `LR_SCHEDULE_EPOCHS=40`,
+`NURD_ENABLED=0`, `CRITIC_START_EPOCH=0`,
+`BALANCE_BINNING=log_fixed`, `BALANCE_CLIP_QUANTILE=0.995`,
+`CRITIC_SHUFFLE_MODE=global`, `CHECKPOINT_EVERY=5`, and statistically valid
+closure. With NURD disabled, training is classification plus the requested
+SupCon loss and the critic is never optimized. To enable NURD immediately:
+
+```bash
+NURD_ENABLED=1 CRITIC_START_EPOCH=0 \
+  bash slurm/launch_engineer_campaign.sh <new_run_tag> 0.3
+```
+
+To let classification/SupCon train alone for epochs 1--5 and switch NURD on
+sharply in epoch 6:
+
+```bash
+NURD_ENABLED=1 CRITIC_START_EPOCH=6 \
+  bash slurm/launch_engineer_campaign.sh <new_run_tag> 0.3
+```
+
+To recover the earlier weight estimator for a controlled comparison, use
 `BALANCE_BINNING=weighted_quantile BALANCE_CLIP_QUANTILE=1.0`.
 `weighted_within_class` remains available only as the recent
 conditional-shuffle comparison.

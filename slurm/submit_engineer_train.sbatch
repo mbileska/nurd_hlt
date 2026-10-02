@@ -25,8 +25,8 @@ CODE_COMMIT="${CODE_COMMIT:?CODE_COMMIT must be supplied by the launcher}"
 CONTRAST_WEIGHT="${CONTRAST_WEIGHT:?CONTRAST_WEIGHT must be supplied by the launcher}"
 NURD_EPOCHS="${NURD_EPOCHS:-40}"
 LR_SCHEDULE_EPOCHS="${LR_SCHEDULE_EPOCHS:-$NURD_EPOCHS}"
-INFO_WARMUP_EPOCHS="${INFO_WARMUP_EPOCHS:-0}"
-INFO_RAMP_EPOCHS="${INFO_RAMP_EPOCHS:-0}"
+NURD_ENABLED="${NURD_ENABLED:-0}"
+CRITIC_START_EPOCH="${CRITIC_START_EPOCH:-0}"
 CRITIC_SHUFFLE_MODE="${CRITIC_SHUFFLE_MODE:-global}"
 BALANCE_BINNING="${BALANCE_BINNING:-log_fixed}"
 BALANCE_CLIP_QUANTILE="${BALANCE_CLIP_QUANTILE:-0.995}"
@@ -75,7 +75,8 @@ echo "NURD experiment: $NURD_EXP"
 echo "SupCon weight: $CONTRAST_WEIGHT"
 echo "NURD maximum epochs: $NURD_EPOCHS"
 echo "NURD LR schedule epochs: $LR_SCHEDULE_EPOCHS"
-echo "Information warm-up/ramp: $INFO_WARMUP_EPOCHS/$INFO_RAMP_EPOCHS"
+echo "NURD enabled: $NURD_ENABLED"
+echo "Critic start epoch: $CRITIC_START_EPOCH (0 means epoch 1)"
 echo "Critic shuffle: $CRITIC_SHUFFLE_MODE"
 echo "Nuisance weight binning: $BALANCE_BINNING"
 echo "Effective-weight clip quantile: $BALANCE_CLIP_QUANTILE"
@@ -115,10 +116,10 @@ python train_hlt.py \
   --lr 1e-4 \
   --critic_lr 1e-3 \
   --critic_steps 3 \
+  --nurd_enabled "$NURD_ENABLED" \
+  --critic_start_epoch "$CRITIC_START_EPOCH" \
   --critic_shuffle_mode "$CRITIC_SHUFFLE_MODE" \
   --lambda_info 1.0 \
-  --info_warmup_epochs "$INFO_WARMUP_EPOCHS" \
-  --info_ramp_epochs "$INFO_RAMP_EPOCHS" \
   --contrast_weight "$CONTRAST_WEIGHT" \
   --weight_decay 5e-3 \
   --embed_size 128 \

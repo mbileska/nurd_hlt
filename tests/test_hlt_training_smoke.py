@@ -1,3 +1,4 @@
+import pytest
 import torch
 
 from models.hlt_autoencoder import HLTAutoencoder
@@ -5,7 +6,10 @@ from train_hlt import main
 from utils.hlt_weights import load_generator_weights, sample_signature
 
 
-def test_one_epoch_continuous_density_ratio_training_smoke(tmp_path, monkeypatch):
+@pytest.mark.parametrize("nurd_enabled", [0, 1])
+def test_one_epoch_continuous_density_ratio_training_smoke(
+    tmp_path, monkeypatch, nurd_enabled
+):
     generator = torch.Generator().manual_seed(13)
     n_events = 96
     labels = torch.arange(n_events) % 4
@@ -45,6 +49,7 @@ def test_one_epoch_continuous_density_ratio_training_smoke(tmp_path, monkeypatch
     }, ae_path)
 
     monkeypatch.chdir(tmp_path)
+    experiment = f"smoke_nurd_{nurd_enabled}"
     main([
         "--data", str(data_path),
         "--ae_ckpt", str(ae_path),
@@ -53,6 +58,8 @@ def test_one_epoch_continuous_density_ratio_training_smoke(tmp_path, monkeypatch
         "--batch_size", "16",
         "--balance_strata", "3",
         "--critic_steps", "1",
+        "--nurd_enabled", str(nurd_enabled),
+        "--critic_start_epoch", "0",
         "--embed_size", "8",
         "--latent_dim", "3",
         "--proj_dim", "3",
@@ -61,11 +68,19 @@ def test_one_epoch_continuous_density_ratio_training_smoke(tmp_path, monkeypatch
         "--dim_ff", "16",
         "--linear_dim", "2",
         "--local_testing", "1",
-        "--exp_name", "smoke",
+        "--exp_name", experiment,
     ])
-    checkpoint = tmp_path / "checkpoints/hlt/hlt/smoke/checkpoint_main.pth.tar"
+    checkpoint = (
+        tmp_path / f"checkpoints/hlt/hlt/{experiment}/checkpoint_main.pth.tar")
     assert checkpoint.exists()
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     assert payload["preprocessing"]["nuisance_transform"]["kind"].startswith(
         "standardize_continuous")
     assert payload["validation_metrics"]["balanced_accuracy"] >= 0.0
+    assert payload["nurd_active"] is bool(nurd_enabled)
+    assert payload["effective_lambda_info"] == pytest.approx(
+        1.0 if nurd_enabled else 0.0)
+    if nurd_enabled:
+        assert payload["train_metrics"]["critic_loss"] > 0.0
+    else:
+        assert payload["train_metrics"]["critic_loss"] == 0.0

@@ -192,6 +192,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--critic_steps", type=int, default=1,
                         help="Independent critic batches trained before each encoder batch.")
     parser.add_argument(
+        "--nurd_enabled", type=int, choices=(0, 1), default=0,
+        help=("Master NURD switch. Zero disables both critic optimization and "
+              "the encoder information penalty."),
+    )
+    parser.add_argument(
+        "--critic_start_epoch", type=int, default=0,
+        help=("One-based epoch for sharp critic/NURD activation. Zero starts "
+              "immediately in epoch 1. Ignored when --nurd_enabled=0."),
+    )
+    parser.add_argument(
         "--critic_shuffle_mode",
         choices=("weighted_within_class", "global"),
         default="global",
@@ -200,14 +210,6 @@ def build_parser() -> argparse.ArgumentParser:
               "under the effective event measure."))
     parser.add_argument("--lambda_info", "--_lambda", dest="lambda_info",
                         type=float, default=1.0)
-    parser.add_argument(
-        "--info_warmup_epochs", type=int, default=0,
-        help=("Epochs with zero encoder information penalty. The critic is "
-              "still trained during this warm-up."))
-    parser.add_argument(
-        "--info_ramp_epochs", type=int, default=0,
-        help=("Epochs used for a cosine ramp from zero to --lambda_info. "
-              "Zero preserves the original immediate-penalty behavior."))
     parser.add_argument("--contrast_weight", type=float, default=0.0)
     parser.add_argument("--contrast_temp", type=float, default=0.05)
     parser.add_argument("--patience", type=int, default=15)
@@ -238,47 +240,35 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def information_schedule_end_epoch(
-    warmup_epochs: int,
-    ramp_epochs: int,
-) -> int:
-    """First epoch eligible for checkpoint selection and early stopping.
-
-    A ten-epoch ramp after five warm-up epochs occupies epochs 6--15, so the
-    full target weight is reached and selection becomes eligible at epoch 15.
-    The immediate schedule remains eligible at epoch 1.
-    """
-    if warmup_epochs < 0 or ramp_epochs < 0:
-        raise ValueError("Information warm-up and ramp epochs must be non-negative.")
-    if ramp_epochs:
-        return warmup_epochs + ramp_epochs
-    return warmup_epochs + 1
-
-
-def effective_information_weight(
+def nurd_active_for_epoch(
     epoch: int,
-    target: float,
-    warmup_epochs: int,
-    ramp_epochs: int,
-) -> float:
-    """Return the encoder information-penalty weight for a one-based epoch."""
+    nurd_enabled: int,
+    critic_start_epoch: int,
+) -> bool:
+    """Return whether critic training and NURD pressure are active."""
     if epoch < 1:
         raise ValueError("Epochs are one-based and must be positive.")
-    if target < 0.0:
-        raise ValueError("The target information weight must be non-negative.")
-    end_epoch = information_schedule_end_epoch(warmup_epochs, ramp_epochs)
-    if epoch <= warmup_epochs:
-        return 0.0
-    if ramp_epochs == 0 or ramp_epochs == 1:
-        return float(target)
+    if int(nurd_enabled) not in (0, 1):
+        raise ValueError("nurd_enabled must be zero or one.")
+    if critic_start_epoch < 0:
+        raise ValueError("critic_start_epoch must be non-negative.")
+    if not int(nurd_enabled):
+        return False
+    return critic_start_epoch == 0 or epoch >= critic_start_epoch
 
-    # The first ramp epoch is exactly zero and the last is exactly the target.
-    progress = (epoch - warmup_epochs - 1) / float(ramp_epochs - 1)
-    progress = min(max(progress, 0.0), 1.0)
-    multiplier = 0.5 * (1.0 - math.cos(math.pi * progress))
-    if epoch >= end_epoch:
-        multiplier = 1.0
-    return float(target) * multiplier
+
+def checkpoint_selection_start_epoch(
+    nurd_enabled: int,
+    critic_start_epoch: int,
+) -> int:
+    """Delay selection only while an enabled critic is waiting to start."""
+    if int(nurd_enabled) not in (0, 1):
+        raise ValueError("nurd_enabled must be zero or one.")
+    if critic_start_epoch < 0:
+        raise ValueError("critic_start_epoch must be non-negative.")
+    if not int(nurd_enabled) or critic_start_epoch == 0:
+        return 1
+    return critic_start_epoch
 
 
 def cosine_lr_multiplier(
@@ -387,23 +377,24 @@ def train_epoch(
     device: torch.device,
     args,
     contrastive_loss,
-    information_weight: float,
+    nurd_active: bool,
 ) -> Dict[str, object]:
     metrics = EpochMetrics(model.classifier.out_features)
-    critic_iterator = iter(train_loader)
+    critic_iterator = iter(train_loader) if nurd_active else None
 
     for batch in train_loader:
-        for _ in range(args.critic_steps):
-            try:
-                critic_batch = next(critic_iterator)
-            except StopIteration:
-                critic_iterator = iter(train_loader)
-                critic_batch = next(critic_iterator)
-            critic_loss, critic_accuracy, context_accuracy = critic_update(
-                model, critic, critic_optimizer, critic_batch, device,
-                args.critic_shuffle_mode)
-            metrics.update_critic(
-                critic_loss, critic_accuracy, context_accuracy)
+        if nurd_active:
+            for _ in range(args.critic_steps):
+                try:
+                    critic_batch = next(critic_iterator)
+                except StopIteration:
+                    critic_iterator = iter(train_loader)
+                    critic_batch = next(critic_iterator)
+                critic_loss, critic_accuracy, context_accuracy = critic_update(
+                    model, critic, critic_optimizer, critic_batch, device,
+                    args.critic_shuffle_mode)
+                metrics.update_critic(
+                    critic_loss, critic_accuracy, context_accuracy)
 
         inputs, labels, nuisance, _ae_reco, weights, _physics = _move_batch(
             batch, device)
@@ -412,9 +403,12 @@ def train_epoch(
         latent, logits = model(inputs)
         ce = F.cross_entropy(logits, labels, reduction="none")
 
-        with frozen_parameters(critic):
-            information_per_event = engineer_information_penalty(
-                critic, latent, labels, nuisance)
+        if nurd_active:
+            with frozen_parameters(critic):
+                information_per_event = engineer_information_penalty(
+                    critic, latent, labels, nuisance)
+        else:
+            information_per_event = torch.zeros_like(ce)
         # Weights are normalized to mean one over the complete training split.
         # A fixed denominator is unbiased even for the very broad Mequinna
         # generator weights; per-batch self-normalization is not.
@@ -428,7 +422,7 @@ def train_epoch(
             contrast_loss = latent.sum() * 0.0
         total_loss = (
             ce_loss
-            + information_weight * information_loss
+            + (args.lambda_info if nurd_active else 0.0) * information_loss
             + args.contrast_weight * contrast_loss
         )
 
@@ -439,7 +433,9 @@ def train_epoch(
             logits.detach(), labels, weights, ce.detach(), total_loss,
             information_loss, contrast_loss)
 
-    return metrics.summary()
+    summary = metrics.summary()
+    summary["nurd_active"] = bool(nurd_active)
+    return summary
 
 
 @torch.no_grad()
@@ -449,6 +445,7 @@ def validate(
     loader,
     device: torch.device,
     critic_shuffle_mode: str,
+    nurd_active: bool,
 ) -> Dict[str, object]:
     model.eval()
     critic.eval()
@@ -458,32 +455,38 @@ def validate(
             batch, device)
         latent, logits = model(inputs)
         ce = F.cross_entropy(logits, labels, reduction="none")
-        information = weighted_mean(
-            engineer_information_penalty(critic, latent, labels, nuisance),
-            weights,
-        )
-        donor_indices = sample_nuisance_donor_indices(
-            labels, weights, shuffle_mode=critic_shuffle_mode)
-        critic_loss, critic_accuracy, _ = density_ratio_critic_loss(
-            critic, latent, labels, nuisance, weights,
-            permutation=donor_indices,
-            shuffle_mode=critic_shuffle_mode)
-        context_accuracy = critic_context_only_accuracy(
-            critic, latent, labels, nuisance, weights,
-            permutation=donor_indices,
-            shuffle_mode=critic_shuffle_mode)
-        metrics.update_critic(
-            critic_loss, critic_accuracy, context_accuracy)
+        if nurd_active:
+            information = weighted_mean(
+                engineer_information_penalty(critic, latent, labels, nuisance),
+                weights,
+            )
+            donor_indices = sample_nuisance_donor_indices(
+                labels, weights, shuffle_mode=critic_shuffle_mode)
+            critic_loss, critic_accuracy, _ = density_ratio_critic_loss(
+                critic, latent, labels, nuisance, weights,
+                permutation=donor_indices,
+                shuffle_mode=critic_shuffle_mode)
+            context_accuracy = critic_context_only_accuracy(
+                critic, latent, labels, nuisance, weights,
+                permutation=donor_indices,
+                shuffle_mode=critic_shuffle_mode)
+            metrics.update_critic(
+                critic_loss, critic_accuracy, context_accuracy)
+        else:
+            information = latent.sum() * 0.0
         metrics.update_main(
             logits, labels, weights, ce,
             weighted_mean(ce, weights), information,
             latent.sum() * 0.0)
-    return metrics.summary()
+    summary = metrics.summary()
+    summary["nurd_active"] = bool(nurd_active)
+    return summary
 
 
 def format_metrics(split: str, epoch: int, metrics: Dict[str, object]) -> str:
     return (
-        f"{split} epoch={epoch} weighted_ce={metrics['weighted_ce']:.6f} "
+        f"{split} epoch={epoch} nurd_active={metrics['nurd_active']} "
+        f"weighted_ce={metrics['weighted_ce']:.6f} "
         f"weighted_acc={metrics['weighted_accuracy']:.4f} "
         f"balanced_acc={metrics['balanced_accuracy']:.4f} "
         f"critic_acc={metrics['critic_accuracy']:.4f} "
@@ -499,20 +502,20 @@ def main(argv=None):
         raise ValueError("critic_steps must be at least one.")
     if args.lambda_info < 0.0 or args.contrast_weight < 0.0:
         raise ValueError("Loss weights must be non-negative.")
-    if args.info_warmup_epochs < 0 or args.info_ramp_epochs < 0:
-        raise ValueError("Information warm-up and ramp epochs must be non-negative.")
+    if args.critic_start_epoch < 0:
+        raise ValueError("critic_start_epoch must be non-negative.")
     if args.checkpoint_every < 0:
         raise ValueError("checkpoint_every must be non-negative.")
     if args.lr_schedule_epochs < 0:
         raise ValueError("lr_schedule_epochs must be non-negative.")
     if not 0.5 <= args.balance_clip_quantile <= 1.0:
         raise ValueError("balance_clip_quantile must lie in [0.5, 1.0].")
-    selection_start_epoch = information_schedule_end_epoch(
-        args.info_warmup_epochs, args.info_ramp_epochs)
+    selection_start_epoch = checkpoint_selection_start_epoch(
+        args.nurd_enabled, args.critic_start_epoch)
     if selection_start_epoch > args.epochs:
         raise ValueError(
-            "The information schedule must finish within the requested epochs: "
-            f"selection starts at epoch {selection_start_epoch}, epochs={args.epochs}.")
+            "The critic must start within the requested epochs: "
+            f"start={selection_start_epoch}, epochs={args.epochs}.")
 
     set_random_seed(args.manualSeed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -622,10 +625,9 @@ def main(argv=None):
         args.balance_clip_quantile, args.lambda_info, args.critic_steps,
         args.critic_shuffle_mode)
     logger.info(
-        "Information schedule: warmup_epochs=%d ramp_epochs=%d "
-        "selection_start_epoch=%d",
-        args.info_warmup_epochs, args.info_ramp_epochs,
-        selection_start_epoch)
+        "NURD switch: enabled=%d critic_start_epoch=%d "
+        "selection_start_epoch=%d activation=sharp",
+        args.nurd_enabled, args.critic_start_epoch, selection_start_epoch)
     logger.info(
         "Optimization schedule: maximum_epochs=%d lr_schedule_epochs=%d "
         "patience=%d checkpoint_every=%d",
@@ -641,27 +643,26 @@ def main(argv=None):
     last_payload = None
 
     for epoch in range(1, args.epochs + 1):
-        information_weight = effective_information_weight(
-            epoch,
-            args.lambda_info,
-            args.info_warmup_epochs,
-            args.info_ramp_epochs,
-        )
+        nurd_active = nurd_active_for_epoch(
+            epoch, args.nurd_enabled, args.critic_start_epoch)
+        information_weight = args.lambda_info if nurd_active else 0.0
         train_metrics = train_epoch(
             model, critic, train_loader,
             model_optimizer, critic_optimizer,
-            device, args, contrastive_loss, information_weight)
+            device, args, contrastive_loss, nurd_active)
         val_metrics = validate(
-            model, critic, val_loader, device, args.critic_shuffle_mode)
+            model, critic, val_loader, device, args.critic_shuffle_mode,
+            nurd_active)
         if model_scheduler is not None:
             model_scheduler.step()
         logger.info(format_metrics("train", epoch, train_metrics))
         logger.info(format_metrics("validation", epoch, val_metrics))
         logger.info(
-            "information schedule epoch=%d effective_lambda_info=%.6f",
-            epoch, information_weight)
+            "NURD state epoch=%d active=%s effective_lambda_info=%.6f",
+            epoch, nurd_active, information_weight)
         history.append({
             "epoch": epoch,
+            "nurd_active": nurd_active,
             "effective_lambda_info": information_weight,
             "train": train_metrics,
             "validation": val_metrics,
@@ -671,6 +672,7 @@ def main(argv=None):
             flat = {
                 "epoch": epoch,
                 "lr": model_optimizer.param_groups[0]["lr"],
+                "nurd_active": int(nurd_active),
                 "effective_lambda_info": information_weight,
             }
             for split, values in (("train", train_metrics), ("validation", val_metrics)):
@@ -692,6 +694,7 @@ def main(argv=None):
             "ae_checkpoint_sha256": ae_checkpoint_sha256,
             "selection_metric": "training-fit-weighted_validation_ce",
             "selection_value": float(val_metrics["weighted_ce"]),
+            "nurd_active": nurd_active,
             "effective_lambda_info": information_weight,
             "train_metrics": train_metrics,
             "validation_metrics": val_metrics,

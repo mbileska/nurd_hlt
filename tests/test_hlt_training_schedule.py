@@ -5,28 +5,39 @@ import torch
 
 from train_hlt import (
     EpochMetrics,
+    checkpoint_selection_start_epoch,
     cosine_lr_multiplier,
-    effective_information_weight,
-    information_schedule_end_epoch,
+    nurd_active_for_epoch,
 )
 
 
-def test_immediate_information_schedule_preserves_previous_behavior():
-    assert information_schedule_end_epoch(0, 0) == 1
-    assert effective_information_weight(1, 1.0, 0, 0) == pytest.approx(1.0)
-    assert effective_information_weight(20, 1.0, 0, 0) == pytest.approx(1.0)
+def test_nurd_disabled_keeps_critic_off_and_allows_immediate_selection():
+    assert checkpoint_selection_start_epoch(0, 20) == 1
+    assert nurd_active_for_epoch(1, 0, 0) is False
+    assert nurd_active_for_epoch(40, 0, 20) is False
 
 
-def test_five_epoch_warmup_and_ten_epoch_cosine_ramp():
-    assert information_schedule_end_epoch(5, 10) == 15
+def test_zero_start_activates_nurd_immediately_without_ramp():
+    assert checkpoint_selection_start_epoch(1, 0) == 1
+    assert nurd_active_for_epoch(1, 1, 0) is True
+    assert nurd_active_for_epoch(40, 1, 0) is True
+
+
+def test_positive_start_switches_nurd_on_sharply():
+    assert checkpoint_selection_start_epoch(1, 6) == 6
     for epoch in range(1, 6):
-        assert effective_information_weight(epoch, 1.0, 5, 10) == 0.0
-    assert effective_information_weight(6, 1.0, 5, 10) == 0.0
-    expected_epoch_10 = 0.5 * (1.0 - math.cos(math.pi * 4.0 / 9.0))
-    assert effective_information_weight(10, 1.0, 5, 10) == pytest.approx(
-        expected_epoch_10)
-    assert effective_information_weight(15, 1.0, 5, 10) == pytest.approx(1.0)
-    assert effective_information_weight(16, 1.0, 5, 10) == pytest.approx(1.0)
+        assert nurd_active_for_epoch(epoch, 1, 6) is False
+    assert nurd_active_for_epoch(6, 1, 6) is True
+    assert nurd_active_for_epoch(7, 1, 6) is True
+
+
+def test_nurd_schedule_rejects_invalid_values():
+    with pytest.raises(ValueError, match="one-based"):
+        nurd_active_for_epoch(0, 1, 0)
+    with pytest.raises(ValueError, match="zero or one"):
+        checkpoint_selection_start_epoch(2, 0)
+    with pytest.raises(ValueError, match="non-negative"):
+        checkpoint_selection_start_epoch(1, -1)
 
 
 def test_accuracy_metrics_remain_global_weighted_and_class_balanced():

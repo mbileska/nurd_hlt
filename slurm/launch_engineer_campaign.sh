@@ -22,8 +22,8 @@ RUN_TAG="$1"
 CONTRAST_WEIGHT="$2"
 NURD_EPOCHS="${NURD_EPOCHS:-40}"
 LR_SCHEDULE_EPOCHS="${LR_SCHEDULE_EPOCHS:-$NURD_EPOCHS}"
-INFO_WARMUP_EPOCHS="${INFO_WARMUP_EPOCHS:-0}"
-INFO_RAMP_EPOCHS="${INFO_RAMP_EPOCHS:-0}"
+NURD_ENABLED="${NURD_ENABLED:-0}"
+CRITIC_START_EPOCH="${CRITIC_START_EPOCH:-0}"
 CRITIC_SHUFFLE_MODE="${CRITIC_SHUFFLE_MODE:-global}"
 BALANCE_BINNING="${BALANCE_BINNING:-log_fixed}"
 BALANCE_CLIP_QUANTILE="${BALANCE_CLIP_QUANTILE:-0.995}"
@@ -37,13 +37,17 @@ if [[ ! "$CONTRAST_WEIGHT" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$
   echo "ERROR: SUPCON_WEIGHT must be a non-negative number."
   exit 2
 fi
-for value_name in NURD_EPOCHS LR_SCHEDULE_EPOCHS INFO_WARMUP_EPOCHS INFO_RAMP_EPOCHS CHECKPOINT_EVERY; do
+for value_name in NURD_EPOCHS LR_SCHEDULE_EPOCHS CRITIC_START_EPOCH CHECKPOINT_EVERY; do
   value="${!value_name}"
   if [[ ! "$value" =~ ^[0-9]+$ ]]; then
     echo "ERROR: $value_name must be a non-negative integer."
     exit 2
   fi
 done
+if [[ "$NURD_ENABLED" != "0" && "$NURD_ENABLED" != "1" ]]; then
+  echo "ERROR: NURD_ENABLED must be zero or one."
+  exit 2
+fi
 if [[ "$CRITIC_SHUFFLE_MODE" != "weighted_within_class" \
       && "$CRITIC_SHUFFLE_MODE" != "global" ]]; then
   echo "ERROR: CRITIC_SHUFFLE_MODE must be weighted_within_class or global."
@@ -76,13 +80,8 @@ if (( LR_SCHEDULE_EPOCHS < 1 )); then
   echo "ERROR: LR_SCHEDULE_EPOCHS must be at least one."
   exit 2
 fi
-if (( INFO_RAMP_EPOCHS > 0 )); then
-  SELECTION_START_EPOCH=$((INFO_WARMUP_EPOCHS + INFO_RAMP_EPOCHS))
-else
-  SELECTION_START_EPOCH=$((INFO_WARMUP_EPOCHS + 1))
-fi
-if (( SELECTION_START_EPOCH > NURD_EPOCHS )); then
-  echo "ERROR: the information schedule does not finish within NURD_EPOCHS."
+if (( NURD_ENABLED == 1 && CRITIC_START_EPOCH > NURD_EPOCHS )); then
+  echo "ERROR: CRITIC_START_EPOCH must not exceed NURD_EPOCHS when NURD is enabled."
   exit 2
 fi
 AE_EXP="ae_engineer_$RUN_TAG"
@@ -100,7 +99,7 @@ done
 
 TRAIN_JOB="$(sbatch --parsable \
   --job-name="${RUN_TAG}_train" \
-  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",CODE_COMMIT="$CODE_COMMIT",RUN_TAG="$RUN_TAG",AE_EXP="$AE_EXP",NURD_EXP="$NURD_EXP",CONTRAST_WEIGHT="$CONTRAST_WEIGHT",NURD_EPOCHS="$NURD_EPOCHS",LR_SCHEDULE_EPOCHS="$LR_SCHEDULE_EPOCHS",INFO_WARMUP_EPOCHS="$INFO_WARMUP_EPOCHS",INFO_RAMP_EPOCHS="$INFO_RAMP_EPOCHS",CRITIC_SHUFFLE_MODE="$CRITIC_SHUFFLE_MODE",BALANCE_BINNING="$BALANCE_BINNING",BALANCE_CLIP_QUANTILE="$BALANCE_CLIP_QUANTILE",CHECKPOINT_EVERY="$CHECKPOINT_EVERY" \
+  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",CODE_COMMIT="$CODE_COMMIT",RUN_TAG="$RUN_TAG",AE_EXP="$AE_EXP",NURD_EXP="$NURD_EXP",CONTRAST_WEIGHT="$CONTRAST_WEIGHT",NURD_EPOCHS="$NURD_EPOCHS",LR_SCHEDULE_EPOCHS="$LR_SCHEDULE_EPOCHS",NURD_ENABLED="$NURD_ENABLED",CRITIC_START_EPOCH="$CRITIC_START_EPOCH",CRITIC_SHUFFLE_MODE="$CRITIC_SHUFFLE_MODE",BALANCE_BINNING="$BALANCE_BINNING",BALANCE_CLIP_QUANTILE="$BALANCE_CLIP_QUANTILE",CHECKPOINT_EVERY="$CHECKPOINT_EVERY" \
   slurm/submit_engineer_train.sbatch)"
 
 EVAL_JOB="$(sbatch --parsable \
@@ -116,7 +115,8 @@ echo "NURD:          $NURD_EXP"
 echo "SupCon weight: $CONTRAST_WEIGHT"
 echo "NURD maximum epochs: $NURD_EPOCHS"
 echo "NURD LR schedule epochs: $LR_SCHEDULE_EPOCHS"
-echo "Information warm-up/ramp: $INFO_WARMUP_EPOCHS/$INFO_RAMP_EPOCHS"
+echo "NURD enabled: $NURD_ENABLED"
+echo "Critic start epoch: $CRITIC_START_EPOCH (0 means epoch 1)"
 echo "Critic shuffle: $CRITIC_SHUFFLE_MODE"
 echo "Nuisance weight binning: $BALANCE_BINNING"
 echo "Effective-weight clip quantile: $BALANCE_CLIP_QUANTILE"
