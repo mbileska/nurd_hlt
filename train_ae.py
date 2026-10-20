@@ -39,9 +39,15 @@ parser.add_argument("--gen_weight_path", "--gen_weights", dest="gen_weight_path"
 parser.add_argument(
     "--generator_weight_label", "--qcd_label",
     dest="generator_weight_label", default=1, type=int,
-    help=("Class whose rows receive values from the Mequinna generator-weight "
-          "file; all other rows retain unit weight. The AE still trains on "
-          "events from every class."),
+    help=("Class whose rows receive a legacy single-label weight vector. "
+          "Ignored by new payloads declaring weight_scope=all_events."),
+)
+parser.add_argument(
+    "--generator_weight_scope",
+    choices=("auto", "all_events", "single_label"),
+    default="auto",
+    help=("auto honors explicit payload scope and treats bare legacy tensors "
+          "as single-label weights."),
 )
 parser.add_argument("--epochs",     default=100,    type=int)
 parser.add_argument("-b","--batch_size", default=2048, type=int)
@@ -99,6 +105,7 @@ physics_weights, generator_metadata = load_generator_weights(
     qcd_label=args.generator_weight_label,
     max_events=args.max_events,
     sample=raw,
+    weight_scope=args.generator_weight_scope,
 )
 del raw
 

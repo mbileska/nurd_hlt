@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import pytest
 import torch
 
@@ -63,18 +64,52 @@ def test_validation_uses_training_joint_factors_without_refitting():
         {0: 0.5, 1: 0.5}, abs=1e-6)
 
 
-def test_generator_weights_apply_only_to_qcd_and_validate_length(tmp_path):
+def test_legacy_generator_weights_apply_only_to_qcd_and_validate_length(tmp_path):
     labels = torch.tensor([0, 1, 1, 2, 3])
     path = tmp_path / "weights.pt"
     torch.save(torch.tensor([9.0, 2.0, 3.0, 8.0, 7.0]), path)
     weights, metadata = load_generator_weights(str(path), labels, qcd_label=1)
     assert weights.tolist() == [1.0, 2.0, 3.0, 1.0, 1.0]
     assert metadata["qcd_sum"] == pytest.approx(5.0)
+    assert metadata["weight_scope"] == "single_label"
 
     short_path = tmp_path / "short.pt"
     torch.save(torch.ones(4), short_path)
     with pytest.raises(ValueError, match="does not match"):
         load_generator_weights(str(short_path), labels, qcd_label=1)
+
+
+def test_declared_all_event_npz_weights_apply_to_every_class(tmp_path):
+    labels = torch.tensor([0, 1, 1, 2, 3])
+    event_ids = np.asarray([
+        [0, 1, 10, 100],
+        [1, 1, 10, 101],
+        [1, 1, 10, 102],
+        [2, 1, 10, 103],
+        [3, 1, 10, 104],
+    ], dtype=np.int64)
+    sample = {"label": labels, "event_id": torch.as_tensor(event_ids)}
+    expected = np.asarray([9.0, 2.0, 3.0, 8.0, 7.0])
+    path = tmp_path / "weights.npz"
+    np.savez_compressed(
+        path,
+        weights=expected,
+        event_id=event_ids,
+        weight_scope=np.asarray("all_events"),
+    )
+
+    weights, metadata = load_generator_weights(
+        str(path), labels, qcd_label=1, sample=sample)
+    assert weights.tolist() == expected.tolist()
+    assert metadata["weight_scope"] == "all_events"
+    assert metadata["alignment_verified"] is True
+    assert metadata["classes"][0]["sum"] == pytest.approx(9.0)
+    assert metadata["classes"][3]["sum"] == pytest.approx(7.0)
+
+    with pytest.raises(ValueError, match="conflicts"):
+        load_generator_weights(
+            str(path), labels, qcd_label=1, sample=sample,
+            weight_scope="single_label")
 
 
 def test_ae_generator_only_weights_preserve_ratios_without_class_balance():

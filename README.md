@@ -30,10 +30,12 @@ no ramp. Weight estimation uses fixed-width bins in a training-fitted scaled
 separately in each class before restoring equal class mass. The AE weighting
 is the all-class, generator-only update described above.
 
-Generator weights are loaded from `weight_train.pt`/`weight_test.pt`. The AE
-uses those physics weights directly across the full all-class sample (non-QCD
-rows have unit generator weight). NURD training separately combines generator
-weights with class and nuisance-stratum balancing through
+Generator/physics weights are loaded from `.pt` or `.npz` payloads. New
+production payloads declare `weight_scope=all_events`, carry the composite
+event ID, and are applied to every background row only after exact alignment
+with the converted sample. Bare legacy tensors keep their historical QCD-only
+meaning. The AE uses the physics weights directly across the full all-class
+sample. NURD training separately combines them with class and nuisance-stratum balancing through
 `utils/hlt_weights.py`; those NURD effective weights are used consistently by
 classification, SupCon, critic training, and the encoder information loss.
 

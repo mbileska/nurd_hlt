@@ -26,6 +26,8 @@ WEIGHT_KEYS = (
     "event_weights", "event_weight",
 )
 EVENT_ID_KEYS = ("eventid", "event_id", "eventids", "event_ids")
+WEIGHT_SCOPE_KEYS = ("weight_scope", "scope")
+WEIGHT_SCOPES = {"auto", "all_events", "single_label"}
 
 
 def tensor_sha256(value) -> str:
@@ -113,18 +115,69 @@ def _as_float_vector(value) -> torch.Tensor:
     return torch.as_tensor(value, dtype=torch.float64).detach().cpu().reshape(-1)
 
 
+def _load_weight_payload(path):
+    """Load a torch payload or a non-pickled NumPy NPZ mapping."""
+    path = Path(path)
+    if path.suffix.lower() == ".npz":
+        with np.load(path, allow_pickle=False) as archive:
+            return {key: archive[key] for key in archive.files}
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def _scalar_text(value) -> Optional[str]:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.numel() != 1:
+            raise ValueError("Weight-scope metadata must be scalar.")
+        value = value.detach().cpu().reshape(()).item()
+    elif isinstance(value, np.ndarray):
+        if value.size != 1:
+            raise ValueError("Weight-scope metadata must be scalar.")
+        value = value.reshape(()).item()
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    return str(value)
+
+
+def _resolve_weight_scope(payload, requested_scope: str) -> Tuple[str, Optional[str]]:
+    if requested_scope not in WEIGHT_SCOPES:
+        raise ValueError(
+            f"weight_scope must be one of {sorted(WEIGHT_SCOPES)}, got "
+            f"{requested_scope!r}.")
+    declared_scope = None
+    if isinstance(payload, Mapping):
+        declared, _ = _find_mapping_value(payload, WEIGHT_SCOPE_KEYS)
+        declared_scope = _scalar_text(declared)
+        if declared_scope == "all":
+            declared_scope = "all_events"
+        if declared_scope not in {None, "all_events", "single_label"}:
+            raise ValueError(f"Unsupported declared weight scope {declared_scope!r}.")
+    if requested_scope == "auto":
+        # Bare legacy tensors were defined as QCD-only. New production payloads
+        # explicitly declare all_events, so old campaigns retain their meaning.
+        return declared_scope or "single_label", declared_scope
+    if declared_scope is not None and declared_scope != requested_scope:
+        raise ValueError(
+            f"Requested weight scope {requested_scope!r} conflicts with payload "
+            f"scope {declared_scope!r}.")
+    return requested_scope, declared_scope
+
+
 def load_generator_weights(
     path: Optional[str],
     labels: torch.Tensor,
     qcd_label: int = 1,
     max_events: int = -1,
     sample: Optional[Mapping] = None,
+    weight_scope: str = "auto",
 ) -> Tuple[torch.Tensor, Dict[str, object]]:
     """Load and validate per-event physics weights.
 
-    MEquiNNa weight files describe the QCD component.  Non-QCD events are
-    intentionally assigned unit physics weight, irrespective of any unused
-    values in the file.
+    New production mappings declare ``weight_scope=all_events`` and apply the
+    aligned vector to every class. Bare legacy tensors remain ``single_label``
+    in auto mode: only ``qcd_label`` receives their values and other rows stay
+    at unit weight. Event IDs, when present, must match the data exactly.
     """
     labels = torch.as_tensor(labels).long().reshape(-1).cpu()
     n_events = labels.numel()
@@ -133,8 +186,12 @@ def load_generator_weights(
         source = "unit"
         raw_checksum = tensor_sha256(weights)
         alignment_verified = True
+        effective_scope = "unit"
+        declared_scope = None
     else:
-        payload = torch.load(path, map_location="cpu", weights_only=False)
+        payload = _load_weight_payload(path)
+        effective_scope, declared_scope = _resolve_weight_scope(
+            payload, weight_scope)
         payload_ids = None
         if isinstance(payload, Mapping):
             payload_ids, _ = _find_mapping_value(payload, EVENT_ID_KEYS)
@@ -173,9 +230,12 @@ def load_generator_weights(
         else:
             alignment_verified = False
         raw_checksum = tensor_sha256(loaded)
-        weights = torch.ones(n_events, dtype=torch.float64)
-        qcd_mask = labels == int(qcd_label)
-        weights[qcd_mask] = loaded[qcd_mask]
+        if effective_scope == "all_events":
+            weights = loaded.clone()
+        else:
+            weights = torch.ones(n_events, dtype=torch.float64)
+            qcd_mask = labels == int(qcd_label)
+            weights[qcd_mask] = loaded[qcd_mask]
         source = str(Path(path))
 
     if not torch.isfinite(weights).all():
@@ -187,9 +247,20 @@ def load_generator_weights(
 
     qcd_mask = labels == int(qcd_label)
     qcd = weights[qcd_mask]
+    class_summaries = {}
+    for label in sorted(int(value) for value in labels.unique().tolist()):
+        selected = weights[labels == label]
+        class_summaries[label] = {
+            "events": int(selected.numel()),
+            "sum": float(selected.sum()),
+            "min": float(selected.min()) if selected.numel() else None,
+            "max": float(selected.max()) if selected.numel() else None,
+        }
     metadata = {
         "source": source,
         "n_events": int(n_events),
+        "weight_scope": effective_scope,
+        "declared_weight_scope": declared_scope,
         "qcd_label": int(qcd_label),
         "qcd_events": int(qcd_mask.sum()),
         "qcd_sum": float(qcd.sum()) if qcd.numel() else 0.0,
@@ -197,6 +268,7 @@ def load_generator_weights(
         "qcd_max": float(qcd.max()) if qcd.numel() else None,
         "raw_weight_sha256": raw_checksum,
         "effective_physics_weight_sha256": tensor_sha256(weights),
+        "classes": class_summaries,
         "alignment_verified": alignment_verified,
         "alignment": (
             "event_ids" if alignment_verified and path is not None

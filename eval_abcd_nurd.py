@@ -1197,9 +1197,9 @@ if __name__ == "__main__":
     parser.add_argument("--signal_pt",    default=None,
                         help="Optional signal .pt file")
     parser.add_argument("--gen_weight_path", default=None,
-                        help="Path to per-event gen weights .pt (e.g. weight_test.pt). "
+                        help="Path to aligned per-event physics weights (.pt or .npz). "
                              "Must have same number of entries as --test_pt. "
-                             "Applied to QCD events only for weighted ABCD counts.")
+                             "New all-events payloads must declare their scope.")
     parser.add_argument("--outdir",       default="outputs_abcd")
     parser.add_argument("--min_A",        type=int, default=50)
     parser.add_argument("--min_B",        type=int, default=50)

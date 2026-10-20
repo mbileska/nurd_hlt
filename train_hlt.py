@@ -161,6 +161,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--data", required=True)
     parser.add_argument("--ae_ckpt", required=True)
     parser.add_argument("--gen_weight_path", "--gen_weights", dest="gen_weight_path")
+    parser.add_argument(
+        "--generator_weight_scope",
+        choices=("auto", "all_events", "single_label"),
+        default="auto",
+        help=("auto honors explicit payload scope and treats bare legacy tensors "
+              "as single-label weights."),
+    )
     parser.add_argument("--val_split", type=float, default=0.1)
     parser.add_argument("--balance_strata", type=int, default=20,
                         help="Training-only histogram strata used to estimate weights; "
@@ -553,6 +560,7 @@ def main(argv=None):
         exclude_labels=args.exclude_labels,
         gen_weight_path=args.gen_weight_path,
         qcd_label=args.qcd_label,
+        generator_weight_scope=args.generator_weight_scope,
         ae_scaler=ae_checkpoint["ae_scaler"],
         balance_strata=args.balance_strata,
         balance_binning=args.balance_binning,

@@ -103,6 +103,7 @@ def build_hlt_datasets(
     exclude_labels: Optional[Sequence[int]] = None,
     gen_weight_path: Optional[str] = None,
     qcd_label: int = 1,
+    generator_weight_scope: str = "auto",
     ae_scaler: Optional[Mapping[str, torch.Tensor]] = None,
     balance_strata: int = 20,
     balance_binning: str = "log_fixed",
@@ -137,6 +138,7 @@ def build_hlt_datasets(
         qcd_label=qcd_label,
         max_events=max_events,
         sample=raw,
+        weight_scope=generator_weight_scope,
     )
     del raw
 
