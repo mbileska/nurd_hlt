@@ -14,18 +14,11 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
-import sys
 from typing import Dict, Mapping, Sequence
 
 import numpy as np
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-if str(REPOSITORY_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPOSITORY_ROOT))
-
-from utils.hlt_data import MANIFEST_FORMAT
-
-
+MANIFEST_FORMAT = "nurd_hlt_numpy_v1"
 PF_SIZE = 400
 OBJECT_SLOTS = {
     "ScoutingPFJet": (0, 10, 0),

@@ -71,7 +71,23 @@ scalar-pT fraction. The validator independently checks finiteness, padding,
 pT ordering, PDG IDs, split uniqueness, category coverage, and exact
 data/weight event-ID alignment.
 
-### 1. Prepare the converter on login.hep.wisc.edu
+### 1. Copy the standalone converter from Della to login.hep.wisc.edu
+
+Run on Della after pulling this branch:
+
+```bash
+cd /home/mb7126/nurd_hlt
+git switch dismembered-nurd-implementation
+git pull --ff-only origin dismembered-nurd-implementation
+
+export FALCON=mbileska@login.hep.wisc.edu
+export REMOTE_WORK=/afs/hep.wisc.edu/user/mbileska/axo_sample_work/CMSSW_16_1_0_pre4/src/DPGAnalysis/L1TNanoAOD/test/axoScoutingNano
+
+scp scripts/convert_background_nanoaod.py \
+  "$FALCON:$REMOTE_WORK/convert_background_nanoaod.py"
+```
+
+Then log into Falcon and prepare its existing CMSSW area:
 
 ```bash
 source /cvmfs/cms.cern.ch/cmsset_default.sh
@@ -80,15 +96,7 @@ cd /afs/hep.wisc.edu/user/mbileska/axo_sample_work/CMSSW_16_1_0_pre4/src
 cmsenv
 export PYTHONNOUSERSITE=1
 
-export NURD_CODE=/afs/hep.wisc.edu/user/mbileska/nurd_hlt
-if [[ ! -d "$NURD_CODE/.git" ]]; then
-  git clone --branch dismembered-nurd-implementation \
-    git@github.com:mbileska/nurd_hlt.git "$NURD_CODE"
-fi
-cd "$NURD_CODE"
-git switch dismembered-nurd-implementation
-git pull --ff-only origin dismembered-nurd-implementation
-
+cd DPGAnalysis/L1TNanoAOD/test/axoScoutingNano
 python3 -c 'import numpy, awkward, uproot; print("conversion environment OK")'
 ```
 
@@ -100,16 +108,12 @@ export FILELIST="$CMSSW_WORK/production_filelists/all.txt"
 export FULL_WEIGHTS="$CMSSW_WORK/production_reports/background_physics_weights.npz"
 export SMOKE_OUT=/hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_smoke_qcd_v1
 
-python3 scripts/convert_background_nanoaod.py @"$FILELIST" \
+python3 convert_background_nanoaod.py @"$FILELIST" \
   --weights "$FULL_WEIGHTS" \
   --output-dir "$SMOKE_OUT" \
   --max-files 3 --seed 42 --test-fraction 0.2
 
-python3 scripts/validate_converted_backgrounds.py \
-  --input-dir "$SMOKE_OUT" \
-  --expected-files 3 \
-  --expected-categories 0-5 \
-  --allow-partial-classes
+ls -lh "$SMOKE_OUT/conversion_report.json"
 ```
 
 The smoke sample is deliberately a prefix of the canonical file list so its
@@ -117,8 +121,8 @@ rows still align with the prefix of the full weight payload.
 
 ### 3. Convert and validate all 2,582,935 events in tmux
 
-Start a persistent shell with `tmux new -s train3m_convert`, repeat the setup
-in step 1 inside it, and run:
+Start a persistent shell with `tmux new -s train3m_convert`, repeat the Falcon
+CMSSW setup in step 1 inside it, and run from `axoScoutingNano`:
 
 ```bash
 export CMSSW_WORK=/afs/hep.wisc.edu/user/mbileska/axo_sample_work/CMSSW_16_1_0_pre4/src/DPGAnalysis/L1TNanoAOD/test/axoScoutingNano
@@ -127,7 +131,7 @@ export FULL_WEIGHTS="$CMSSW_WORK/production_reports/background_physics_weights.n
 export CONVERTED=/hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_v1
 set -o pipefail
 
-time python3 scripts/convert_background_nanoaod.py @"$FILELIST" \
+time python3 convert_background_nanoaod.py @"$FILELIST" \
   --weights "$FULL_WEIGHTS" \
   --output-dir "$CONVERTED" \
   --expected-files 2008 \
@@ -135,16 +139,14 @@ time python3 scripts/convert_background_nanoaod.py @"$FILELIST" \
   --seed 42 --test-fraction 0.2 \
   2>&1 | tee "$CMSSW_WORK/production_reports/nurd_tensor_conversion.log"
 
-python3 scripts/validate_converted_backgrounds.py \
-  --input-dir "$CONVERTED" \
-  --full-weights "$FULL_WEIGHTS" \
-  --expected-files 2008 \
-  --expected-events 2582935 \
-  --expected-categories 0-23,27-36 \
-  2>&1 | tee "$CMSSW_WORK/production_reports/nurd_tensor_validation.log"
-
+ls -lh "$CONVERTED/conversion_report.json"
 du -sh "$CONVERTED"
 ```
+
+The full PyTorch-based validator is run on Della after the copy, where the
+NURD environment and repository exist. The standalone converter itself still
+checks every ROOT/weight event ID and every converted chunk before marking the
+conversion complete.
 
 The converter refuses to overwrite a non-empty destination. If an interrupted
 attempt leaves `.conversion_incomplete`, move that whole directory aside and
