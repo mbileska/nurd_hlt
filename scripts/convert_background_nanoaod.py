@@ -2,18 +2,23 @@
 """Convert the validated background NanoAOD campaign into NURD tensors.
 
 The converter is intentionally streaming and writes NumPy ``open_memmap``
-arrays described by a small JSON manifest.  It therefore never materializes
-the roughly 30 GB production tensor set in RAM and does not create a second
-temporary copy.  Event IDs from the ROOT files are checked row-for-row against
-the all-background physics-weight payload before any row is accepted.
+arrays described by a small JSON manifest. It therefore never materializes
+the roughly 30 GB production tensor set in RAM. Filesystems such as HDFS that
+do not support memory mapping can be used as the final destination by staging
+the arrays on worker-local disk first. Event IDs from the ROOT files are
+checked row-for-row against the all-background physics-weight payload before
+any row is accepted.
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
 import json
 from pathlib import Path
+import shutil
+import tempfile
 from typing import Dict, Mapping, Sequence
 
 import numpy as np
@@ -230,6 +235,27 @@ def _flush_arrays(arrays):
         value.flush()
 
 
+def _publish_directory(source: Path, destination: Path):
+    """Copy completed staged files to a non-mmap destination safely."""
+    source = Path(source)
+    destination = Path(destination)
+    if destination.exists() and any(destination.iterdir()):
+        raise FileExistsError(f"Refusing to overwrite non-empty {destination}")
+    destination.mkdir(parents=True, exist_ok=True)
+    incomplete = destination / ".conversion_incomplete"
+    incomplete.write_text("publishing\n", encoding="utf-8")
+    for path in sorted(source.rglob("*")):
+        relative = path.relative_to(source)
+        target = destination / relative
+        if path.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("rb") as source_handle, target.open("wb") as target_handle:
+            shutil.copyfileobj(source_handle, target_handle, length=8 * 1024 * 1024)
+    incomplete.unlink()
+
+
 def _load_weights(path: Path):
     with np.load(path, allow_pickle=False) as archive:
         payload = {key: archive[key] for key in archive.files}
@@ -267,6 +293,10 @@ def main(argv=None):
     parser.add_argument("inputs", nargs="+", help="ROOT files or @filelist")
     parser.add_argument("--weights", required=True, type=Path)
     parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument(
+        "--staging-dir", type=Path,
+        help=("Local filesystem used for memory-mapped construction before "
+              "publishing to output-dir (required when output-dir is HDFS)."))
     parser.add_argument("--test-fraction", type=float, default=0.2)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--step-size", default="50 MB")
@@ -295,10 +325,23 @@ def main(argv=None):
         if not Path(path).is_file():
             raise FileNotFoundError(path)
 
-    output_dir = args.output_dir.expanduser().resolve()
-    if output_dir.exists() and any(output_dir.iterdir()):
-        raise FileExistsError(f"Refusing to overwrite non-empty {output_dir}")
-    output_dir.mkdir(parents=True, exist_ok=True)
+    final_output_dir = args.output_dir.expanduser().resolve()
+    if final_output_dir.exists() and any(final_output_dir.iterdir()):
+        raise FileExistsError(
+            f"Refusing to overwrite non-empty {final_output_dir}")
+
+    staging_dir = None
+    if args.staging_dir is not None:
+        staging_root = args.staging_dir.expanduser().resolve()
+        staging_root.mkdir(parents=True, exist_ok=True)
+        staging_dir = Path(tempfile.mkdtemp(
+            prefix="nurd_tensor_staging_", dir=staging_root))
+        atexit.register(shutil.rmtree, staging_dir, ignore_errors=True)
+        output_dir = staging_dir
+        print(f"Staging memory-mapped arrays in {staging_dir}", flush=True)
+    else:
+        output_dir = final_output_dir
+        output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / ".conversion_incomplete").write_text("incomplete\n")
 
     payload, weight_ids_full, samples_full, categories_full = _load_weights(
@@ -439,8 +482,8 @@ def main(argv=None):
                 "10 PF jets, 4 vertex muons, 4 electrons, 4 photons, 1 MET; "
                 "each [pt,eta,phi,type]"),
         }
-        manifests[name] = str(_write_manifest(
-            output_dir / name, split_arrays[name], split_metadata))
+        _write_manifest(output_dir / name, split_arrays[name], split_metadata)
+        manifests[name] = f"{name}/sample.json"
         split_reports[name] = {
             "events": int(mask.sum()),
             "labels": {
@@ -479,6 +522,11 @@ def main(argv=None):
     (output_dir / "conversion_report.json").write_text(
         json.dumps(report, indent=2), encoding="utf-8")
     (output_dir / ".conversion_incomplete").unlink()
+    if staging_dir is not None:
+        print(f"Publishing completed arrays to {final_output_dir}", flush=True)
+        _publish_directory(staging_dir, final_output_dir)
+        shutil.rmtree(staging_dir)
+        atexit.unregister(shutil.rmtree)
     print(json.dumps(report, indent=2), flush=True)
 
 

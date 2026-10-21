@@ -106,11 +106,13 @@ python3 -c 'import numpy, awkward, uproot; print("conversion environment OK")'
 export CMSSW_WORK=/afs/hep.wisc.edu/user/mbileska/axo_sample_work/CMSSW_16_1_0_pre4/src/DPGAnalysis/L1TNanoAOD/test/axoScoutingNano
 export FILELIST="$CMSSW_WORK/production_filelists/all.txt"
 export FULL_WEIGHTS="$CMSSW_WORK/production_reports/background_physics_weights.npz"
-export SMOKE_OUT=/hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_smoke_qcd_v1
+export SMOKE_OUT=/hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_smoke_qcd_v2
+export SMOKE_STAGE=/scratch/mbileska/nurd_tensor_staging
 
 python3 convert_background_nanoaod.py @"$FILELIST" \
   --weights "$FULL_WEIGHTS" \
   --output-dir "$SMOKE_OUT" \
+  --staging-dir "$SMOKE_STAGE" \
   --max-files 3 --seed 42 --test-fraction 0.2
 
 ls -lh "$SMOKE_OUT/conversion_report.json"
@@ -141,6 +143,7 @@ cd DPGAnalysis/L1TNanoAOD/test/axoScoutingNano
 python3 convert_background_nanoaod.py @production_filelists/all.txt \
   --weights production_reports/background_physics_weights.npz \
   --output-dir /hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_v1 \
+  --staging-dir "${_CONDOR_SCRATCH_DIR:?HTCondor scratch directory is not set}" \
   --expected-files 2008 --expected-events 2582935 \
   --seed 42 --test-fraction 0.2
 EOF
@@ -155,7 +158,7 @@ error = $CMSSW_WORK/production_reports/nurd_tensor_conversion.err
 log = $CMSSW_WORK/production_reports/nurd_tensor_conversion.condor.log
 request_cpus = 1
 request_memory = 8000MB
-request_disk = 2GB
+request_disk = 45GB
 should_transfer_files = NO
 queue
 EOF

@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 from scripts.convert_background_nanoaod import (
+    _publish_directory,
     labels_from_samples,
     split_weight_payload,
     stratified_test_mask,
@@ -40,3 +41,20 @@ def test_weight_split_slices_all_event_fields_and_keeps_metadata():
     assert selected["weights"].shape == (3,)
     assert selected["luminosity_pb_inverse"].shape == ()
     assert selected["weight_scope"].item() == "all_events"
+
+
+def test_staged_directory_is_published_with_completion_marker_removed(tmp_path):
+    source = tmp_path / "stage"
+    destination = tmp_path / "hdfs"
+    (source / "train").mkdir(parents=True)
+    (source / "train" / "sample.json").write_text("{}", encoding="utf-8")
+    np.save(source / "train" / "label.npy", np.asarray([1, 2, 3]))
+
+    _publish_directory(source, destination)
+
+    assert (destination / "train" / "sample.json").read_text() == "{}"
+    assert np.array_equal(
+        np.load(destination / "train" / "label.npy"), [1, 2, 3])
+    assert not (destination / ".conversion_incomplete").exists()
+    with pytest.raises(FileExistsError, match="non-empty"):
+        _publish_directory(source, destination)
