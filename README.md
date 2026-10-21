@@ -119,28 +119,59 @@ ls -lh "$SMOKE_OUT/conversion_report.json"
 The smoke sample is deliberately a prefix of the canonical file list so its
 rows still align with the prefix of the full weight payload.
 
-### 3. Convert and validate all 2,582,935 events in tmux
+### 3. Convert all 2,582,935 events through HTCondor
 
-Start a persistent shell with `tmux new -s train3m_convert`, repeat the Falcon
-CMSSW setup in step 1 inside it, and run from `axoScoutingNano`:
+The full conversion is too intensive for a Falcon login node. From
+`axoScoutingNano`, create a self-contained batch wrapper and submit file:
 
 ```bash
 export CMSSW_WORK=/afs/hep.wisc.edu/user/mbileska/axo_sample_work/CMSSW_16_1_0_pre4/src/DPGAnalysis/L1TNanoAOD/test/axoScoutingNano
-export FILELIST="$CMSSW_WORK/production_filelists/all.txt"
-export FULL_WEIGHTS="$CMSSW_WORK/production_reports/background_physics_weights.npz"
-export CONVERTED=/hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_v1
-set -o pipefail
 
-time python3 convert_background_nanoaod.py @"$FILELIST" \
-  --weights "$FULL_WEIGHTS" \
-  --output-dir "$CONVERTED" \
-  --expected-files 2008 \
-  --expected-events 2582935 \
-  --seed 42 --test-fraction 0.2 \
-  2>&1 | tee "$CMSSW_WORK/production_reports/nurd_tensor_conversion.log"
+cat > "$CMSSW_WORK/run_nurd_tensor_conversion.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+unset PYTHONHOME PYTHONPATH
+source /cvmfs/cms.cern.ch/cmsset_default.sh
+export SCRAM_ARCH=el9_amd64_gcc14
+cd /afs/hep.wisc.edu/user/mbileska/axo_sample_work/CMSSW_16_1_0_pre4/src
+eval "$(scram runtime -sh)"
+export PYTHONNOUSERSITE=1
+cd DPGAnalysis/L1TNanoAOD/test/axoScoutingNano
 
-ls -lh "$CONVERTED/conversion_report.json"
-du -sh "$CONVERTED"
+python3 convert_background_nanoaod.py @production_filelists/all.txt \
+  --weights production_reports/background_physics_weights.npz \
+  --output-dir /hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_v1 \
+  --expected-files 2008 --expected-events 2582935 \
+  --seed 42 --test-fraction 0.2
+EOF
+chmod 700 "$CMSSW_WORK/run_nurd_tensor_conversion.sh"
+
+cat > "$CMSSW_WORK/nurd_tensor_conversion.sub" <<EOF
+universe = vanilla
+executable = $CMSSW_WORK/run_nurd_tensor_conversion.sh
+initialdir = $CMSSW_WORK
+output = $CMSSW_WORK/production_reports/nurd_tensor_conversion.out
+error = $CMSSW_WORK/production_reports/nurd_tensor_conversion.err
+log = $CMSSW_WORK/production_reports/nurd_tensor_conversion.condor.log
+request_cpus = 1
+request_memory = 8000MB
+request_disk = 2GB
+should_transfer_files = NO
+queue
+EOF
+
+test ! -e /hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_v1
+condor_submit "$CMSSW_WORK/nurd_tensor_conversion.sub"
+```
+
+Monitor it with `condor_q "$USER"`. After it leaves the queue, require both a
+zero exit code in the Condor log and a final report:
+
+```bash
+grep -E "return value|Job terminated" production_reports/nurd_tensor_conversion.condor.log
+tail -50 production_reports/nurd_tensor_conversion.err
+ls -lh /hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_v1/conversion_report.json
+du -sh /hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_v1
 ```
 
 The full PyTorch-based validator is run on Della after the copy, where the
