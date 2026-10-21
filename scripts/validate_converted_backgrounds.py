@@ -71,6 +71,9 @@ def validate_split(name: str, sample_path: Path, weight_path: Path):
         "event ID shape": tuple(sample["event_id"].shape) == (n_events, 4),
         "PF values finite": _finite_in_chunks(sample["pf"]),
         "object values finite": _finite_in_chunks(sample["obj"]),
+        "event ID sample column agrees": torch.equal(
+            sample["event_id"][:, 0].long(),
+            sample["background_sample"].long()),
         "labels follow sample map": torch.equal(
             sample["label"].long(),
             LABEL_BY_SAMPLE[sample["background_sample"].long()]),
@@ -78,6 +81,16 @@ def validate_split(name: str, sample_path: Path, weight_path: Path):
             sample["pf"],
             lambda value: bool(torch.all(
                 (value[:, :, 5] == 0) | (value[:, :, 5] == 1)))),
+        "PF candidates are pT ordered": _all_in_chunks(
+            sample["pf"],
+            lambda value: bool(torch.all(
+                value[:, :-1, 0] >= value[:, 1:, 0]))),
+        "PF pdgId is supported": _all_in_chunks(
+            sample["pf"],
+            lambda value: bool(torch.all(torch.isin(
+                value[:, :, 6].long(),
+                torch.tensor(
+                    [-211, -13, -11, 0, 1, 2, 11, 13, 22, 130, 211]))))),
         "PF padding is zero": _all_in_chunks(
             sample["pf"],
             lambda value: bool(torch.all(
@@ -86,6 +99,12 @@ def validate_split(name: str, sample_path: Path, weight_path: Path):
             sample["obj"],
             lambda value: bool(torch.all(
                 value[value[:, :, 0] <= 0] == 0))),
+        "object collections are pT ordered": _all_in_chunks(
+            sample["obj"],
+            lambda value: all(bool(torch.all(
+                value[:, start:start + size - 1, 0]
+                >= value[:, start + 1:start + size, 0]))
+                for start, size in ((0, 10), (10, 4), (14, 4), (18, 4)))),
     }
     weights, weight_metadata = load_generator_weights(
         str(weight_path), sample["label"], sample=sample,

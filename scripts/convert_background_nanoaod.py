@@ -187,7 +187,13 @@ def _convert_pf(ak, arrays):
     pf[:, :, 6] = raw_pdg.astype(np.float32)
     pf[~active] = 0.0
     np.nan_to_num(pf, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
-    return pf, counts, int(invalid.sum())
+    total_scalar_pt = ak.to_numpy(
+        ak.sum(arrays["ScoutingParticle_pt"], axis=1)
+    ).astype(np.float64, copy=False)
+    np.nan_to_num(
+        total_scalar_pt, copy=False, nan=0.0, posinf=0.0, neginf=0.0)
+    retained_scalar_pt = pf[:, :, 0].sum(axis=1, dtype=np.float64)
+    return pf, counts, int(invalid.sum()), total_scalar_pt, retained_scalar_pt
 
 
 def _convert_objects(ak, arrays):
@@ -334,6 +340,8 @@ def main(argv=None):
         "pf_events_truncated": 0,
         "pf_candidates_dropped": 0,
         "pf_max_candidates": 0,
+        "pf_total_scalar_pt": 0.0,
+        "pf_retained_scalar_pt": 0.0,
         "invalid_active_pdg_ids_replaced": 0,
         "object_events_truncated": {key: 0 for key in OBJECT_SLOTS},
         "object_candidates_dropped": {key: 0 for key in OBJECT_SLOTS},
@@ -363,7 +371,8 @@ def main(argv=None):
         if not np.array_equal(root_categories, categories[offset:stop]):
             raise ValueError(f"Background_category mismatch in rows {offset}:{stop}.")
 
-        pf, pf_counts, invalid_pdg = _convert_pf(ak, arrays)
+        (pf, pf_counts, invalid_pdg, pf_total_scalar_pt,
+         pf_retained_scalar_pt) = _convert_pf(ak, arrays)
         obj, object_counts = _convert_objects(ak, arrays)
         labels = labels_from_samples(root_samples)
         if not np.isfinite(pf).all() or not np.isfinite(obj).all():
@@ -373,6 +382,8 @@ def main(argv=None):
         stats["pf_candidates_dropped"] += int(np.maximum(pf_counts - PF_SIZE, 0).sum())
         stats["pf_max_candidates"] = max(stats["pf_max_candidates"], int(pf_counts.max()))
         stats["invalid_active_pdg_ids_replaced"] += invalid_pdg
+        stats["pf_total_scalar_pt"] += float(pf_total_scalar_pt.sum())
+        stats["pf_retained_scalar_pt"] += float(pf_retained_scalar_pt.sum())
         for prefix, counts in object_counts.items():
             size = OBJECT_SLOTS[prefix][1]
             stats["object_events_truncated"][prefix] += int((counts > size).sum())
@@ -402,6 +413,15 @@ def main(argv=None):
 
     if offset != n_events:
         raise ValueError(f"ROOT iteration produced {offset} events, expected {n_events}.")
+    stats["pf_retained_scalar_pt_fraction"] = (
+        stats["pf_retained_scalar_pt"] / stats["pf_total_scalar_pt"]
+        if stats["pf_total_scalar_pt"] > 0.0 else None)
+    stats["pf_events_truncated_fraction"] = (
+        stats["pf_events_truncated"] / n_events if n_events else None)
+    stats["object_events_truncated_fraction"] = {
+        key: value / n_events if n_events else None
+        for key, value in stats["object_events_truncated"].items()
+    }
     for name, arrays in split_arrays.items():
         expected = int(split_masks[name].sum())
         if positions[name] != expected:

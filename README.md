@@ -66,6 +66,11 @@ The data contract is:
   already performed by the CMSSW exporter; conversion never recomputes or
   class-balances it.
 
+The conversion report records multiplicity truncation and the retained
+scalar-pT fraction. The validator independently checks finiteness, padding,
+pT ordering, PDG IDs, split uniqueness, category coverage, and exact
+data/weight event-ID alignment.
+
 ### 1. Prepare the converter on login.hep.wisc.edu
 
 ```bash
