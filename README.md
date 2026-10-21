@@ -165,8 +165,8 @@ git pull --ff-only origin dismembered-nurd-implementation
 
 export DATA_DIR=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/data/train3M_v1
 mkdir -p "$DATA_DIR"
-rsync -ahP --partial \
-  mbileska@login.hep.wisc.edu:/hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_v1/ \
+scp -rp \
+  mbileska@login.hep.wisc.edu:/hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_v1/. \
   "$DATA_DIR/"
 
 python scripts/validate_converted_backgrounds.py \
