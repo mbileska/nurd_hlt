@@ -1,7 +1,9 @@
 matplotlib
 numpy
+awkward
 pytest
 scikit-learn
 scipy
 torch
+uproot
 wandb

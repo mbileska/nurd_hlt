@@ -4,8 +4,10 @@ import torch
 
 from scripts.create_diagnostic_subset import (
     extract_weight_vector,
+    save_weight_payload,
     stratified_subset_indices,
     subset_event_mapping,
+    subset_weight_payload,
 )
 
 
@@ -50,3 +52,19 @@ def test_extract_weight_vector_accepts_standard_mapping_and_rejects_ambiguity():
                        torch.tensor([1.0, 2.0], dtype=torch.float64))
     with pytest.raises(ValueError, match="ambiguous"):
         extract_weight_vector({"first": expected, "second": expected})
+
+
+def test_npz_diagnostic_weights_preserve_scope_and_event_ids(tmp_path):
+    event_ids = np.arange(32, dtype=np.int64).reshape(8, 4)
+    payload = {
+        "weights": np.linspace(1.0, 2.0, 8),
+        "event_id": event_ids,
+        "weight_scope": np.asarray("all_events"),
+    }
+    indices = torch.tensor([0, 3, 7])
+    selected = subset_weight_payload(payload, indices, n_events=8)
+    destination = tmp_path / "subset.npz"
+    save_weight_payload(selected, destination)
+    with np.load(destination, allow_pickle=False) as archive:
+        assert archive["weight_scope"].item() == "all_events"
+        assert np.array_equal(archive["event_id"], event_ids[[0, 3, 7]])

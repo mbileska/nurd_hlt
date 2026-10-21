@@ -115,13 +115,18 @@ def _as_float_vector(value) -> torch.Tensor:
     return torch.as_tensor(value, dtype=torch.float64).detach().cpu().reshape(-1)
 
 
-def _load_weight_payload(path):
+def load_weight_payload(path):
     """Load a torch payload or a non-pickled NumPy NPZ mapping."""
     path = Path(path)
     if path.suffix.lower() == ".npz":
         with np.load(path, allow_pickle=False) as archive:
             return {key: archive[key] for key in archive.files}
     return torch.load(path, map_location="cpu", weights_only=False)
+
+
+# Kept as an alias for older internal callers while scripts use the public
+# spelling when they need to preserve complete payload metadata.
+_load_weight_payload = load_weight_payload
 
 
 def _scalar_text(value) -> Optional[str]:
@@ -189,7 +194,7 @@ def load_generator_weights(
         effective_scope = "unit"
         declared_scope = None
     else:
-        payload = _load_weight_payload(path)
+        payload = load_weight_payload(path)
         effective_scope, declared_scope = _resolve_weight_scope(
             payload, weight_scope)
         payload_ids = None

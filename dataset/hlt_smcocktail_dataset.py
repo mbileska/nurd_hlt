@@ -12,6 +12,7 @@ from typing import Dict, Mapping, Optional, Sequence
 import torch
 from torch.utils.data import Dataset
 
+from utils.hlt_data import load_hlt_sample
 from utils.hlt_weights import (
     apply_class_balance_factors,
     apply_joint_balance,
@@ -116,7 +117,7 @@ def build_hlt_datasets(
     ``preprocessing`` come from the training split and are saved in the model
     checkpoint for exact evaluation reuse.
     """
-    raw = torch.load(pt_path, map_location="cpu", weights_only=False)
+    raw = load_hlt_sample(pt_path)
     for key in ("pf", "obj", "label"):
         if key not in raw:
             raise KeyError(f"Training file is missing required key {key!r}.")

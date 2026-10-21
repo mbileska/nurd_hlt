@@ -40,6 +40,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from models.hlt_autoencoder import HLTAutoencoder  # noqa: E402
 from models.hlt_con import HLTContrastiveModel  # noqa: E402
+from utils.hlt_data import load_hlt_sample  # noqa: E402
 from utils.hlt_weights import (  # noqa: E402
     load_generator_weights,
     sample_signature,
@@ -107,11 +108,8 @@ class DisplayEvent:
 
 
 def load_torch(path: Path) -> Any:
-    """Memory-map large samples when supported by the installed PyTorch."""
-    try:
-        return torch.load(path, map_location="cpu", mmap=True, weights_only=False)
-    except (TypeError, RuntimeError):
-        return torch.load(path, map_location="cpu", weights_only=False)
+    """Load a legacy PyTorch sample or a memory-mapped NumPy manifest."""
+    return load_hlt_sample(path)
 
 
 def require_sample(payload: Any, path: Path) -> Mapping[str, Any]:

@@ -39,6 +39,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from dataset.hlt_smcocktail_dataset import build_hlt_datasets
 from models.hlt_autoencoder import HLTAutoencoder
 from models.hlt_con import HLTCritic, HLTContrastiveModel
+from utils.hlt_data import load_hlt_sample
 from utils.hlt_density_ratio import (
     critic_context_only_accuracy,
     density_ratio_critic_loss,
@@ -1106,7 +1107,7 @@ def main(argv=None):
         if not path.is_file():
             raise FileNotFoundError(path)
 
-    raw = torch.load(data_path, map_location="cpu", weights_only=False)
+    raw = load_hlt_sample(data_path)
     labels_original = raw["label"].long().reshape(-1)
     _physics_all, generator_metadata = load_generator_weights(
         str(weight_path), labels_original, qcd_label=args.qcd_label, sample=raw)

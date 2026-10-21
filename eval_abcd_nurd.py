@@ -33,6 +33,7 @@ from matplotlib.lines import Line2D
 
 from models.hlt_con import HLTContrastiveModel
 from models.hlt_autoencoder import HLTAutoencoder
+from utils.hlt_data import load_hlt_sample
 from utils.hlt_weights import file_sha256, load_generator_weights, sample_signature
 
 
@@ -245,7 +246,7 @@ def compute_ae_scores(ae, ae_scaler, pt_path, device, batch_size=4096):
     mu  = ae_scaler["mu"].cpu().numpy()
     std = ae_scaler["std"].cpu().numpy()
 
-    raw = torch.load(pt_path, map_location="cpu")
+    raw = load_hlt_sample(pt_path)
     obj = torch.nan_to_num(
         raw["obj"][:, :, :4].reshape(raw["obj"].shape[0], -1).float(),
         nan=0.0, posinf=0.0, neginf=0.0).numpy()
@@ -266,7 +267,7 @@ def compute_ae_scores(ae, ae_scaler, pt_path, device, batch_size=4096):
 def embed_pf(model, pt_path, device, batch_size=512, return_logits=False):
     """Run NURD encoder on PF candidates; return (latents [N,D], labels [N]).
     If return_logits=True, returns (latents, logits [N,C], labels)."""
-    raw    = torch.load(pt_path, map_location="cpu")
+    raw    = load_hlt_sample(pt_path)
     pf     = torch.nan_to_num(raw["pf"], nan=0.0, posinf=0.0, neginf=0.0)
     labels = raw["label"].numpy()
     N = pf.shape[0]
@@ -389,7 +390,7 @@ def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None,
 
 def load_physics_weights(weight_path, pt_path, qcd_label):
     """Load evaluation weights through the same validated training contract."""
-    raw = torch.load(pt_path, map_location="cpu", weights_only=False)
+    raw = load_hlt_sample(pt_path)
     labels = raw["label"].long().reshape(-1)
     weights, metadata = load_generator_weights(
         weight_path, labels, qcd_label=qcd_label, sample=raw)

@@ -21,7 +21,14 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from utils.hlt_weights import EVENT_ID_KEYS, WEIGHT_KEYS, tensor_sha256
+from utils.hlt_data import load_hlt_sample
+from utils.hlt_weights import (
+    EVENT_ID_KEYS,
+    WEIGHT_KEYS,
+    load_generator_weights,
+    load_weight_payload,
+    tensor_sha256,
+)
 
 
 def extract_weight_vector(payload) -> torch.Tensor:
@@ -100,6 +107,39 @@ def subset_event_mapping(sample: Mapping, indices: torch.Tensor) -> dict:
     return output
 
 
+def subset_weight_payload(payload, indices: torch.Tensor, n_events: int):
+    """Slice every event-aligned field and retain weight-scope metadata."""
+    if not isinstance(payload, Mapping):
+        return torch.as_tensor(payload).reshape(-1)[indices]
+    output = {}
+    numpy_indices = indices.numpy()
+    for key, value in payload.items():
+        if torch.is_tensor(value) and value.ndim and value.shape[0] == n_events:
+            output[key] = value[indices]
+        elif isinstance(value, np.ndarray) and value.ndim and value.shape[0] == n_events:
+            output[key] = value[numpy_indices]
+        else:
+            output[key] = value
+    return output
+
+
+def save_weight_payload(payload, path: Path):
+    if path.suffix.lower() == ".npz":
+        if not isinstance(payload, Mapping):
+            payload = {"weights": torch.as_tensor(payload).numpy()}
+        arrays = {}
+        for key, value in payload.items():
+            if torch.is_tensor(value):
+                value = value.detach().cpu().numpy()
+            arrays[key] = np.asarray(value)
+            if arrays[key].dtype == object:
+                raise TypeError(
+                    f"Cannot safely save object-valued weight field {key!r} to NPZ.")
+        np.savez_compressed(path, **arrays)
+    else:
+        torch.save(payload, path)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="Build a deterministic class-stratified diagnostic sample.")
@@ -122,25 +162,30 @@ def main(argv=None):
         if output.exists():
             raise FileExistsError(f"Refusing to overwrite diagnostic input: {output}")
 
-    sample = torch.load(data_path, map_location="cpu", weights_only=False)
+    sample = load_hlt_sample(data_path)
     if not isinstance(sample, Mapping):
         raise TypeError("The HLT training sample must be a mapping.")
     for key in ("pf", "obj", "label"):
         if key not in sample:
             raise KeyError(f"Training sample is missing required key {key!r}.")
     labels = torch.as_tensor(sample["label"]).long().reshape(-1)
-    raw_weights = extract_weight_vector(torch.load(
-        weight_path, map_location="cpu", weights_only=False))
+    weight_payload = load_weight_payload(weight_path)
+    raw_weights = extract_weight_vector(weight_payload)
     if raw_weights.numel() != labels.numel():
         raise ValueError(
             f"Weight length {raw_weights.numel()} does not match data length "
             f"{labels.numel()}.")
 
+    # This also enforces composite event-ID alignment for production NPZ files.
+    load_generator_weights(
+        str(weight_path), labels, sample=sample, weight_scope="auto")
     indices = stratified_subset_indices(labels, args.max_events, args.seed)
     selected_sample = subset_event_mapping(sample, indices)
     selected_weights = raw_weights[indices]
+    selected_weight_payload = subset_weight_payload(
+        weight_payload, indices, labels.numel())
     torch.save(selected_sample, output_data)
-    torch.save(selected_weights, output_weights)
+    save_weight_payload(selected_weight_payload, output_weights)
 
     classes = sorted(int(value) for value in labels.unique().tolist())
     metadata = {

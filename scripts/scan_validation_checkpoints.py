@@ -35,6 +35,7 @@ from eval_abcd_nurd import (
     statistically_valid_regions,
     weighted_quantile,
 )
+from utils.hlt_data import load_hlt_sample
 from utils.hlt_weights import file_sha256, load_generator_weights, sample_signature
 
 
@@ -284,7 +285,7 @@ def main(argv=None):
     for epoch, path, role in candidates:
         print(f"  epoch {epoch:3d} ({role}): {path}", flush=True)
 
-    raw = torch.load(data_path, map_location="cpu", weights_only=False)
+    raw = load_hlt_sample(data_path)
     for key in ("pf", "obj", "label"):
         if key not in raw:
             raise KeyError(f"Training sample is missing {key!r}.")

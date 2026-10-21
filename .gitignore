@@ -6,6 +6,7 @@ __pycache__/
 checkpoints/
 data/
 local/
+local_only/
 logs/
 matplotlib/
 outputs/

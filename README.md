@@ -39,6 +39,156 @@ sample. NURD training separately combines them with class and nuisance-stratum b
 `utils/hlt_weights.py`; those NURD effective weights are used consistently by
 classification, SupCon, critic training, and the encoder information loss.
 
+## 2025 train3M conversion
+
+`scripts/convert_background_nanoaod.py` is the production bridge from the
+validated 2,008-file NanoAOD campaign to this repository. It streams ROOT
+files, verifies every row against the composite
+`(Background_sample, run, luminosityBlock, event)` ID in the physics-weight
+NPZ, and makes a deterministic 80/20 split stratified by the fine background
+category. It writes memory-mapped NumPy arrays plus `sample.json`, not a
+second monolithic `.pt` copy.
+
+The data contract is:
+
+- `pf`: 400 highest-pT `ScoutingParticle` candidates with
+  `[pt, eta, phi, dxy, dxysig, is_pf, pdgId]`; `is_pf=1` for active rows and
+  zero for padding. This intentionally avoids guessing the undocumented
+  high-level-object duplication present in the old Mequinna PF tensor.
+- `obj`: 10 PF jets, 4 vertex muons, 4 electrons, 4 photons, and 1 MET row,
+  each `[pt, eta, phi, type]`, matching the legacy 23-slot AE layout.
+- `label`: NURD labels `Z=0`, `QCD=1`, `ttbar=2`, `W=3`.
+- `background_category`: the original exclusive generator-level subcategory;
+  it is retained for audits and splitting but is not a training target.
+- `event_id`: the four-column composite ID used to prove weight alignment.
+- `weight_{train,test}.npz`: the exact all-background physics measure sliced
+  with the same split. The cross section and generator-weight calculation was
+  already performed by the CMSSW exporter; conversion never recomputes or
+  class-balances it.
+
+### 1. Prepare the converter on login.hep.wisc.edu
+
+```bash
+source /cvmfs/cms.cern.ch/cmsset_default.sh
+export SCRAM_ARCH=el9_amd64_gcc14
+cd /afs/hep.wisc.edu/user/mbileska/axo_sample_work/CMSSW_16_1_0_pre4/src
+cmsenv
+export PYTHONNOUSERSITE=1
+
+export NURD_CODE=/afs/hep.wisc.edu/user/mbileska/nurd_hlt
+if [[ ! -d "$NURD_CODE/.git" ]]; then
+  git clone --branch dismembered-nurd-implementation \
+    git@github.com:mbileska/nurd_hlt.git "$NURD_CODE"
+fi
+cd "$NURD_CODE"
+git switch dismembered-nurd-implementation
+git pull --ff-only origin dismembered-nurd-implementation
+
+python3 -c 'import numpy, awkward, uproot; print("conversion environment OK")'
+```
+
+### 2. Run a small QCD-prefix smoke conversion
+
+```bash
+export CMSSW_WORK=/afs/hep.wisc.edu/user/mbileska/axo_sample_work/CMSSW_16_1_0_pre4/src/DPGAnalysis/L1TNanoAOD/test/axoScoutingNano
+export FILELIST="$CMSSW_WORK/production_filelists/all.txt"
+export FULL_WEIGHTS="$CMSSW_WORK/production_reports/background_physics_weights.npz"
+export SMOKE_OUT=/hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_smoke_qcd_v1
+
+python3 scripts/convert_background_nanoaod.py @"$FILELIST" \
+  --weights "$FULL_WEIGHTS" \
+  --output-dir "$SMOKE_OUT" \
+  --max-files 3 --seed 42 --test-fraction 0.2
+
+python3 scripts/validate_converted_backgrounds.py \
+  --input-dir "$SMOKE_OUT" \
+  --expected-files 3 \
+  --expected-categories 0-5 \
+  --allow-partial-classes
+```
+
+The smoke sample is deliberately a prefix of the canonical file list so its
+rows still align with the prefix of the full weight payload.
+
+### 3. Convert and validate all 2,582,935 events in tmux
+
+Start a persistent shell with `tmux new -s train3m_convert`, repeat the setup
+in step 1 inside it, and run:
+
+```bash
+export CMSSW_WORK=/afs/hep.wisc.edu/user/mbileska/axo_sample_work/CMSSW_16_1_0_pre4/src/DPGAnalysis/L1TNanoAOD/test/axoScoutingNano
+export FILELIST="$CMSSW_WORK/production_filelists/all.txt"
+export FULL_WEIGHTS="$CMSSW_WORK/production_reports/background_physics_weights.npz"
+export CONVERTED=/hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_v1
+set -o pipefail
+
+time python3 scripts/convert_background_nanoaod.py @"$FILELIST" \
+  --weights "$FULL_WEIGHTS" \
+  --output-dir "$CONVERTED" \
+  --expected-files 2008 \
+  --expected-events 2582935 \
+  --seed 42 --test-fraction 0.2 \
+  2>&1 | tee "$CMSSW_WORK/production_reports/nurd_tensor_conversion.log"
+
+python3 scripts/validate_converted_backgrounds.py \
+  --input-dir "$CONVERTED" \
+  --full-weights "$FULL_WEIGHTS" \
+  --expected-files 2008 \
+  --expected-events 2582935 \
+  --expected-categories 0-23,27-36 \
+  2>&1 | tee "$CMSSW_WORK/production_reports/nurd_tensor_validation.log"
+
+du -sh "$CONVERTED"
+```
+
+The converter refuses to overwrite a non-empty destination. If an interrupted
+attempt leaves `.conversion_incomplete`, move that whole directory aside and
+start with a fresh destination rather than mixing partial and final arrays.
+
+### 4. Copy to Della and validate there
+
+Run on Della:
+
+```bash
+module load anaconda3/2025.12
+conda activate disco
+cd /home/mb7126/nurd_hlt
+git switch dismembered-nurd-implementation
+git pull --ff-only origin dismembered-nurd-implementation
+
+export DATA_DIR=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/data/train3M_v1
+mkdir -p "$DATA_DIR"
+rsync -ahP --partial \
+  mbileska@login.hep.wisc.edu:/hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_v1/ \
+  "$DATA_DIR/"
+
+python scripts/validate_converted_backgrounds.py \
+  --input-dir "$DATA_DIR" \
+  --expected-files 2008 \
+  --expected-events 2582935 \
+  --expected-categories 0-23,27-36
+```
+
+### 5. Launch the diagnostic, then the full AE/NURD campaign
+
+```bash
+cd /home/mb7126/nurd_hlt
+module load anaconda3/2025.12
+conda activate disco
+
+# Short end-to-end test on a deterministic subset.
+bash slurm/launch_train3m_campaign.sh train3m_v1_diagnostic 0.3 --diagnostic
+
+# After the diagnostic report is healthy, train with NURD enabled from epoch 6.
+NURD_ENABLED=1 CRITIC_START_EPOCH=6 \
+  bash slurm/launch_train3m_campaign.sh train3m_v1_nurd 0.3
+```
+
+For a later evaluation retry or checkpoint scan, first run
+`source slurm/train3m_environment.sh`; this exports the train/test manifests
+and their matching NPZ weights so the generic launchers cannot silently fall
+back to the old Mequinna inputs.
+
 ## Canonical Della run
 
 From the repository root:

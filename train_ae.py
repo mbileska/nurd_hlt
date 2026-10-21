@@ -21,6 +21,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from models.hlt_autoencoder import HLTAutoencoder
+from utils.hlt_data import load_hlt_sample
 from utils.hlt_weights import (
     effective_mass_by_class,
     load_generator_weights,
@@ -92,7 +93,7 @@ log.addHandler(fh)
 # ── Load & normalise obj features ─────────────────────────────────────────────
 
 log.debug(f"Loading {args.data}")
-raw = torch.load(args.data, map_location="cpu", weights_only=False)
+raw = load_hlt_sample(args.data)
 data_signature = sample_signature(raw, max_events=args.max_events)
 obj = raw["obj"]
 labels = raw["label"].long().reshape(-1)
