@@ -160,8 +160,12 @@ should_transfer_files = NO
 queue
 EOF
 
-test ! -e /hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_v1
-condor_submit "$CMSSW_WORK/nurd_tensor_conversion.sub"
+export CONVERTED=/hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_v1
+if [[ -e "$CONVERTED" ]]; then
+  echo "Refusing to submit: output already exists at $CONVERTED"
+else
+  condor_submit "$CMSSW_WORK/nurd_tensor_conversion.sub"
+fi
 ```
 
 Monitor it with `condor_q "$USER"`. After it leaves the queue, require both a
