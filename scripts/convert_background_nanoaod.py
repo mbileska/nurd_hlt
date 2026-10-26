@@ -52,6 +52,14 @@ ROOT_BRANCHES = [
 ]
 
 
+def normalize_input_location(value: str) -> str:
+    """Expand local paths without corrupting XRootD/HTTP URLs."""
+    location = str(value)
+    if "://" in location:
+        return location
+    return str(Path(location).expanduser())
+
+
 def _find_key(payload: Mapping, candidates: Sequence[str], description: str) -> str:
     key = next((candidate for candidate in candidates if candidate in payload), None)
     if key is None:
@@ -313,7 +321,7 @@ def main(argv=None):
             "Conversion requires awkward and uproot (available in the CMSSW "
             "runtime used on login.hep.wisc.edu).") from error
 
-    inputs = [str(Path(item).expanduser()) for item in args.inputs]
+    inputs = [normalize_input_location(item) for item in args.inputs]
     if args.max_files > 0:
         inputs = inputs[:args.max_files]
     if not inputs:
@@ -322,7 +330,7 @@ def main(argv=None):
         raise ValueError(
             f"Selected {len(inputs)} files, expected {args.expected_files}.")
     for path in inputs:
-        if not Path(path).is_file():
+        if "://" not in path and not Path(path).is_file():
             raise FileNotFoundError(path)
 
     final_output_dir = args.output_dir.expanduser().resolve()

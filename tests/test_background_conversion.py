@@ -4,6 +4,7 @@ import pytest
 from scripts.convert_background_nanoaod import (
     _publish_directory,
     labels_from_samples,
+    normalize_input_location,
     split_weight_payload,
     stratified_test_mask,
 )
@@ -13,6 +14,13 @@ def test_background_label_contract():
     assert labels_from_samples([0, 1, 2, 3]).tolist() == [1, 3, 0, 2]
     with pytest.raises(ValueError, match="Unsupported"):
         labels_from_samples([4])
+
+
+def test_input_location_preserves_remote_urls(tmp_path):
+    remote = "root://cmsxrootd.hep.wisc.edu//store/user/example/input.root"
+    assert normalize_input_location(remote) == remote
+    assert normalize_input_location(str(tmp_path / "input.root")) == str(
+        tmp_path / "input.root")
 
 
 def test_fine_category_split_is_deterministic_and_complete():

@@ -201,7 +201,7 @@ cd /home/mb7126/nurd_hlt
 git switch dismembered-nurd-implementation
 git pull --ff-only origin dismembered-nurd-implementation
 
-export DATA_DIR=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/data/train3M_v1
+export DATA_DIR=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/data/train3M_v1/converted_v1
 mkdir -p "$DATA_DIR"
 scp -rp \
   mbileska@login.hep.wisc.edu:/hdfs/store/user/mbileska/anomalyNano/2025/nurd_tensor_v1/. \
@@ -232,7 +232,8 @@ NURD_ENABLED=1 CRITIC_START_EPOCH=6 \
 For a later evaluation retry or checkpoint scan, first run
 `source slurm/train3m_environment.sh`; this exports the train/test manifests
 and their matching NPZ weights so the generic launchers cannot silently fall
-back to the old Mequinna inputs.
+back to the old Mequinna inputs. The launcher also requires the validator's
+`converted_v1/FULL_VALIDATION_PASSED` marker before it will submit any job.
 
 ## Canonical Della run
 

@@ -194,6 +194,10 @@ def main(argv=None):
         **{f"test: {key}": value for key, value in test_checks.items()},
         **overall_checks,
     }
+    # NumPy comparisons such as ``np.isclose`` return ``np.bool_`` scalars.
+    # They have the intended truth semantics but are not accepted by Python's
+    # standard JSON encoder, so normalize every validation result explicitly.
+    all_checks = {name: bool(passed) for name, passed in all_checks.items()}
     report = {
         "ok": all(all_checks.values()),
         "events": total_events,
