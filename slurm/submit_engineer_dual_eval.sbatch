@@ -31,8 +31,12 @@ LEGACY_PT="${LEGACY_PT:-$BASE/data/hlt_smcocktail_test.pt}"
 SIGNAL_PT="${SIGNAL_PT:-$BASE/data/hlt_signal_TpTp.pt}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$BASE/outputs/${RUN_TAG}_eval}"
 STATISTICALLY_VALID_CLOSURE="${STATISTICALLY_VALID_CLOSURE:-0}"
+TARGET_SCHEME="${TARGET_SCHEME:-parent4}"
 
-mkdir -p "$BASE/logs" "$BASE/outputs" "$BASE/wandb" "$OUTPUT_ROOT/held-out" "$OUTPUT_ROOT/legacy"
+mkdir -p "$BASE/logs" "$BASE/outputs" "$BASE/wandb" "$OUTPUT_ROOT/held-out"
+if [[ "$TARGET_SCHEME" == "parent4" ]]; then
+  mkdir -p "$OUTPUT_ROOT/legacy"
+fi
 export WANDB_DIR="$BASE/wandb"
 export WANDB_MODE="${WANDB_MODE:-offline}"
 export MPLCONFIGDIR="$BASE/matplotlib"
@@ -43,8 +47,14 @@ if [[ "$(git rev-parse HEAD)" != "$CODE_COMMIT" ]]; then
   echo "ERROR: code changed after campaign submission."
   exit 2
 fi
-for input in "$AE_CKPT" "$NURD_CKPT" "$HELDOUT_PT" "$HELDOUT_WEIGHTS" \
-  "$REFERENCE_PT" "$REFERENCE_WEIGHTS" "$LEGACY_PT"; do
+required_inputs=(
+  "$AE_CKPT" "$NURD_CKPT" "$HELDOUT_PT" "$HELDOUT_WEIGHTS"
+  "$REFERENCE_PT" "$REFERENCE_WEIGHTS"
+)
+if [[ "$TARGET_SCHEME" == "parent4" ]]; then
+  required_inputs+=("$LEGACY_PT")
+fi
+for input in "${required_inputs[@]}"; do
   if [[ ! -s "$input" ]]; then
     echo "ERROR: required evaluation input is missing: $input"
     exit 2
@@ -73,26 +83,35 @@ python eval_abcd_nurd.py \
   --outdir "$OUTPUT_ROOT/held-out" \
   --n_pca 6 \
   --qcd_label 1 \
+  --target_scheme "$TARGET_SCHEME" \
   --wandb_run_name "${RUN_TAG}_held_out${WANDB_EVAL_SUFFIX}" \
   "${STATISTICS_ARGS[@]}" \
   "${SIGNAL_ARGS[@]}"
 
-python eval_abcd_nurd.py \
-  --ckpt "$NURD_CKPT" \
-  --ae_ckpt "$AE_CKPT" \
-  --test_pt "$LEGACY_PT" \
-  --outdir "$OUTPUT_ROOT/legacy" \
-  --n_pca 6 \
-  --qcd_label 1 \
-  --wandb_run_name "${RUN_TAG}_legacy${WANDB_EVAL_SUFFIX}" \
-  "${STATISTICS_ARGS[@]}" \
-  "${SIGNAL_ARGS[@]}"
+SUMMARY_ARGS=()
+if [[ "$TARGET_SCHEME" == "parent4" ]]; then
+  python eval_abcd_nurd.py \
+    --ckpt "$NURD_CKPT" \
+    --ae_ckpt "$AE_CKPT" \
+    --test_pt "$LEGACY_PT" \
+    --outdir "$OUTPUT_ROOT/legacy" \
+    --n_pca 6 \
+    --qcd_label 1 \
+    --target_scheme "$TARGET_SCHEME" \
+    --wandb_run_name "${RUN_TAG}_legacy${WANDB_EVAL_SUFFIX}" \
+    "${STATISTICS_ARGS[@]}" \
+    "${SIGNAL_ARGS[@]}"
+else
+  echo "Skipping legacy evaluation: legacy tensor has no background_category."
+  SUMMARY_ARGS=(--skip-legacy)
+fi
 
 python scripts/summarize_dual_eval.py \
   --root "$OUTPUT_ROOT" \
   --ckpt "$NURD_CKPT" \
   --ae-ckpt "$AE_CKPT" \
-  --code-commit "$CODE_COMMIT"
+  --code-commit "$CODE_COMMIT" \
+  "${SUMMARY_ARGS[@]}"
 
 echo "DUAL EVALUATION DONE"
 echo "Held-out: $OUTPUT_ROOT/held-out"

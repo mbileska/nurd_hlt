@@ -13,6 +13,7 @@ import torch
 from torch.utils.data import Dataset
 
 from utils.hlt_data import load_hlt_sample
+from utils.hlt_targets import derive_target_labels
 from utils.hlt_weights import (
     apply_class_balance_factors,
     apply_joint_balance,
@@ -104,6 +105,7 @@ def build_hlt_datasets(
     exclude_labels: Optional[Sequence[int]] = None,
     gen_weight_path: Optional[str] = None,
     qcd_label: int = 1,
+    target_scheme: str = "parent4",
     generator_weight_scope: str = "auto",
     ae_scaler: Optional[Mapping[str, torch.Tensor]] = None,
     balance_strata: int = 20,
@@ -129,6 +131,11 @@ def build_hlt_datasets(
     if not (pf.shape[0] == obj.shape[0] == labels_original.numel()):
         raise ValueError("PF, object, and label arrays do not have equal lengths.")
 
+    target_labels, target_metadata = derive_target_labels(
+        raw, scheme=target_scheme, maximum_events=max_events)
+    if target_scheme == "decay8" and int(qcd_label) != 1:
+        raise ValueError("decay8 requires the converted sample's QCD label 1.")
+
     if max_events > 0:
         pf = pf[:max_events]
         obj = obj[:max_events]
@@ -144,21 +151,28 @@ def build_hlt_datasets(
     del raw
 
     if exclude_labels:
-        keep = torch.ones(labels_original.numel(), dtype=torch.bool)
+        keep = torch.ones(target_labels.numel(), dtype=torch.bool)
         for label in exclude_labels:
-            keep &= labels_original != int(label)
+            keep &= target_labels != int(label)
         pf, obj = pf[keep], obj[keep]
         physics_weights = physics_weights[keep]
         labels_original = labels_original[keep]
+        target_labels = target_labels[keep]
 
-    unique_labels = sorted(int(value) for value in labels_original.unique().tolist())
+    unique_labels = sorted(int(value) for value in target_labels.unique().tolist())
     label_map = {old: new for new, old in enumerate(unique_labels)}
-    if int(qcd_label) not in label_map:
-        raise ValueError(f"QCD label {qcd_label} was excluded or is absent.")
-    labels = torch.empty_like(labels_original)
+    source_target_qcd_label = int(target_metadata["qcd_label"])
+    if source_target_qcd_label not in label_map:
+        raise ValueError(
+            f"QCD target label {source_target_qcd_label} was excluded or is absent.")
+    labels = torch.empty_like(target_labels)
     for old_label, new_label in label_map.items():
-        labels[labels_original == old_label] = new_label
-    remapped_qcd_label = label_map[int(qcd_label)]
+        labels[target_labels == old_label] = new_label
+    remapped_qcd_label = label_map[source_target_qcd_label]
+    target_class_names = {
+        label_map[old]: target_metadata["class_names"][old]
+        for old in unique_labels
+    }
 
     pf = torch.nan_to_num(pf.float(), nan=0.0, posinf=0.0, neginf=0.0)
     obj_flat = torch.nan_to_num(
@@ -276,7 +290,11 @@ def build_hlt_datasets(
             "validation_indices": val_indices.cpu(),
         },
         "label_map": label_map,
+        "target_scheme": target_scheme,
+        "target_class_names": target_class_names,
+        "target_definition": target_metadata["definition"],
         "qcd_label": int(remapped_qcd_label),
+        "source_parent_qcd_label": int(qcd_label),
         "data_signature": data_signature,
     }
     return train_dataset, val_dataset, preprocessing

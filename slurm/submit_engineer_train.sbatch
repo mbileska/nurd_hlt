@@ -31,6 +31,7 @@ CRITIC_SHUFFLE_MODE="${CRITIC_SHUFFLE_MODE:-global}"
 BALANCE_BINNING="${BALANCE_BINNING:-log_fixed}"
 BALANCE_CLIP_QUANTILE="${BALANCE_CLIP_QUANTILE:-0.995}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
+TARGET_SCHEME="${TARGET_SCHEME:-parent4}"
 AE_EXP="${AE_EXP:-ae_engineer_$RUN_TAG}"
 NURD_EXP="${NURD_EXP:-hlt_nurd_engineer_$RUN_TAG}"
 AE_CKPT="$BASE/checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth"
@@ -76,6 +77,7 @@ echo "SupCon weight: $CONTRAST_WEIGHT"
 echo "NURD maximum epochs: $NURD_EPOCHS"
 echo "NURD LR schedule epochs: $LR_SCHEDULE_EPOCHS"
 echo "NURD enabled: $NURD_ENABLED"
+echo "Target scheme: $TARGET_SCHEME"
 echo "Critic start epoch: $CRITIC_START_EPOCH (0 means epoch 1)"
 echo "Critic shuffle: $CRITIC_SHUFFLE_MODE"
 echo "Nuisance weight binning: $BALANCE_BINNING"
@@ -106,6 +108,7 @@ python train_hlt.py \
   --gen_weight_path "$GEN_WEIGHT_TRAIN" \
   --ae_ckpt "$AE_CKPT" \
   --qcd_label 1 \
+  --target_scheme "$TARGET_SCHEME" \
   --balance_strata 20 \
   --balance_binning "$BALANCE_BINNING" \
   --balance_clip_quantile "$BALANCE_CLIP_QUANTILE" \

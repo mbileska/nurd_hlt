@@ -20,11 +20,16 @@ def main():
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--ae-ckpt", required=True)
     parser.add_argument("--code-commit", required=True)
+    parser.add_argument(
+        "--skip-legacy", action="store_true",
+        help="Summarize held-out only when the legacy tensor lacks target metadata.")
     args = parser.parse_args()
 
     root = Path(args.root)
     evaluations = {}
-    for name in ("held-out", "legacy"):
+    evaluation_names = (
+        ("held-out",) if args.skip_legacy else ("held-out", "legacy"))
+    for name in evaluation_names:
         diagnostics = root / name / "diagnostics.json"
         thresholds = root / name / "abcd_thresholds.json"
         if not diagnostics.is_file() or not thresholds.is_file():
@@ -46,7 +51,7 @@ def main():
         json.dump(summary, output, indent=2)
 
     print("=== Closure summary ===")
-    for name in ("held-out", "legacy"):
+    for name in evaluation_names:
         values = evaluations[name]["diagnostics"]
         wp = values["working_point"]["absolute_nonclosure"]
         grid = values["heldout_grid"]

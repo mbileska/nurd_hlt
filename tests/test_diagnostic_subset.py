@@ -4,6 +4,7 @@ import torch
 
 from scripts.create_diagnostic_subset import (
     extract_weight_vector,
+    main,
     save_weight_payload,
     stratified_subset_indices,
     subset_event_mapping,
@@ -68,3 +69,50 @@ def test_npz_diagnostic_weights_preserve_scope_and_event_ids(tmp_path):
     with np.load(destination, allow_pickle=False) as archive:
         assert archive["weight_scope"].item() == "all_events"
         assert np.array_equal(archive["event_id"], event_ids[[0, 3, 7]])
+
+
+def test_decay8_subset_is_stratified_by_derived_targets(tmp_path):
+    categories = torch.tensor([15, 0, 27, 6, 9, 12, 18, 21]).repeat(10)
+    parents = torch.tensor([0, 1, 2, 3, 3, 3, 0, 0]).repeat(10)
+    n_events = parents.numel()
+    event_ids = torch.arange(n_events * 4).reshape(n_events, 4)
+    sample = {
+        "pf": torch.ones(n_events, 2, 7),
+        "obj": torch.ones(n_events, 2, 4),
+        "label": parents,
+        "background_category": categories,
+        "event_id": event_ids,
+    }
+    data_path = tmp_path / "sample.pt"
+    weights_path = tmp_path / "weights.npz"
+    output_data = tmp_path / "subset.pt"
+    output_weights = tmp_path / "subset_weights.npz"
+    metadata_path = tmp_path / "metadata.json"
+    torch.save(sample, data_path)
+    np.savez_compressed(
+        weights_path,
+        weights=np.ones(n_events),
+        event_id=event_ids.numpy(),
+        weight_scope=np.asarray("all_events"),
+    )
+
+    main([
+        "--data", str(data_path),
+        "--weights", str(weights_path),
+        "--output-data", str(output_data),
+        "--output-weights", str(output_weights),
+        "--metadata", str(metadata_path),
+        "--max-events", "40",
+        "--target-scheme", "decay8",
+        "--seed", "9",
+    ])
+
+    import json
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["target_scheme"] == "decay8"
+    assert metadata["class_counts_selected"] == {
+        str(label): 5 for label in range(8)
+    }
+    selected = torch.load(output_data, map_location="cpu", weights_only=False)
+    assert "background_category" in selected
+    assert selected["label"].numel() == 40

@@ -40,6 +40,7 @@ from dataset.hlt_smcocktail_dataset import build_hlt_datasets
 from models.hlt_autoencoder import HLTAutoencoder
 from models.hlt_con import HLTCritic, HLTContrastiveModel
 from utils.hlt_data import load_hlt_sample
+from utils.hlt_targets import TARGET_SCHEMES, derive_target_labels
 from utils.hlt_density_ratio import (
     critic_context_only_accuracy,
     density_ratio_critic_loss,
@@ -55,8 +56,11 @@ from utils.hlt_weights import (
 )
 
 
-CLASS_NAMES = {0: "DY", 1: "QCD", 2: "TT", 3: "WJets"}
-COLORS = ("#3B82F6", "#F59E0B", "#EF4444", "#10B981", "#8B5CF6")
+CLASS_NAMES = {0: "Z+jets", 1: "QCD", 2: "ttbar", 3: "W+jets"}
+COLORS = (
+    "#3B82F6", "#F59E0B", "#EF4444", "#10B981", "#8B5CF6",
+    "#EC4899", "#06B6D4", "#84CC16", "#F97316", "#64748B",
+)
 
 
 def _name(label: int) -> str:
@@ -336,10 +340,11 @@ def plot_ae_scores(scores, labels, physics_weights, path):
     for index, label in enumerate(sorted(np.unique(labels).astype(int))):
         mask = labels == label
         axes[0].hist(scores[mask], bins=edges, density=True, histtype="step",
-                     linewidth=1.6, color=COLORS[index], label=_name(label))
+                     linewidth=1.6, color=COLORS[index % len(COLORS)],
+                     label=_name(label))
         axes[1].hist(scores[mask], bins=edges, weights=physics_weights[mask],
                      density=True, histtype="step", linewidth=1.6,
-                     color=COLORS[index], label=_name(label))
+                     color=COLORS[index % len(COLORS)], label=_name(label))
     for ax, title in zip(axes, ("Raw events", "Generator-weighted physics measure")):
         ax.set_xscale("log")
         ax.set_yscale("log")
@@ -357,7 +362,7 @@ def plot_weighted_ae_cdfs(scores, labels, physics_weights, path):
         values = scores[mask][order]
         weights = physics_weights[mask][order]
         cumulative = np.cumsum(weights) / weights.sum()
-        ax.plot(values, cumulative, color=COLORS[index], linewidth=1.6,
+        ax.plot(values, cumulative, color=COLORS[index % len(COLORS)], linewidth=1.6,
                 label=_name(label))
     ax.set_xscale("log")
     ax.set(xlabel="AE reconstruction MSE", ylabel="Generator-weighted CDF",
@@ -436,7 +441,7 @@ def plot_weight_diagnostics(
             ("Raw rows", "Generator-weighted mass", "Post-clipping effective mass"),
         ):
             ax.step(np.arange(bins), values, where="mid", linewidth=1.4,
-                    color=COLORS[index], label=_name(label))
+                    color=COLORS[index % len(COLORS)], label=_name(label))
             ax.set_ylabel(title)
             ax.grid(alpha=0.2)
     axes[0].legend(ncol=len(classes))
@@ -539,7 +544,8 @@ def plot_latent_space(latents, labels, weights, title, outdir):
     for index, label in enumerate(sorted(np.unique(labels).astype(int))):
         mask = labels[sample] == label
         ax.scatter(reduced[mask, 0], reduced[mask, 1], s=4, alpha=0.22,
-                   color=COLORS[index], label=_name(label), rasterized=True)
+                   color=COLORS[index % len(COLORS)], label=_name(label),
+                   rasterized=True)
     ax.set(xlabel="Latent PCA 1", ylabel="Latent PCA 2", title=title)
     ax.legend(markerscale=3)
     ax.grid(alpha=0.2)
@@ -550,7 +556,7 @@ def plot_latent_space(latents, labels, weights, title, outdir):
     for index, label in enumerate(sorted(np.unique(labels).astype(int))):
         mask = labels == label
         ax.hist(norms[mask], bins=70, weights=weights[mask], density=True,
-                histtype="step", color=COLORS[index], linewidth=1.5,
+                histtype="step", color=COLORS[index % len(COLORS)], linewidth=1.5,
                 label=_name(label))
     ax.set(xlabel="Latent L2 norm", ylabel="Weighted density",
            title="Collapse / scale diagnostic")
@@ -935,7 +941,8 @@ def compare_stages(baseline, after, labels, weights, outdir):
     for index, label in enumerate(sorted(np.unique(labels).astype(int))):
         mask = labels == label
         ax.hist(drift[mask], bins=70, weights=weights[mask], density=True,
-                histtype="step", linewidth=1.5, color=COLORS[index],
+                histtype="step", linewidth=1.5,
+                color=COLORS[index % len(COLORS)],
                 label=_name(label))
     ax.set(xlabel="Per-event latent L2 change", ylabel="Weighted density",
            title="How strongly the short NURD phase moved the representation")
@@ -1070,6 +1077,8 @@ def main(argv=None):
     parser.add_argument("--nurd-epoch", required=True, type=int)
     parser.add_argument("--outdir", required=True)
     parser.add_argument("--qcd-label", type=int, default=1)
+    parser.add_argument(
+        "--target-scheme", choices=TARGET_SCHEMES, default="parent4")
     parser.add_argument("--balance-strata", type=int, default=20)
     parser.add_argument("--balance-binning", default="log_fixed")
     parser.add_argument("--balance-clip-quantile", type=float, default=0.995)
@@ -1109,18 +1118,26 @@ def main(argv=None):
 
     raw = load_hlt_sample(data_path)
     labels_original = raw["label"].long().reshape(-1)
+    target_labels, _target_metadata = derive_target_labels(
+        raw, scheme=args.target_scheme)
     _physics_all, generator_metadata = load_generator_weights(
         str(weight_path), labels_original, qcd_label=args.qcd_label, sample=raw)
     ae, ae_payload = load_ae(ae_path, device)
     train_dataset, val_dataset, preprocessing = build_hlt_datasets(
         str(data_path), ae, seed=args.seed,
         gen_weight_path=str(weight_path), qcd_label=args.qcd_label,
+        target_scheme=args.target_scheme,
         ae_scaler=ae_payload["ae_scaler"],
         balance_strata=args.balance_strata,
         balance_binning=args.balance_binning,
         balance_clip_quantile=args.balance_clip_quantile,
         ae_batch_size=args.ae_batch_size,
     )
+    CLASS_NAMES.clear()
+    CLASS_NAMES.update({
+        int(key): str(value)
+        for key, value in preprocessing["target_class_names"].items()
+    })
 
     train_labels = train_dataset.labels.numpy()
     train_scores = train_dataset.ae_reco.numpy()
@@ -1221,7 +1238,15 @@ def main(argv=None):
         "data": {
             "path": str(data_path),
             "events": int(labels_original.numel()),
+            "target_scheme": args.target_scheme,
+            "target_class_names": {
+                str(key): value for key, value in CLASS_NAMES.items()
+            },
             "class_counts": {
+                str(label): int((target_labels == label).sum())
+                for label in target_labels.unique().tolist()
+            },
+            "parent_class_counts": {
                 str(label): int((labels_original == label).sum())
                 for label in labels_original.unique().tolist()
             },

@@ -34,6 +34,7 @@ from matplotlib.lines import Line2D
 from models.hlt_con import HLTContrastiveModel
 from models.hlt_autoencoder import HLTAutoencoder
 from utils.hlt_data import load_hlt_sample
+from utils.hlt_targets import TARGET_SCHEMES, checkpoint_target_labels
 from utils.hlt_weights import file_sha256, load_generator_weights, sample_signature
 
 
@@ -264,12 +265,19 @@ def compute_ae_scores(ae, ae_scaler, pt_path, device, batch_size=4096):
     return torch.cat(scores).numpy().astype(np.float32)
 
 
-def embed_pf(model, pt_path, device, batch_size=512, return_logits=False):
+def embed_pf(
+    model, pt_path, device, batch_size=512, return_logits=False,
+    preprocessing=None,
+):
     """Run NURD encoder on PF candidates; return (latents [N,D], labels [N]).
     If return_logits=True, returns (latents, logits [N,C], labels)."""
     raw    = load_hlt_sample(pt_path)
     pf     = torch.nan_to_num(raw["pf"], nan=0.0, posinf=0.0, neginf=0.0)
-    labels = raw["label"].numpy()
+    labels = (
+        raw["label"].long().reshape(-1)
+        if preprocessing is None
+        else checkpoint_target_labels(raw, preprocessing)
+    ).numpy()
     N = pf.shape[0]
     print(f"  Encoder inference on {N} events from {pt_path}...", flush=True)
 
@@ -323,7 +331,8 @@ def _fit_class_transform(embeddings, mask, n_pca, class_name, weights=None):
 
 def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None,
                       bkg_labels=None, reference_pt=None,
-                      reference_weights=None, reference_fit_indices=None):
+                      reference_weights=None, reference_fit_indices=None,
+                      preprocessing=None, class_names=None, qcd_label=1):
     """
     Embed all events, fit PCA whitening per background class, return MD scores.
 
@@ -334,15 +343,19 @@ def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None,
     Returns (md [N], labels [N], mu_qcd, W_qcd, latents [N,D], class_transforms).
     class_transforms is a list of (label, mu, W) — reuse for signal inference.
     """
-    _CLASS_NAMES = {0: "DY", 1: "QCD", 2: "TT", 3: "WJets"}
+    _CLASS_NAMES = class_names or {
+        0: "Z+jets", 1: "QCD", 2: "ttbar", 3: "W+jets"}
     if bkg_labels is None:
-        bkg_labels = [1]
+        bkg_labels = [qcd_label]
 
-    latents, labels = embed_pf(model, pt_path, device, batch_size)
+    latents, labels = embed_pf(
+        model, pt_path, device, batch_size,
+        preprocessing=preprocessing)
     if reference_pt:
         print(f"  Fitting MD reference on independent sample: {reference_pt}", flush=True)
         reference_latents, reference_labels = embed_pf(
-            model, reference_pt, device, batch_size)
+            model, reference_pt, device, batch_size,
+            preprocessing=preprocessing)
     else:
         reference_latents, reference_labels = latents, labels
 
@@ -381,7 +394,9 @@ def compute_md_scores(model, pt_path, device, batch_size=512, n_pca=None,
     if len(class_transforms) > 1:
         print(f"  Min-MD across classes {[c for c,_,_ in class_transforms]}", flush=True)
 
-    qcd_entry = next((t for t in class_transforms if t[0] == 1), class_transforms[0])
+    qcd_entry = next(
+        (item for item in class_transforms if item[0] == qcd_label),
+        class_transforms[0])
     mu_qcd, W_qcd = qcd_entry[1], qcd_entry[2]
 
     return (md, labels, mu_qcd, W_qcd, latents, class_transforms,
@@ -452,6 +467,20 @@ def ABCD(config):
 
     # ── load models ───────────────────────────────────────────────────────────
     model, main_ckpt = load_nurd_model(config["ckpt"], device)
+    preprocessing = main_ckpt.get("preprocessing", {})
+    target_scheme = str(preprocessing.get("target_scheme", "parent4"))
+    requested_target_scheme = config.get("target_scheme")
+    if (requested_target_scheme is not None
+            and requested_target_scheme != target_scheme):
+        raise ValueError(
+            f"Requested target scheme {requested_target_scheme!r} does not "
+            f"match checkpoint scheme {target_scheme!r}.")
+    class_names = {
+        int(key): str(value) for key, value in preprocessing.get(
+            "target_class_names",
+            {0: "Z+jets", 1: "QCD", 2: "ttbar", 3: "W+jets"},
+        ).items()
+    }
     expected_ae_sha256 = main_ckpt.get("ae_checkpoint_sha256")
     if not expected_ae_sha256 or file_sha256(
             config["ae_ckpt"]) != expected_ae_sha256:
@@ -459,7 +488,17 @@ def ABCD(config):
             "AE checkpoint does not match the exact AE used for NURD training.")
     ae_scaler = main_ckpt["ae_scaler"]
     ae = load_ae(config["ae_ckpt"], ae_scaler, device)
-    qcd_label = int(config.get("qcd_label", 1))
+    qcd_label = int(preprocessing.get("qcd_label", 1))
+    requested_qcd_label = int(config.get("qcd_label", qcd_label))
+    if requested_qcd_label != qcd_label:
+        raise ValueError(
+            f"Requested QCD label {requested_qcd_label} does not match "
+            f"checkpoint QCD label {qcd_label}.")
+    source_parent_qcd_label = int(
+        preprocessing.get("source_parent_qcd_label", 1))
+    print(
+        f"Target scheme: {target_scheme}; classes={class_names}; "
+        f"QCD label={qcd_label}", flush=True)
 
     reference_pt = config.get("reference_pt")
     reference_physics = reference_signature = None
@@ -473,14 +512,16 @@ def ABCD(config):
                 "Held-out reference and report files must be different samples.")
         reference_physics, reference_metadata, reference_signature = (
             load_physics_weights(
-                config["reference_weight_path"], reference_pt, qcd_label))
+                config["reference_weight_path"], reference_pt,
+                source_parent_qcd_label))
         reference_fit_indices, selection_indices = checkpoint_reference_indices(
             main_ckpt, reference_signature, reference_metadata)
 
     test_physics = None
     if config.get("gen_weight_path"):
         test_physics, _test_metadata, _test_signature = load_physics_weights(
-            config["gen_weight_path"], config["test_pt"], qcd_label)
+            config["gen_weight_path"], config["test_pt"],
+            source_parent_qcd_label)
 
     # ── AE scores ─────────────────────────────────────────────────────────────
     print("Computing AE scores (bkg)...", flush=True)
@@ -506,19 +547,28 @@ def ABCD(config):
     if use_logit:
         print("Axis 2 = 1-P(QCD) logit mode.", flush=True)
         latents_all, logits_all, labels = embed_pf(
-            model, config["test_pt"], device, return_logits=True)
+            model, config["test_pt"], device, return_logits=True,
+            preprocessing=preprocessing)
         con_bkg = compute_logit_axis2(logits_all, qcd_label=qcd_label)
         class_transforms = []   # not used in logit mode
         md_mu = md_W = None
         if reference_pt:
             reference_latents, reference_logits, reference_labels = embed_pf(
-                model, reference_pt, device, return_logits=True)
+                model, reference_pt, device, return_logits=True,
+                preprocessing=preprocessing)
             reference_axis2 = compute_logit_axis2(
                 reference_logits, qcd_label=qcd_label)
     else:
-        bkg_labels = [0, 1, 3] if config.get("min_md") else [1]
+        bkg_labels = (
+            [label for label, name in class_names.items()
+             if label != 2 and name != "ttbar"]
+            if config.get("min_md") else [qcd_label]
+        )
         if config.get("min_md"):
-            print("Min-MD mode: axis 2 = min(MD_DY, MD_QCD, MD_WJets)", flush=True)
+            print(
+                "Min-MD mode across non-ttbar target classes: "
+                f"{[class_names[label] for label in bkg_labels]}",
+                flush=True)
         print("Computing contrastive MD scores (bkg)...", flush=True)
         (con_bkg, labels, md_mu, md_W, latents_all, class_transforms,
          reference_latents, reference_labels) = compute_md_scores(
@@ -528,6 +578,9 @@ def ABCD(config):
             reference_pt=reference_pt,
             reference_weights=reference_physics,
             reference_fit_indices=reference_fit_indices,
+            preprocessing=preprocessing,
+            class_names=class_names,
+            qcd_label=qcd_label,
         )
         if reference_pt:
             reference_md = []
@@ -555,7 +608,7 @@ def ABCD(config):
         # still compute a 2D PCA of the latent for the embedding scatter plot
         from sklearn.decomposition import PCA as _PCA
         _pca_fit = _PCA(n_components=min(6, latents_masked.shape[1]))
-        _pca_fit.fit(latents_masked[labels_masked == 1])
+        _pca_fit.fit(latents_masked[labels_masked == qcd_label])
         emb_pca   = _pca_fit.transform(latents_masked)
         n_pca     = emb_pca.shape[1]
         axis2_pca = axis2_bkg   # same axis in logit mode
@@ -607,7 +660,7 @@ def ABCD(config):
         if use_logit:
             sig_latents, sig_logits, _ = embed_pf(
                 model, config["signal_pt"], device, return_logits=True)
-            sig_con = compute_logit_axis2(sig_logits, qcd_label=config.get("qcd_label", 1))
+            sig_con = compute_logit_axis2(sig_logits, qcd_label=qcd_label)
         else:
             sig_latents, _ = embed_pf(model, config["signal_pt"], device)
             sig_mds = []
@@ -763,8 +816,14 @@ def ABCD(config):
     fs, fs_leg, fs_legend = 28, 24, 16
     fig_size = (8, 6)
 
-    class_names  = {0: "DY", 1: "QCD", 2: "TT", 3: "WJets"}
-    class_colors = {0: "tab:blue", 1: "tab:orange", 2: "tab:green", 3: "tab:red"}
+    palette = (
+        "tab:blue", "tab:orange", "tab:green", "tab:red", "tab:purple",
+        "tab:brown", "tab:pink", "tab:gray", "tab:olive", "tab:cyan",
+    )
+    class_colors = {
+        label: palette[index % len(palette)]
+        for index, label in enumerate(sorted(class_names))
+    }
 
     # 2D closure scan — full (p1, p2) grid coloured by |non-closure|
     fig, ax = plt.subplots(figsize=(7.5, 6.5))
@@ -955,7 +1014,7 @@ def ABCD(config):
     # PCA embedding scatter
     if not config.get("skip_embedding_pca"):
         pca2 = PCA(n_components=2)
-        pca2.fit(latents_masked[labels_masked == 1])
+        pca2.fit(latents_masked[labels_masked == qcd_label])
         emb_2d = pca2.transform(latents_masked)
         sig_emb_2d = pca2.transform(sig_latents_masked) if sig_latents_masked is not None else None
 
@@ -1221,10 +1280,14 @@ if __name__ == "__main__":
     parser.add_argument("--skip_pca_md_plots",   action="store_true")
     parser.add_argument("--skip_embedding_pca",  action="store_true")
     parser.add_argument("--min_md",              action="store_true",
-                        help="Use min-MD across DY+QCD+WJets (labels 0,1,3) instead of QCD-only MD")
+                        help="Use min-MD across non-ttbar background target classes instead of QCD-only MD")
     parser.add_argument("--axis2_logit",         action="store_true",
                         help="Use 1-P(QCD) classifier score as axis 2 instead of Mahalanobis distance")
     parser.add_argument("--qcd_label",           type=int, default=1,
                         help="Class label index for QCD (used by logit mode)")
+    parser.add_argument(
+        "--target_scheme", choices=TARGET_SCHEMES, default=None,
+        help=("Optional assertion of the checkpoint target taxonomy. The "
+              "checkpoint remains the authoritative source."))
     args = parser.parse_args()
     ABCD(vars(args))

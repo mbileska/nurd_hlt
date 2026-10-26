@@ -224,10 +224,24 @@ conda activate disco
 # Short end-to-end test on a deterministic subset.
 bash slurm/launch_train3m_campaign.sh train3m_v1_diagnostic 0.3 --diagnostic
 
+# Opt-in comparison: split W/Z by generated decay channel (eight targets).
+# The default remains TARGET_SCHEME=parent4 for the original baseline.
+TARGET_SCHEME=decay8 \
+  bash slurm/launch_train3m_campaign.sh train3m_v1_decay8_diagnostic 0.3 --diagnostic
+
 # After the diagnostic report is healthy, train with NURD enabled from epoch 6.
 NURD_ENABLED=1 CRITIC_START_EPOCH=6 \
   bash slurm/launch_train3m_campaign.sh train3m_v1_nurd 0.3
 ```
+
+`decay8` maps the stored fine-category metadata to QCD, ttbar,
+W$\to e\nu/\mu\nu/\tau\nu$, and Z$\to ee/\mu\mu/\tau\tau$. The W/Z HT
+bins remain within their decay class, while QCD hard-pT bins and ttbar decay
+modes remain diagnostic strata. No NanoAOD regeneration or tensor conversion
+is performed. Checkpoints record the selected taxonomy, and evaluation derives
+the same labels from `background_category`. The legacy tensor has no such
+metadata, so decay8 campaigns intentionally skip the legacy comparison and
+evaluate only the independent converted holdout.
 
 For a later evaluation retry or checkpoint scan, first run
 `source slurm/train3m_environment.sh`; this exports the train/test manifests

@@ -41,6 +41,7 @@ from utils.hlt_density_ratio import (
     weighted_mean,
 )
 from utils.hlt_weights import file_sha256
+from utils.hlt_targets import TARGET_SCHEMES
 
 
 class SupConLoss(nn.Module):
@@ -185,6 +186,11 @@ def build_parser() -> argparse.ArgumentParser:
               "Use 1.0 to disable clipping."),
     )
     parser.add_argument("--qcd_label", type=int, default=1)
+    parser.add_argument(
+        "--target_scheme", choices=TARGET_SCHEMES, default="parent4",
+        help=("Classifier targets: parent4 preserves the historical four-parent "
+              "baseline; decay8 splits W and Z by generator decay channel."),
+    )
     parser.add_argument("--exclude_labels", type=int, nargs="+", default=None)
     parser.add_argument("--max_events", type=int, default=-1)
     parser.add_argument("--ae_batch_size", type=int, default=4096)
@@ -560,6 +566,7 @@ def main(argv=None):
         exclude_labels=args.exclude_labels,
         gen_weight_path=args.gen_weight_path,
         qcd_label=args.qcd_label,
+        target_scheme=args.target_scheme,
         generator_weight_scope=args.generator_weight_scope,
         ae_scaler=ae_checkpoint["ae_scaler"],
         balance_strata=args.balance_strata,
@@ -626,9 +633,11 @@ def main(argv=None):
 
     logger.info(
         "Continuous density-ratio training: events=%d/%d classes=%d "
+        "target_scheme=%s "
         "balance_strata=%d balance_binning=%s balance_clip_quantile=%.4f "
         "lambda_info=%.3f critic_steps=%d shuffle_mode=%s",
         len(train_dataset), len(val_dataset), num_classes,
+        args.target_scheme,
         args.balance_strata, args.balance_binning,
         args.balance_clip_quantile, args.lambda_info, args.critic_steps,
         args.critic_shuffle_mode)

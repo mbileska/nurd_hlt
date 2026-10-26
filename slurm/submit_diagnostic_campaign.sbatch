@@ -32,6 +32,7 @@ DIAG_BATCH_SIZE="${DIAG_BATCH_SIZE:-4096}"
 BALANCE_BINNING="${BALANCE_BINNING:-log_fixed}"
 BALANCE_CLIP_QUANTILE="${BALANCE_CLIP_QUANTILE:-0.995}"
 BALANCE_STRATA="${BALANCE_STRATA:-20}"
+TARGET_SCHEME="${TARGET_SCHEME:-parent4}"
 TOTAL_HLT_EPOCHS=$((DIAG_SUPCON_EPOCHS + DIAG_NURD_EPOCHS))
 CRITIC_START_EPOCH=$((DIAG_SUPCON_EPOCHS + 1))
 
@@ -66,6 +67,7 @@ echo "=== HLT staged training diagnostic ==="
 echo "Run tag: $RUN_TAG"
 echo "Commit: $CODE_COMMIT"
 echo "Subset events: $DIAG_MAX_EVENTS"
+echo "Target scheme: $TARGET_SCHEME"
 echo "AE epochs: $DIAG_AE_EPOCHS"
 echo "SupCon/classifier-only epochs: $DIAG_SUPCON_EPOCHS"
 echo "Short NURD epochs: $DIAG_NURD_EPOCHS"
@@ -79,6 +81,7 @@ python scripts/create_diagnostic_subset.py \
   --output-weights "$SUBSET_WEIGHTS" \
   --metadata "$SUBSET_METADATA" \
   --max-events "$DIAG_MAX_EVENTS" \
+  --target-scheme "$TARGET_SCHEME" \
   --seed 42
 
 python train_ae.py \
@@ -102,6 +105,7 @@ python train_hlt.py \
   --gen_weight_path "$SUBSET_WEIGHTS" \
   --ae_ckpt "$AE_CKPT" \
   --qcd_label 1 \
+  --target_scheme "$TARGET_SCHEME" \
   --balance_strata "$BALANCE_STRATA" \
   --balance_binning "$BALANCE_BINNING" \
   --balance_clip_quantile "$BALANCE_CLIP_QUANTILE" \
@@ -142,6 +146,7 @@ python scripts/run_training_diagnostics.py \
   --nurd-epoch "$TOTAL_HLT_EPOCHS" \
   --outdir "$DIAG_ROOT" \
   --qcd-label 1 \
+  --target-scheme "$TARGET_SCHEME" \
   --balance-strata "$BALANCE_STRATA" \
   --balance-binning "$BALANCE_BINNING" \
   --balance-clip-quantile "$BALANCE_CLIP_QUANTILE" \
@@ -150,7 +155,7 @@ python scripts/run_training_diagnostics.py \
   --critic-probe-epochs "$DIAG_CRITIC_PROBE_EPOCHS" \
   --seed 42
 
-python - "$DIAG_ROOT" "$CODE_COMMIT" "$RUN_TAG" <<'PY'
+python - "$DIAG_ROOT" "$CODE_COMMIT" "$RUN_TAG" "$TARGET_SCHEME" <<'PY'
 import json
 import pathlib
 import sys
@@ -158,6 +163,7 @@ import sys
 root = pathlib.Path(sys.argv[1])
 payload = {
     "run_tag": sys.argv[3],
+    "target_scheme": sys.argv[4],
     "code_commit": sys.argv[2],
     "status": "complete",
     "summary": str(root / "diagnostic_summary.json"),

@@ -22,6 +22,7 @@ if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
 from utils.hlt_data import load_hlt_sample
+from utils.hlt_targets import TARGET_SCHEMES, derive_target_labels
 from utils.hlt_weights import (
     EVENT_ID_KEYS,
     WEIGHT_KEYS,
@@ -150,6 +151,8 @@ def main(argv=None):
     parser.add_argument("--metadata", required=True)
     parser.add_argument("--max-events", type=int, default=120_000)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--target-scheme", choices=TARGET_SCHEMES, default="parent4")
     args = parser.parse_args(argv)
 
     data_path = Path(args.data).resolve()
@@ -168,7 +171,9 @@ def main(argv=None):
     for key in ("pf", "obj", "label"):
         if key not in sample:
             raise KeyError(f"Training sample is missing required key {key!r}.")
-    labels = torch.as_tensor(sample["label"]).long().reshape(-1)
+    parent_labels = torch.as_tensor(sample["label"]).long().reshape(-1)
+    labels, target_metadata = derive_target_labels(
+        sample, scheme=args.target_scheme)
     weight_payload = load_weight_payload(weight_path)
     raw_weights = extract_weight_vector(weight_payload)
     if raw_weights.numel() != labels.numel():
@@ -178,7 +183,7 @@ def main(argv=None):
 
     # This also enforces composite event-ID alignment for production NPZ files.
     load_generator_weights(
-        str(weight_path), labels, sample=sample, weight_scope="auto")
+        str(weight_path), parent_labels, sample=sample, weight_scope="auto")
     indices = stratified_subset_indices(labels, args.max_events, args.seed)
     selected_sample = subset_event_mapping(sample, indices)
     selected_weights = raw_weights[indices]
@@ -190,6 +195,11 @@ def main(argv=None):
     classes = sorted(int(value) for value in labels.unique().tolist())
     metadata = {
         "protocol": "deterministic_class_stratified_without_replacement",
+        "target_scheme": args.target_scheme,
+        "target_class_names": {
+            str(key): value
+            for key, value in target_metadata["class_names"].items()
+        },
         "source_data": str(data_path),
         "source_weights": str(weight_path),
         "seed": int(args.seed),
@@ -203,6 +213,10 @@ def main(argv=None):
         },
         "selected_indices_sha256": tensor_sha256(indices),
         "selected_weights_sha256": tensor_sha256(selected_weights),
+        "parent_counts_selected": {
+            str(label): int((parent_labels[indices] == label).sum())
+            for label in sorted(int(value) for value in parent_labels.unique())
+        },
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
     print(json.dumps(metadata, indent=2), flush=True)

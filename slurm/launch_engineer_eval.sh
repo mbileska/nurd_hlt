@@ -11,8 +11,13 @@ fi
 BASE="${BASE:-/scratch/gpfs/IOJALVO/mb7126/nurd_hlt}"
 RUN_TAG="$1"
 EVAL_MODE="${2:-original}"
+TARGET_SCHEME="${TARGET_SCHEME:-parent4}"
 if [[ ! "$RUN_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "ERROR: run tag may contain only letters, numbers, dot, underscore, and dash."
+  exit 2
+fi
+if [[ "$TARGET_SCHEME" != "parent4" && "$TARGET_SCHEME" != "decay8" ]]; then
+  echo "ERROR: TARGET_SCHEME must be parent4 or decay8."
   exit 2
 fi
 case "$EVAL_MODE" in
@@ -59,12 +64,13 @@ fi
 
 EVAL_JOB="$(sbatch --parsable \
   --job-name="${RUN_TAG}_eval_retry" \
-  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",CODE_COMMIT="$CODE_COMMIT",RUN_TAG="$RUN_TAG",AE_EXP="$AE_EXP",NURD_EXP="$NURD_EXP",OUTPUT_ROOT="$OUTPUT_ROOT",STATISTICALLY_VALID_CLOSURE="$STATISTICALLY_VALID_CLOSURE" \
+  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",CODE_COMMIT="$CODE_COMMIT",RUN_TAG="$RUN_TAG",AE_EXP="$AE_EXP",NURD_EXP="$NURD_EXP",OUTPUT_ROOT="$OUTPUT_ROOT",STATISTICALLY_VALID_CLOSURE="$STATISTICALLY_VALID_CLOSURE",TARGET_SCHEME="$TARGET_SCHEME" \
   slurm/submit_engineer_dual_eval.sbatch)"
 
 echo "Evaluation-only retry submitted."
 echo "Run tag: $RUN_TAG"
 echo "Mode:     $EVAL_MODE"
+echo "Targets:  $TARGET_SCHEME"
 echo "Commit:  $CODE_COMMIT"
 echo "Job:     $EVAL_JOB"
 echo "Output:  $OUTPUT_ROOT/{held-out,legacy}"
