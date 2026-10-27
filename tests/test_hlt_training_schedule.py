@@ -7,6 +7,7 @@ from train_hlt import (
     EpochMetrics,
     checkpoint_selection_start_epoch,
     cosine_lr_multiplier,
+    information_weight_for_epoch,
     nurd_active_for_epoch,
 )
 
@@ -29,6 +30,32 @@ def test_positive_start_switches_nurd_on_sharply():
         assert nurd_active_for_epoch(epoch, 1, 6) is False
     assert nurd_active_for_epoch(6, 1, 6) is True
     assert nurd_active_for_epoch(7, 1, 6) is True
+
+
+def test_critic_warmup_and_linear_information_ramp():
+    values = [
+        information_weight_for_epoch(
+            epoch, nurd_enabled=1, critic_start_epoch=3,
+            critic_warmup_epochs=2, lambda_info_ramp_epochs=4,
+            maximum_weight=0.2)
+        for epoch in range(1, 10)
+    ]
+    assert values == pytest.approx([
+        0.0, 0.0,  # critic inactive
+        0.0, 0.0,  # critic-only warm-up
+        0.05, 0.10, 0.15, 0.20, 0.20,
+    ])
+    assert checkpoint_selection_start_epoch(
+        1, 3, critic_warmup_epochs=2, lambda_info_ramp_epochs=4,
+        selection_after_ramp=1) == 8
+
+
+def test_zero_length_ramp_preserves_sharp_switch_after_optional_warmup():
+    assert information_weight_for_epoch(1, 1, 0, 0, 0, 0.3) == 0.3
+    assert information_weight_for_epoch(1, 1, 0, 2, 0, 0.3) == 0.0
+    assert information_weight_for_epoch(2, 1, 0, 2, 0, 0.3) == 0.0
+    assert information_weight_for_epoch(3, 1, 0, 2, 0, 0.3) == 0.3
+    assert checkpoint_selection_start_epoch(1, 0, 2, 0, 1) == 3
 
 
 def test_nurd_schedule_rejects_invalid_values():

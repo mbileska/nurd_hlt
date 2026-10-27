@@ -29,8 +29,16 @@ LR_SCHEDULE_EPOCHS="${LR_SCHEDULE_EPOCHS:-$NURD_EPOCHS}"
 NURD_ENABLED="${NURD_ENABLED:-0}"
 CRITIC_START_EPOCH="${CRITIC_START_EPOCH:-0}"
 CRITIC_SHUFFLE_MODE="${CRITIC_SHUFFLE_MODE:-global}"
+CRITIC_WARMUP_EPOCHS="${CRITIC_WARMUP_EPOCHS:-0}"
+LAMBDA_INFO_RAMP_EPOCHS="${LAMBDA_INFO_RAMP_EPOCHS:-0}"
+SELECTION_AFTER_RAMP="${SELECTION_AFTER_RAMP:-0}"
+LAMBDA_INFO="${LAMBDA_INFO:-1.0}"
+TRAIN_LR="${TRAIN_LR:-1e-4}"
+WARM_START_CKPT="${WARM_START_CKPT:-}"
+REUSE_AE="${REUSE_AE:-0}"
 BALANCE_BINNING="${BALANCE_BINNING:-log_fixed}"
 BALANCE_CLIP_QUANTILE="${BALANCE_CLIP_QUANTILE:-0.995}"
+BALANCE_STRATA="${BALANCE_STRATA:-20}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
 STATISTICALLY_VALID_CLOSURE="${STATISTICALLY_VALID_CLOSURE:-1}"
 TARGET_SCHEME="${TARGET_SCHEME:-parent4}"
@@ -42,15 +50,29 @@ if [[ ! "$CONTRAST_WEIGHT" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$
   echo "ERROR: SUPCON_WEIGHT must be a non-negative number."
   exit 2
 fi
-for value_name in NURD_EPOCHS LR_SCHEDULE_EPOCHS CRITIC_START_EPOCH CHECKPOINT_EVERY; do
+for value_name in NURD_EPOCHS LR_SCHEDULE_EPOCHS CRITIC_START_EPOCH CHECKPOINT_EVERY CRITIC_WARMUP_EPOCHS LAMBDA_INFO_RAMP_EPOCHS BALANCE_STRATA; do
   value="${!value_name}"
   if [[ ! "$value" =~ ^[0-9]+$ ]]; then
     echo "ERROR: $value_name must be a non-negative integer."
     exit 2
   fi
 done
-if [[ "$NURD_ENABLED" != "0" && "$NURD_ENABLED" != "1" ]]; then
-  echo "ERROR: NURD_ENABLED must be zero or one."
+for switch_name in NURD_ENABLED SELECTION_AFTER_RAMP REUSE_AE; do
+  switch_value="${!switch_name}"
+  if [[ "$switch_value" != "0" && "$switch_value" != "1" ]]; then
+    echo "ERROR: $switch_name must be zero or one."
+    exit 2
+  fi
+done
+for float_name in LAMBDA_INFO TRAIN_LR; do
+  float_value="${!float_name}"
+  if [[ ! "$float_value" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)([eE][+-]?[0-9]+)?$ ]]; then
+    echo "ERROR: $float_name must be a non-negative number."
+    exit 2
+  fi
+done
+if [[ "$REUSE_AE" == "1" && -z "${AE_EXP:-}" ]]; then
+  echo "ERROR: REUSE_AE=1 requires AE_EXP to name an existing AE experiment."
   exit 2
 fi
 if [[ "$CRITIC_SHUFFLE_MODE" != "weighted_within_class" \
@@ -89,17 +111,32 @@ if (( LR_SCHEDULE_EPOCHS < 1 )); then
   echo "ERROR: LR_SCHEDULE_EPOCHS must be at least one."
   exit 2
 fi
+if (( BALANCE_STRATA < 1 )); then
+  echo "ERROR: BALANCE_STRATA must be at least one."
+  exit 2
+fi
 if (( NURD_ENABLED == 1 && CRITIC_START_EPOCH > NURD_EPOCHS )); then
   echo "ERROR: CRITIC_START_EPOCH must not exceed NURD_EPOCHS when NURD is enabled."
   exit 2
 fi
-AE_EXP="ae_engineer_$RUN_TAG"
-NURD_EXP="hlt_nurd_engineer_$RUN_TAG"
+AE_EXP="${AE_EXP:-ae_engineer_$RUN_TAG}"
+NURD_EXP="${NURD_EXP:-hlt_nurd_engineer_$RUN_TAG}"
 
-for output in \
-  "$BASE/checkpoints/hlt/hlt/$AE_EXP" \
-  "$BASE/checkpoints/hlt/hlt/$NURD_EXP" \
-  "$BASE/outputs/${RUN_TAG}_eval"; do
+outputs=(
+  "$BASE/checkpoints/hlt/hlt/$NURD_EXP"
+  "$BASE/outputs/${RUN_TAG}_eval"
+)
+if [[ "$REUSE_AE" == "0" ]]; then
+  outputs+=("$BASE/checkpoints/hlt/hlt/$AE_EXP")
+elif [[ ! -s "$BASE/checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth" ]]; then
+  echo "ERROR: requested reusable AE checkpoint is missing."
+  exit 2
+fi
+if [[ -n "$WARM_START_CKPT" && ! -s "$WARM_START_CKPT" ]]; then
+  echo "ERROR: warm-start checkpoint is missing: $WARM_START_CKPT"
+  exit 2
+fi
+for output in "${outputs[@]}"; do
   if [[ -e "$output" ]]; then
     echo "ERROR: refusing to overwrite existing campaign output: $output"
     exit 2
@@ -108,7 +145,7 @@ done
 
 TRAIN_JOB="$(sbatch --parsable \
   --job-name="${RUN_TAG}_train" \
-  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",CODE_COMMIT="$CODE_COMMIT",RUN_TAG="$RUN_TAG",AE_EXP="$AE_EXP",NURD_EXP="$NURD_EXP",CONTRAST_WEIGHT="$CONTRAST_WEIGHT",NURD_EPOCHS="$NURD_EPOCHS",LR_SCHEDULE_EPOCHS="$LR_SCHEDULE_EPOCHS",NURD_ENABLED="$NURD_ENABLED",CRITIC_START_EPOCH="$CRITIC_START_EPOCH",CRITIC_SHUFFLE_MODE="$CRITIC_SHUFFLE_MODE",BALANCE_BINNING="$BALANCE_BINNING",BALANCE_CLIP_QUANTILE="$BALANCE_CLIP_QUANTILE",CHECKPOINT_EVERY="$CHECKPOINT_EVERY",TARGET_SCHEME="$TARGET_SCHEME" \
+  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",CODE_COMMIT="$CODE_COMMIT",RUN_TAG="$RUN_TAG",AE_EXP="$AE_EXP",NURD_EXP="$NURD_EXP",CONTRAST_WEIGHT="$CONTRAST_WEIGHT",NURD_EPOCHS="$NURD_EPOCHS",LR_SCHEDULE_EPOCHS="$LR_SCHEDULE_EPOCHS",NURD_ENABLED="$NURD_ENABLED",CRITIC_START_EPOCH="$CRITIC_START_EPOCH",CRITIC_SHUFFLE_MODE="$CRITIC_SHUFFLE_MODE",CRITIC_WARMUP_EPOCHS="$CRITIC_WARMUP_EPOCHS",LAMBDA_INFO_RAMP_EPOCHS="$LAMBDA_INFO_RAMP_EPOCHS",SELECTION_AFTER_RAMP="$SELECTION_AFTER_RAMP",LAMBDA_INFO="$LAMBDA_INFO",TRAIN_LR="$TRAIN_LR",WARM_START_CKPT="$WARM_START_CKPT",REUSE_AE="$REUSE_AE",BALANCE_STRATA="$BALANCE_STRATA",BALANCE_BINNING="$BALANCE_BINNING",BALANCE_CLIP_QUANTILE="$BALANCE_CLIP_QUANTILE",CHECKPOINT_EVERY="$CHECKPOINT_EVERY",TARGET_SCHEME="$TARGET_SCHEME" \
   slurm/submit_engineer_train.sbatch)"
 
 EVAL_JOB="$(sbatch --parsable \
@@ -128,6 +165,14 @@ echo "NURD enabled: $NURD_ENABLED"
 echo "Target scheme: $TARGET_SCHEME"
 echo "Critic start epoch: $CRITIC_START_EPOCH (0 means epoch 1)"
 echo "Critic shuffle: $CRITIC_SHUFFLE_MODE"
+echo "Critic-only warm-up: $CRITIC_WARMUP_EPOCHS"
+echo "Lambda ramp epochs: $LAMBDA_INFO_RAMP_EPOCHS"
+echo "Maximum information lambda: $LAMBDA_INFO"
+echo "Selection after ramp: $SELECTION_AFTER_RAMP"
+echo "Training learning rate: $TRAIN_LR"
+echo "Warm-start checkpoint: ${WARM_START_CKPT:-none}"
+echo "Reuse AE: $REUSE_AE"
+echo "Nuisance balance strata: $BALANCE_STRATA"
 echo "Nuisance weight binning: $BALANCE_BINNING"
 echo "Effective-weight clip quantile: $BALANCE_CLIP_QUANTILE"
 echo "Checkpoint interval: $CHECKPOINT_EVERY"

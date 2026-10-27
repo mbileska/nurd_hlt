@@ -28,8 +28,16 @@ LR_SCHEDULE_EPOCHS="${LR_SCHEDULE_EPOCHS:-$NURD_EPOCHS}"
 NURD_ENABLED="${NURD_ENABLED:-0}"
 CRITIC_START_EPOCH="${CRITIC_START_EPOCH:-0}"
 CRITIC_SHUFFLE_MODE="${CRITIC_SHUFFLE_MODE:-global}"
+CRITIC_WARMUP_EPOCHS="${CRITIC_WARMUP_EPOCHS:-0}"
+LAMBDA_INFO_RAMP_EPOCHS="${LAMBDA_INFO_RAMP_EPOCHS:-0}"
+SELECTION_AFTER_RAMP="${SELECTION_AFTER_RAMP:-0}"
+LAMBDA_INFO="${LAMBDA_INFO:-1.0}"
+TRAIN_LR="${TRAIN_LR:-1e-4}"
+WARM_START_CKPT="${WARM_START_CKPT:-}"
+REUSE_AE="${REUSE_AE:-0}"
 BALANCE_BINNING="${BALANCE_BINNING:-log_fixed}"
 BALANCE_CLIP_QUANTILE="${BALANCE_CLIP_QUANTILE:-0.995}"
+BALANCE_STRATA="${BALANCE_STRATA:-20}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
 TARGET_SCHEME="${TARGET_SCHEME:-parent4}"
 AE_EXP="${AE_EXP:-ae_engineer_$RUN_TAG}"
@@ -80,27 +88,48 @@ echo "NURD enabled: $NURD_ENABLED"
 echo "Target scheme: $TARGET_SCHEME"
 echo "Critic start epoch: $CRITIC_START_EPOCH (0 means epoch 1)"
 echo "Critic shuffle: $CRITIC_SHUFFLE_MODE"
+echo "Critic-only warm-up epochs: $CRITIC_WARMUP_EPOCHS"
+echo "Lambda ramp epochs: $LAMBDA_INFO_RAMP_EPOCHS"
+echo "Maximum information lambda: $LAMBDA_INFO"
+echo "Selection after ramp: $SELECTION_AFTER_RAMP"
+echo "Training learning rate: $TRAIN_LR"
+echo "Warm-start checkpoint: ${WARM_START_CKPT:-none}"
+echo "Reuse AE: $REUSE_AE"
+echo "Nuisance balance strata: $BALANCE_STRATA"
 echo "Nuisance weight binning: $BALANCE_BINNING"
 echo "Effective-weight clip quantile: $BALANCE_CLIP_QUANTILE"
 echo "Checkpoint interval: $CHECKPOINT_EVERY"
 
-python train_ae.py \
-  --data "$TRAIN_PT" \
-  --gen_weight_path "$GEN_WEIGHT_TRAIN" \
-  --generator_weight_label 1 \
-  --epochs 100 \
-  --batch_size 4096 \
-  --lr 1e-3 \
-  --latent_dim 16 \
-  --enc_nodes 512 256 \
-  --dec_nodes 256 512 \
-  --exp_name "$AE_EXP" \
-  --project_name hlt \
-  --manualSeed 42
+if [[ "$REUSE_AE" == "1" ]]; then
+  if [[ ! -s "$AE_CKPT" ]]; then
+    echo "ERROR: requested reusable AE checkpoint is missing: $AE_CKPT"
+    exit 2
+  fi
+  echo "Reusing existing AE checkpoint: $AE_CKPT"
+else
+  python train_ae.py \
+    --data "$TRAIN_PT" \
+    --gen_weight_path "$GEN_WEIGHT_TRAIN" \
+    --generator_weight_label 1 \
+    --epochs 100 \
+    --batch_size 4096 \
+    --lr 1e-3 \
+    --latent_dim 16 \
+    --enc_nodes 512 256 \
+    --dec_nodes 256 512 \
+    --exp_name "$AE_EXP" \
+    --project_name hlt \
+    --manualSeed 42
+fi
 
 if [[ ! -s "$AE_CKPT" ]]; then
   echo "ERROR: AE checkpoint was not produced: $AE_CKPT"
   exit 2
+fi
+
+WARM_START_ARGS=()
+if [[ -n "$WARM_START_CKPT" ]]; then
+  WARM_START_ARGS=(--warm_start_ckpt "$WARM_START_CKPT")
 fi
 
 python train_hlt.py \
@@ -109,20 +138,23 @@ python train_hlt.py \
   --ae_ckpt "$AE_CKPT" \
   --qcd_label 1 \
   --target_scheme "$TARGET_SCHEME" \
-  --balance_strata 20 \
+  --balance_strata "$BALANCE_STRATA" \
   --balance_binning "$BALANCE_BINNING" \
   --balance_clip_quantile "$BALANCE_CLIP_QUANTILE" \
   --epochs "$NURD_EPOCHS" \
   --lr_schedule_epochs "$LR_SCHEDULE_EPOCHS" \
   --batch_size 4096 \
   --num_workers 0 \
-  --lr 1e-4 \
+  --lr "$TRAIN_LR" \
   --critic_lr 1e-3 \
   --critic_steps 3 \
   --nurd_enabled "$NURD_ENABLED" \
   --critic_start_epoch "$CRITIC_START_EPOCH" \
   --critic_shuffle_mode "$CRITIC_SHUFFLE_MODE" \
-  --lambda_info 1.0 \
+  --critic_warmup_epochs "$CRITIC_WARMUP_EPOCHS" \
+  --lambda_info_ramp_epochs "$LAMBDA_INFO_RAMP_EPOCHS" \
+  --selection_after_ramp "$SELECTION_AFTER_RAMP" \
+  --lambda_info "$LAMBDA_INFO" \
   --contrast_weight "$CONTRAST_WEIGHT" \
   --weight_decay 5e-3 \
   --embed_size 128 \
@@ -137,7 +169,8 @@ python train_hlt.py \
   --exp_name "$NURD_EXP" \
   --project_name hlt \
   --manualSeed 42 \
-  --code_commit "$CODE_COMMIT"
+  --code_commit "$CODE_COMMIT" \
+  "${WARM_START_ARGS[@]}"
 
 NURD_CKPT="$BASE/checkpoints/hlt/hlt/$NURD_EXP/checkpoint_main.pth.tar"
 if [[ ! -s "$NURD_CKPT" ]]; then

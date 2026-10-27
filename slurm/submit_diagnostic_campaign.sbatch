@@ -33,6 +33,11 @@ BALANCE_BINNING="${BALANCE_BINNING:-log_fixed}"
 BALANCE_CLIP_QUANTILE="${BALANCE_CLIP_QUANTILE:-0.995}"
 BALANCE_STRATA="${BALANCE_STRATA:-20}"
 TARGET_SCHEME="${TARGET_SCHEME:-parent4}"
+CRITIC_SHUFFLE_MODE="${CRITIC_SHUFFLE_MODE:-global}"
+LAMBDA_INFO="${LAMBDA_INFO:-1.0}"
+CRITIC_WARMUP_EPOCHS="${CRITIC_WARMUP_EPOCHS:-0}"
+LAMBDA_INFO_RAMP_EPOCHS="${LAMBDA_INFO_RAMP_EPOCHS:-0}"
+SELECTION_AFTER_RAMP="${SELECTION_AFTER_RAMP:-0}"
 TOTAL_HLT_EPOCHS=$((DIAG_SUPCON_EPOCHS + DIAG_NURD_EPOCHS))
 CRITIC_START_EPOCH=$((DIAG_SUPCON_EPOCHS + 1))
 
@@ -68,6 +73,10 @@ echo "Run tag: $RUN_TAG"
 echo "Commit: $CODE_COMMIT"
 echo "Subset events: $DIAG_MAX_EVENTS"
 echo "Target scheme: $TARGET_SCHEME"
+echo "Critic shuffle: $CRITIC_SHUFFLE_MODE"
+echo "Critic-only warm-up epochs: $CRITIC_WARMUP_EPOCHS"
+echo "Lambda ramp epochs: $LAMBDA_INFO_RAMP_EPOCHS"
+echo "Maximum lambda: $LAMBDA_INFO"
 echo "AE epochs: $DIAG_AE_EPOCHS"
 echo "SupCon/classifier-only epochs: $DIAG_SUPCON_EPOCHS"
 echo "Short NURD epochs: $DIAG_NURD_EPOCHS"
@@ -118,8 +127,11 @@ python train_hlt.py \
   --critic_steps 3 \
   --nurd_enabled 1 \
   --critic_start_epoch "$CRITIC_START_EPOCH" \
-  --critic_shuffle_mode global \
-  --lambda_info 1.0 \
+  --critic_shuffle_mode "$CRITIC_SHUFFLE_MODE" \
+  --critic_warmup_epochs "$CRITIC_WARMUP_EPOCHS" \
+  --lambda_info_ramp_epochs "$LAMBDA_INFO_RAMP_EPOCHS" \
+  --selection_after_ramp "$SELECTION_AFTER_RAMP" \
+  --lambda_info "$LAMBDA_INFO" \
   --contrast_weight "$CONTRAST_WEIGHT" \
   --weight_decay 5e-3 \
   --embed_size 128 \
@@ -147,6 +159,7 @@ python scripts/run_training_diagnostics.py \
   --outdir "$DIAG_ROOT" \
   --qcd-label 1 \
   --target-scheme "$TARGET_SCHEME" \
+  --critic-shuffle-mode "$CRITIC_SHUFFLE_MODE" \
   --balance-strata "$BALANCE_STRATA" \
   --balance-binning "$BALANCE_BINNING" \
   --balance-clip-quantile "$BALANCE_CLIP_QUANTILE" \

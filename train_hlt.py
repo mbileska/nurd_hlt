@@ -215,6 +215,23 @@ def build_parser() -> argparse.ArgumentParser:
               "immediately in epoch 1. Ignored when --nurd_enabled=0."),
     )
     parser.add_argument(
+        "--critic_warmup_epochs", type=int, default=0,
+        help=("Number of critic-active epochs with zero encoder information "
+              "penalty. This lets a fresh critic learn before it supplies a "
+              "gradient to a warm-started classifier."),
+    )
+    parser.add_argument(
+        "--lambda_info_ramp_epochs", type=int, default=0,
+        help=("Linearly ramp the encoder information coefficient from zero to "
+              "--lambda_info over this many epochs after critic warm-up. Zero "
+              "preserves the historical sharp switch."),
+    )
+    parser.add_argument(
+        "--selection_after_ramp", type=int, choices=(0, 1), default=0,
+        help=("When enabled, start best-checkpoint selection only after the "
+              "critic warm-up and lambda ramp reach their final value."),
+    )
+    parser.add_argument(
         "--critic_shuffle_mode",
         choices=("weighted_within_class", "global"),
         default="global",
@@ -223,6 +240,13 @@ def build_parser() -> argparse.ArgumentParser:
               "under the effective event measure."))
     parser.add_argument("--lambda_info", "--_lambda", dest="lambda_info",
                         type=float, default=1.0)
+    parser.add_argument(
+        "--warm_start_ckpt", default="",
+        help=("Optional classifier checkpoint used to initialize only the HLT "
+              "model. Optimizers and the critic are deliberately initialized "
+              "fresh. The source checkpoint must be a NURD-inactive baseline "
+              "with the same data, AE, targets, split, and weighting setup."),
+    )
     parser.add_argument("--contrast_weight", type=float, default=0.0)
     parser.add_argument("--contrast_temp", type=float, default=0.05)
     parser.add_argument("--patience", type=int, default=15)
@@ -273,15 +297,51 @@ def nurd_active_for_epoch(
 def checkpoint_selection_start_epoch(
     nurd_enabled: int,
     critic_start_epoch: int,
+    critic_warmup_epochs: int = 0,
+    lambda_info_ramp_epochs: int = 0,
+    selection_after_ramp: int = 0,
 ) -> int:
-    """Delay selection only while an enabled critic is waiting to start."""
+    """Return the first continuation epoch eligible for best-model selection."""
     if int(nurd_enabled) not in (0, 1):
         raise ValueError("nurd_enabled must be zero or one.")
     if critic_start_epoch < 0:
         raise ValueError("critic_start_epoch must be non-negative.")
-    if not int(nurd_enabled) or critic_start_epoch == 0:
-        return 1
-    return critic_start_epoch
+    if critic_warmup_epochs < 0 or lambda_info_ramp_epochs < 0:
+        raise ValueError("NURD warm-up and ramp epochs must be non-negative.")
+    if int(selection_after_ramp) not in (0, 1):
+        raise ValueError("selection_after_ramp must be zero or one.")
+    start = 1 if critic_start_epoch == 0 else critic_start_epoch
+    if not int(nurd_enabled) or not int(selection_after_ramp):
+        return 1 if not int(nurd_enabled) else start
+    if lambda_info_ramp_epochs:
+        return start + critic_warmup_epochs + lambda_info_ramp_epochs - 1
+    return start + critic_warmup_epochs
+
+
+def information_weight_for_epoch(
+    epoch: int,
+    nurd_enabled: int,
+    critic_start_epoch: int,
+    critic_warmup_epochs: int,
+    lambda_info_ramp_epochs: int,
+    maximum_weight: float,
+) -> float:
+    """Return the scheduled encoder information coefficient for one epoch."""
+    if maximum_weight < 0.0:
+        raise ValueError("maximum information weight must be non-negative.")
+    if critic_warmup_epochs < 0 or lambda_info_ramp_epochs < 0:
+        raise ValueError("NURD warm-up and ramp epochs must be non-negative.")
+    if not nurd_active_for_epoch(epoch, nurd_enabled, critic_start_epoch):
+        return 0.0
+    start = critic_start_epoch or 1
+    active_index = epoch - start
+    if active_index < critic_warmup_epochs:
+        return 0.0
+    if lambda_info_ramp_epochs == 0:
+        return float(maximum_weight)
+    ramp_step = active_index - critic_warmup_epochs + 1
+    fraction = min(max(ramp_step / float(lambda_info_ramp_epochs), 0.0), 1.0)
+    return float(maximum_weight) * fraction
 
 
 def cosine_lr_multiplier(
@@ -340,6 +400,78 @@ def validate_ae_training_contract(ae_checkpoint, preprocessing):
             "The AE and NURD stages must use the same aligned physics weights.")
 
 
+def _tensor_equal(left, right) -> bool:
+    return torch.equal(torch.as_tensor(left).cpu(), torch.as_tensor(right).cpu())
+
+
+def load_warm_start_model(
+    model: nn.Module,
+    path: str,
+    args,
+    preprocessing,
+    ae_checkpoint_sha256: str,
+):
+    """Load a compatible NURD-inactive classifier and return its provenance."""
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    required = ("state_dict_model", "preprocessing", "config", "epoch")
+    missing = [key for key in required if key not in checkpoint]
+    if missing:
+        raise KeyError(f"Warm-start checkpoint is missing keys: {missing}")
+    if bool(checkpoint.get("nurd_active", False)):
+        raise ValueError(
+            "Warm-start checkpoint has NURD active. Use a classifier-only "
+            "baseline so the continuation starts from an auditable reference.")
+
+    source = checkpoint["preprocessing"]
+    if source.get("target_scheme", "parent4") != args.target_scheme:
+        raise ValueError("Warm-start target scheme does not match --target_scheme.")
+    if source.get("data_signature") != preprocessing.get("data_signature"):
+        raise ValueError("Warm-start data signature does not match --data.")
+    if source.get("label_map") != preprocessing.get("label_map"):
+        raise ValueError("Warm-start label map does not match this run.")
+    if checkpoint.get("ae_checkpoint_sha256") != ae_checkpoint_sha256:
+        raise ValueError("Warm-start checkpoint was trained with a different AE.")
+
+    source_split = source.get("split", {})
+    current_split = preprocessing.get("split", {})
+    for key in ("train_indices", "validation_indices"):
+        if key not in source_split or key not in current_split:
+            raise ValueError(f"Warm-start preprocessing is missing split field {key}.")
+        if not _tensor_equal(source_split[key], current_split[key]):
+            raise ValueError(f"Warm-start {key} do not match this run.")
+
+    source_generator = source.get("weighting", {}).get("generator", {})
+    current_generator = preprocessing.get("weighting", {}).get("generator", {})
+    checksum_key = "effective_physics_weight_sha256"
+    if (not source_generator.get(checksum_key)
+            or source_generator.get(checksum_key)
+            != current_generator.get(checksum_key)):
+        raise ValueError("Warm-start generator weights do not match this run.")
+
+    source_config = checkpoint["config"]
+    for key in (
+        "embed_size", "latent_dim", "proj_dim", "num_heads", "num_layers",
+        "dim_ff", "linear_dim", "dropout", "contrast_weight", "contrast_temp",
+        "weight_decay", "target_scheme", "qcd_label",
+        "balance_strata", "balance_binning", "balance_clip_quantile",
+    ):
+        if source_config.get(key) != getattr(args, key):
+            raise ValueError(
+                f"Warm-start configuration mismatch for {key}: "
+                f"source={source_config.get(key)!r}, "
+                f"current={getattr(args, key)!r}.")
+
+    model.load_state_dict(checkpoint["state_dict_model"], strict=True)
+    return {
+        "path": os.path.abspath(path),
+        "sha256": file_sha256(path),
+        "source_epoch": int(checkpoint["epoch"]),
+        "source_checkpoint_role": checkpoint.get("checkpoint_role", "unknown"),
+        "source_nurd_active": bool(checkpoint.get("nurd_active", False)),
+        "source_validation_metrics": checkpoint.get("validation_metrics", {}),
+    }
+
+
 def _move_batch(batch: Iterable[torch.Tensor], device: torch.device):
     inputs, labels, nuisance, ae_reco, weights, physics_weights = batch
     return (
@@ -391,6 +523,7 @@ def train_epoch(
     args,
     contrastive_loss,
     nurd_active: bool,
+    information_weight: float,
 ) -> Dict[str, object]:
     metrics = EpochMetrics(model.classifier.out_features)
     critic_iterator = iter(train_loader) if nurd_active else None
@@ -435,7 +568,7 @@ def train_epoch(
             contrast_loss = latent.sum() * 0.0
         total_loss = (
             ce_loss
-            + (args.lambda_info if nurd_active else 0.0) * information_loss
+            + information_weight * information_loss
             + args.contrast_weight * contrast_loss
         )
 
@@ -448,6 +581,7 @@ def train_epoch(
 
     summary = metrics.summary()
     summary["nurd_active"] = bool(nurd_active)
+    summary["effective_lambda_info"] = float(information_weight)
     return summary
 
 
@@ -517,6 +651,8 @@ def main(argv=None):
         raise ValueError("Loss weights must be non-negative.")
     if args.critic_start_epoch < 0:
         raise ValueError("critic_start_epoch must be non-negative.")
+    if args.critic_warmup_epochs < 0 or args.lambda_info_ramp_epochs < 0:
+        raise ValueError("critic warm-up and lambda ramp must be non-negative.")
     if args.checkpoint_every < 0:
         raise ValueError("checkpoint_every must be non-negative.")
     if args.lr_schedule_epochs < 0:
@@ -524,7 +660,9 @@ def main(argv=None):
     if not 0.5 <= args.balance_clip_quantile <= 1.0:
         raise ValueError("balance_clip_quantile must lie in [0.5, 1.0].")
     selection_start_epoch = checkpoint_selection_start_epoch(
-        args.nurd_enabled, args.critic_start_epoch)
+        args.nurd_enabled, args.critic_start_epoch,
+        args.critic_warmup_epochs, args.lambda_info_ramp_epochs,
+        args.selection_after_ramp)
     if selection_start_epoch > args.epochs:
         raise ValueError(
             "The critic must start within the requested epochs: "
@@ -606,6 +744,14 @@ def main(argv=None):
         num_tokens=train_dataset.num_tokens,
         dropout=args.dropout,
     ).to(device)
+    warm_start = None
+    if args.warm_start_ckpt:
+        if not os.path.isfile(args.warm_start_ckpt):
+            raise FileNotFoundError(
+                f"Warm-start checkpoint does not exist: {args.warm_start_ckpt}")
+        warm_start = load_warm_start_model(
+            model, args.warm_start_ckpt, args, preprocessing,
+            ae_checkpoint_sha256)
     critic = HLTCritic(args.latent_dim, num_classes).to(device)
     model_optimizer = torch.optim.Adam(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -642,9 +788,14 @@ def main(argv=None):
         args.balance_clip_quantile, args.lambda_info, args.critic_steps,
         args.critic_shuffle_mode)
     logger.info(
-        "NURD switch: enabled=%d critic_start_epoch=%d "
-        "selection_start_epoch=%d activation=sharp",
-        args.nurd_enabled, args.critic_start_epoch, selection_start_epoch)
+        "NURD schedule: enabled=%d critic_start_epoch=%d "
+        "critic_warmup_epochs=%d lambda_ramp_epochs=%d lambda_max=%.6f "
+        "selection_start_epoch=%d selection_after_ramp=%d",
+        args.nurd_enabled, args.critic_start_epoch,
+        args.critic_warmup_epochs, args.lambda_info_ramp_epochs,
+        args.lambda_info, selection_start_epoch, args.selection_after_ramp)
+    if warm_start is not None:
+        logger.info("Warm-start provenance: %s", warm_start)
     logger.info(
         "Optimization schedule: maximum_epochs=%d lr_schedule_epochs=%d "
         "patience=%d checkpoint_every=%d",
@@ -662,11 +813,15 @@ def main(argv=None):
     for epoch in range(1, args.epochs + 1):
         nurd_active = nurd_active_for_epoch(
             epoch, args.nurd_enabled, args.critic_start_epoch)
-        information_weight = args.lambda_info if nurd_active else 0.0
+        information_weight = information_weight_for_epoch(
+            epoch, args.nurd_enabled, args.critic_start_epoch,
+            args.critic_warmup_epochs, args.lambda_info_ramp_epochs,
+            args.lambda_info)
         train_metrics = train_epoch(
             model, critic, train_loader,
             model_optimizer, critic_optimizer,
-            device, args, contrastive_loss, nurd_active)
+            device, args, contrastive_loss, nurd_active,
+            information_weight)
         val_metrics = validate(
             model, critic, val_loader, device, args.critic_shuffle_mode,
             nurd_active)
@@ -715,6 +870,7 @@ def main(argv=None):
             "effective_lambda_info": information_weight,
             "train_metrics": train_metrics,
             "validation_metrics": val_metrics,
+            "warm_start": warm_start,
         }
         last_payload = current_payload
         if args.checkpoint_every and epoch % args.checkpoint_every == 0:

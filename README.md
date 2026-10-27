@@ -229,10 +229,40 @@ bash slurm/launch_train3m_campaign.sh train3m_v1_diagnostic 0.3 --diagnostic
 TARGET_SCHEME=decay8 \
   bash slurm/launch_train3m_campaign.sh train3m_v1_decay8_diagnostic 0.3 --diagnostic
 
-# After the diagnostic report is healthy, train with NURD enabled from epoch 6.
-NURD_ENABLED=1 CRITIC_START_EPOCH=6 \
-  bash slurm/launch_train3m_campaign.sh train3m_v1_nurd 0.3
+# After establishing a classifier-only baseline, continue from that exact
+# checkpoint with a fresh conditional critic and gradual information ramp.
+BASELINE_TAG=<completed_decay8_supcon_tag>
+AE_EXP="ae_engineer_${BASELINE_TAG}" \
+REUSE_AE=1 \
+WARM_START_CKPT="/scratch/gpfs/IOJALVO/mb7126/nurd_hlt/checkpoints/hlt/hlt/hlt_nurd_engineer_${BASELINE_TAG}/checkpoint_main.pth.tar" \
+TARGET_SCHEME=decay8 \
+NURD_ENABLED=1 \
+CRITIC_START_EPOCH=0 \
+CRITIC_SHUFFLE_MODE=weighted_within_class \
+CRITIC_WARMUP_EPOCHS=3 \
+LAMBDA_INFO_RAMP_EPOCHS=10 \
+LAMBDA_INFO=0.1 \
+SELECTION_AFTER_RAMP=1 \
+TRAIN_LR=3e-5 \
+NURD_EPOCHS=30 \
+LR_SCHEDULE_EPOCHS=30 \
+CHECKPOINT_EVERY=1 \
+  bash slurm/launch_train3m_campaign.sh train3m_v1_decay8_nurd_ramp 0.3
 ```
+
+The same recommended configuration is available through a shorter wrapper:
+
+```bash
+bash slurm/launch_warm_start_nurd.sh \
+  <completed_decay8_supcon_tag> \
+  <new_nurd_run_tag> \
+  0.3
+```
+
+Every wrapper default remains overrideable. For example,
+`LAMBDA_INFO_RAMP_EPOCHS=0` switches the penalty on sharply after the
+configured critic warm-up, while `LAMBDA_INFO=0.05` lowers the final pressure.
+Set both warm-up and ramp lengths to zero to reproduce immediate activation.
 
 `decay8` maps the stored fine-category metadata to QCD, ttbar,
 W$\to e\nu/\mu\nu/\tau\nu$, and Z$\to ee/\mu\mu/\tau\tau$. The W/Z HT
@@ -242,6 +272,17 @@ is performed. Checkpoints record the selected taxonomy, and evaluation derives
 the same labels from `background_category`. The legacy tensor has no such
 metadata, so decay8 campaigns intentionally skip the legacy comparison and
 evaluate only the independent converted holdout.
+
+The continuation launcher refuses incompatible warm starts. It verifies the
+exact data signature, aligned physics-weight checksum, AE checksum, target
+taxonomy, train/validation row indices, architecture, and weighting settings.
+Only the classifier/encoder parameters are restored; the critic and both
+optimizers start fresh. `REUSE_AE=1` avoids retraining the validated AE.
+During `CRITIC_WARMUP_EPOCHS` the critic trains while the encoder information
+coefficient is zero. The coefficient then rises linearly to `LAMBDA_INFO`
+over `LAMBDA_INFO_RAMP_EPOCHS`. With `SELECTION_AFTER_RAMP=1`, best-checkpoint
+selection begins only after the full requested penalty is reached; periodic
+snapshots retain the entire trajectory.
 
 For a later evaluation retry or checkpoint scan, first run
 `source slurm/train3m_environment.sh`; this exports the train/test manifests
@@ -332,6 +373,11 @@ NURD_ENABLED=1 CRITIC_START_EPOCH=6 \
   bash slurm/launch_engineer_campaign.sh <new_run_tag> 0.3
 ```
 
+Those sharp-switch commands are retained for reproducing earlier baselines.
+For a new physics result, prefer the warm-started conditional-ramp workflow
+above. Setting `LAMBDA_INFO_RAMP_EPOCHS=0` preserves the historical on/off
+switch, so the ramp remains a toggleable experiment control.
+
 To recover the earlier weight estimator for a controlled comparison, use
 `BALANCE_BINNING=weighted_quantile BALANCE_CLIP_QUANTILE=1.0`.
 `weighted_within_class` remains available only as the recent
@@ -365,6 +411,20 @@ DIAG_AE_EPOCHS=8 \
 DIAG_SUPCON_EPOCHS=6 \
 DIAG_NURD_EPOCHS=4 \
 DIAG_CRITIC_PROBE_EPOCHS=4 \
+  bash slurm/launch_engineer_campaign.sh <new_diagnostic_tag> 0.3 --diagnostic
+```
+
+The safer conditional-ramp diagnostic is available without source edits:
+
+```bash
+TARGET_SCHEME=decay8 \
+DIAG_SUPCON_EPOCHS=30 \
+DIAG_NURD_EPOCHS=15 \
+CRITIC_SHUFFLE_MODE=weighted_within_class \
+CRITIC_WARMUP_EPOCHS=3 \
+LAMBDA_INFO_RAMP_EPOCHS=7 \
+LAMBDA_INFO=0.1 \
+SELECTION_AFTER_RAMP=1 \
   bash slurm/launch_engineer_campaign.sh <new_diagnostic_tag> 0.3 --diagnostic
 ```
 

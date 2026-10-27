@@ -766,7 +766,7 @@ def plot_training_history(history_path, switch_epoch, path):
 
 
 def critic_predictions(critic, latent, labels, nuisance, weights, device,
-                       batch_size, seed=42):
+                       batch_size, shuffle_mode="global", seed=42):
     critic.eval()
     scores, targets, output_weights = [], [], []
     output_labels, output_nuisance = [], []
@@ -782,7 +782,8 @@ def critic_predictions(critic, latent, labels, nuisance, weights, device,
             w = torch.as_tensor(weights[selected]).float().to(device)
             permutation = torch.randperm(len(selected), generator=generator).to(device)
             examples = make_density_ratio_examples(
-                z, y, n, w, permutation=permutation, shuffle_mode="global")
+                z, y, n, w, permutation=permutation,
+                shuffle_mode=shuffle_mode)
             ex_z, ex_y, ex_n, ex_w, ex_target = examples
             logits = critic(ex_z, ex_y, ex_n)
             scores.append(F.softmax(logits, dim=1)[:, 1].cpu().numpy())
@@ -792,7 +793,7 @@ def critic_predictions(critic, latent, labels, nuisance, weights, device,
             output_nuisance.append(ex_n.cpu().numpy())
             context = critic_context_only_accuracy(
                 critic, z, y, n, w, permutation=permutation,
-                shuffle_mode="global")
+                shuffle_mode=shuffle_mode)
             context_numerator += float(context) * float(ex_w.sum())
             context_denominator += float(ex_w.sum())
     scores = np.concatenate(scores)
@@ -818,6 +819,7 @@ def train_frozen_critic(
     train_latent, train_labels, train_nuisance, train_weights,
     val_latent, val_labels, val_nuisance, val_weights,
     latent_dim, num_classes, epochs, batch_size, learning_rate, device,
+    shuffle_mode="global",
 ):
     torch.manual_seed(42)
     critic = HLTCritic(latent_dim, num_classes).to(device)
@@ -840,13 +842,13 @@ def train_frozen_critic(
             optimizer.zero_grad()
             loss, _accuracy, _ = density_ratio_critic_loss(
                 critic, latent, labels, nuisance, weights,
-                shuffle_mode="global")
+                shuffle_mode=shuffle_mode)
             loss.backward()
             optimizer.step()
             losses.append(float(loss.detach()))
         validation = critic_predictions(
             critic, val_latent, val_labels, val_nuisance, val_weights,
-            device, batch_size)
+            device, batch_size, shuffle_mode=shuffle_mode)
         history.append({
             "epoch": epoch,
             "train_loss": float(np.mean(losses)),
@@ -1079,6 +1081,9 @@ def main(argv=None):
     parser.add_argument("--qcd-label", type=int, default=1)
     parser.add_argument(
         "--target-scheme", choices=TARGET_SCHEMES, default="parent4")
+    parser.add_argument(
+        "--critic-shuffle-mode",
+        choices=("global", "weighted_within_class"), default="global")
     parser.add_argument("--balance-strata", type=int, default=20)
     parser.add_argument("--balance-binning", default="log_fixed")
     parser.add_argument("--balance-clip-quantile", type=float, default=0.995)
@@ -1190,7 +1195,8 @@ def main(argv=None):
         train_effective, baseline["latents"], val_labels, val_nuisance,
         val_effective, baseline["latents"].shape[1],
         len(np.unique(train_labels)), args.critic_probe_epochs,
-        args.batch_size, args.critic_probe_lr, device)
+        args.batch_size, args.critic_probe_lr, device,
+        shuffle_mode=args.critic_shuffle_mode)
     plot_critic_diagnostics(
         probe_history, probe_predictions,
         "Fresh critic on frozen SupCon-only latents", critic_dir)
@@ -1202,7 +1208,8 @@ def main(argv=None):
         train_effective, after["latents"], val_labels, val_nuisance,
         val_effective, after["latents"].shape[1],
         len(np.unique(train_labels)), args.critic_probe_epochs,
-        args.batch_size, args.critic_probe_lr, device)
+        args.batch_size, args.critic_probe_lr, device,
+        shuffle_mode=args.critic_shuffle_mode)
     plot_critic_diagnostics(
         after_probe_history, after_probe_predictions,
         "Fresh critic on frozen post-NURD latents", after_probe_dir)
@@ -1214,7 +1221,8 @@ def main(argv=None):
     final_critic.load_state_dict(after["metadata"]["state_dict_critic"])
     coupled_predictions = critic_predictions(
         final_critic, after["latents"], val_labels, val_nuisance,
-        val_effective, device, args.batch_size)
+        val_effective, device, args.batch_size,
+        shuffle_mode=args.critic_shuffle_mode)
     plot_critic_diagnostics(
         [{"epoch": args.nurd_epoch, "train_loss": float(
             after["metadata"].get("train_metrics", {}).get("critic_loss", math.nan)),
@@ -1235,6 +1243,7 @@ def main(argv=None):
     summary = {
         "protocol": "short_staged_training_diagnostic_no_heldout_access",
         "heldout_sample_accessed": False,
+        "critic_shuffle_mode": args.critic_shuffle_mode,
         "data": {
             "path": str(data_path),
             "events": int(labels_original.numel()),

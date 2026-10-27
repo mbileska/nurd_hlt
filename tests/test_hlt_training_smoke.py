@@ -157,3 +157,87 @@ def test_one_epoch_decay8_target_training_smoke(tmp_path, monkeypatch):
     assert payload["state_dict_model"]["classifier.weight"].shape[0] == 8
     assert payload["preprocessing"]["target_scheme"] == "decay8"
     assert payload["preprocessing"]["target_class_names"][7] == "Z->tautau"
+
+
+def test_warm_started_ramped_nurd_continuation(tmp_path, monkeypatch):
+    generator = torch.Generator().manual_seed(31)
+    n_events = 96
+    labels = torch.arange(n_events) % 4
+    pf = torch.randn(n_events, 6, 7, generator=generator)
+    pf[:, :, 0] = pf[:, :, 0].abs() + 0.1
+    obj = torch.randn(n_events, 2, 4, generator=generator)
+    sample = {"pf": pf, "obj": obj, "label": labels}
+    data_path = tmp_path / "train.pt"
+    weights_path = tmp_path / "weights.pt"
+    ae_path = tmp_path / "ae.pth"
+    torch.save(sample, data_path)
+    torch.save(torch.ones(n_events), weights_path)
+    _, generator_metadata = load_generator_weights(
+        str(weights_path), labels, qcd_label=1, sample=sample)
+
+    features = obj.shape[1] * 4
+    ae_config = {
+        "features": features,
+        "latent_dim": 3,
+        "encoder_config": {"nodes": [12]},
+        "decoder_config": {"nodes": [12, features]},
+        "alpha": 1.0,
+    }
+    ae = HLTAutoencoder(ae_config)
+    torch.save({
+        "ae": ae.state_dict(),
+        "ae_config": ae_config,
+        "ae_scaler": {
+            "mu": torch.zeros(features),
+            "std": torch.ones(features),
+        },
+        "data_signature": sample_signature(sample),
+        "weighting": {"generator": generator_metadata},
+    }, ae_path)
+
+    common = [
+        "--data", str(data_path),
+        "--ae_ckpt", str(ae_path),
+        "--gen_weight_path", str(weights_path),
+        "--batch_size", "16",
+        "--balance_strata", "2",
+        "--critic_steps", "1",
+        "--embed_size", "8",
+        "--latent_dim", "3",
+        "--proj_dim", "3",
+        "--num_heads", "1",
+        "--num_layers", "1",
+        "--dim_ff", "16",
+        "--linear_dim", "2",
+        "--local_testing", "1",
+    ]
+    monkeypatch.chdir(tmp_path)
+    main(common + [
+        "--epochs", "1",
+        "--nurd_enabled", "0",
+        "--exp_name", "baseline",
+    ])
+    baseline = (
+        tmp_path / "checkpoints/hlt/hlt/baseline/checkpoint_main.pth.tar")
+
+    main(common + [
+        "--epochs", "3",
+        "--nurd_enabled", "1",
+        "--critic_shuffle_mode", "weighted_within_class",
+        "--critic_warmup_epochs", "1",
+        "--lambda_info_ramp_epochs", "2",
+        "--selection_after_ramp", "1",
+        "--lambda_info", "0.2",
+        "--warm_start_ckpt", str(baseline),
+        "--exp_name", "continuation",
+    ])
+
+    continuation = (
+        tmp_path / "checkpoints/hlt/hlt/continuation/checkpoint_main.pth.tar")
+    payload = torch.load(continuation, map_location="cpu", weights_only=False)
+    assert payload["epoch"] == 3
+    assert payload["nurd_active"] is True
+    assert payload["effective_lambda_info"] == pytest.approx(0.2)
+    assert payload["warm_start"]["source_epoch"] == 1
+    assert payload["warm_start"]["source_nurd_active"] is False
+    assert payload["config"]["critic_shuffle_mode"] == "weighted_within_class"
