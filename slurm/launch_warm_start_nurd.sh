@@ -47,4 +47,4 @@ echo "AE checkpoint:       $BASE/checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth"
 echo "Classifier checkpoint: $WARM_START_CKPT"
 echo "Schedule: critic warm-up=$CRITIC_WARMUP_EPOCHS, ramp=$LAMBDA_INFO_RAMP_EPOCHS, lambda_max=$LAMBDA_INFO"
 
-exec bash "$SCRIPT_DIR/launch_train3m_campaign.sh" +  "$NEW_RUN_TAG" "$SUPCON_WEIGHT"
+exec bash "$SCRIPT_DIR/launch_train3m_campaign.sh" "$NEW_RUN_TAG" "$SUPCON_WEIGHT"
