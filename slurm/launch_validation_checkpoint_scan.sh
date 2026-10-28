@@ -38,8 +38,14 @@ if [[ ! "$SCAN_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   exit 2
 fi
 
+# Most campaigns train an AE under the same run tag. Warm-started NURD
+# continuations deliberately reuse a validated baseline AE, so allow callers
+# to name that experiment without manufacturing a duplicate checkpoint.
+AE_EXP="${AE_EXP:-ae_engineer_$RUN_TAG}"
+AE_CKPT="${AE_CKPT:-$BASE/checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth}"
+
 for input in \
-  "$BASE/checkpoints/hlt/hlt/ae_engineer_$RUN_TAG/checkpoint_ae.pth" \
+  "$AE_CKPT" \
   "$BASE/checkpoints/hlt/hlt/hlt_nurd_engineer_$RUN_TAG"; do
   if [[ ! -e "$input" ]]; then
     echo "ERROR: required trained-model input is missing: $input"
@@ -55,11 +61,12 @@ fi
 ANALYSIS_COMMIT="$(git rev-parse HEAD)"
 JOB_ID="$(sbatch --parsable \
   --job-name="${RUN_TAG}_valscan" \
-  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",ANALYSIS_COMMIT="$ANALYSIS_COMMIT",RUN_TAG="$RUN_TAG",SCAN_TAG="$SCAN_TAG",EPOCHS_CSV="$EPOCHS_CSV" \
+  --export=ALL,BASE="$BASE",CODE_DIR="$CODE_DIR",ANALYSIS_COMMIT="$ANALYSIS_COMMIT",RUN_TAG="$RUN_TAG",SCAN_TAG="$SCAN_TAG",EPOCHS_CSV="$EPOCHS_CSV",AE_CKPT="$AE_CKPT" \
   slurm/submit_validation_checkpoint_scan.sbatch)"
 
 echo "Run tag:        $RUN_TAG"
 echo "Analysis commit: $ANALYSIS_COMMIT"
+echo "AE checkpoint:   $AE_CKPT"
 echo "Epochs:         ${EPOCHS_CSV:-all saved epochs}"
 echo "Protocol:       training rows fit MD; validation rows report closure"
 echo "Held-out data:  NOT ACCESSED"
