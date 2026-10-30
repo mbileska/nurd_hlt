@@ -23,9 +23,10 @@ from torch.utils.data import DataLoader, TensorDataset
 from models.hlt_autoencoder import HLTAutoencoder
 from utils.hlt_data import load_hlt_sample
 from utils.hlt_weights import (
+    AE_WEIGHTING_SCHEMES,
     effective_mass_by_class,
     load_generator_weights,
-    normalize_generator_weights_for_split,
+    prepare_ae_exposure_weights,
     sample_signature,
     stratified_split_indices,
     weighted_mean_and_std,
@@ -49,6 +50,14 @@ parser.add_argument(
     default="auto",
     help=("auto honors explicit payload scope and treats bare legacy tensors "
           "as single-label weights."),
+)
+parser.add_argument(
+    "--ae_weighting_scheme", "--ae-weighting-scheme",
+    choices=sorted(AE_WEIGHTING_SCHEMES),
+    default="physics",
+    help=("AE optimization measure. physics preserves the cross-section "
+          "mixture; parent_balanced gives each parent equal training mass "
+          "while preserving generator-weight ratios within that parent."),
 )
 parser.add_argument("--epochs",     default=100,    type=int)
 parser.add_argument("-b","--batch_size", default=2048, type=int)
@@ -121,9 +130,19 @@ del obj
 idx_tr, idx_val = stratified_split_indices(
     labels, val_fraction=args.val_split, seed=args.manualSeed,
     weights=physics_weights)
-weights_tr, weights_val, generator_weight_normalization = (
-    normalize_generator_weights_for_split(
-        physics_weights, idx_tr, idx_val))
+(
+    weights_tr,
+    weights_val,
+    physics_weights_tr,
+    physics_weights_val,
+    ae_weighting_metadata,
+) = prepare_ae_exposure_weights(
+    labels,
+    physics_weights,
+    idx_tr,
+    idx_val,
+    scheme=args.ae_weighting_scheme,
+)
 
 mu, std = weighted_mean_and_std(obj_flat[idx_tr], weights_tr)
 std = torch.where(std < 1e-8, torch.ones_like(std), std)
@@ -132,11 +151,15 @@ del obj_flat
 n_features = obj_norm.shape[1]
 log.debug(f"AE input: {obj_norm.shape}  ({n_features} features)")
 log.debug(
-    "AE generator-only all-class train mass=%s validation mass=%s "
-    "normalization=%.8g generator=%s",
+    "AE weighting scheme=%s train mass=%s validation mass=%s "
+    "physics train mass=%s physics validation mass=%s normalization=%.8g "
+    "generator=%s",
+    args.ae_weighting_scheme,
     effective_mass_by_class(labels[idx_tr], weights_tr),
     effective_mass_by_class(labels[idx_val], weights_val),
-    generator_weight_normalization,
+    effective_mass_by_class(labels[idx_tr], physics_weights_tr),
+    effective_mass_by_class(labels[idx_val], physics_weights_val),
+    ae_weighting_metadata["normalization_divisor"],
     generator_metadata,
 )
 
@@ -146,10 +169,10 @@ labels_tr = labels[idx_tr]
 labels_val = labels[idx_val]
 
 dl_tr = DataLoader(
-    TensorDataset(obj_tr, weights_tr, labels_tr),
+    TensorDataset(obj_tr, weights_tr, physics_weights_tr, labels_tr),
     batch_size=args.batch_size, shuffle=True, drop_last=False)
 dl_val = DataLoader(
-    TensorDataset(obj_val, weights_val, labels_val),
+    TensorDataset(obj_val, weights_val, physics_weights_val, labels_val),
     batch_size=args.batch_size, shuffle=False, drop_last=False)
 
 # ── Build AE ──────────────────────────────────────────────────────────────────
@@ -186,7 +209,7 @@ for epoch in range(args.epochs):
     ae.train()
     tr_numerator = 0.0
     tr_denominator = 0.0
-    for batch, weights, _labels in dl_tr:
+    for batch, weights, _physics_weights, _labels in dl_tr:
         batch = batch.to(device)
         weights = weights.to(device)
         optim.zero_grad()
@@ -206,19 +229,34 @@ for epoch in range(args.epochs):
     ae.eval()
     val_numerator = 0.0
     val_denominator = 0.0
+    val_physics_numerator = 0.0
+    val_physics_denominator = 0.0
     with torch.no_grad():
-        for batch, weights, _labels in dl_val:
+        for batch, weights, batch_physics_weights, _labels in dl_val:
             batch = batch.to(device)
             weights = weights.to(device)
+            batch_physics_weights = batch_physics_weights.to(device)
             recon, _ = ae(batch)
             per_event = (recon - batch).square().mean(dim=1)
             val_numerator += float((per_event * weights).sum())
             val_denominator += float(weights.sum())
+            val_physics_numerator += float(
+                (per_event * batch_physics_weights).sum())
+            val_physics_denominator += float(batch_physics_weights.sum())
     val_loss = val_numerator / max(val_denominator, 1e-12)
+    val_physics_loss = (
+        val_physics_numerator / max(val_physics_denominator, 1e-12))
 
-    log.debug(f"Epoch {epoch+1}/{args.epochs}  train={tr_loss:.6f}  val={val_loss:.6f}  lr={scheduler.get_last_lr()[0]:.2e}")
+    log.debug(
+        f"Epoch {epoch+1}/{args.epochs}  train={tr_loss:.6f}  "
+        f"val_exposure={val_loss:.6f}  val_physics={val_physics_loss:.6f}  "
+        f"lr={scheduler.get_last_lr()[0]:.2e}")
     if not args.local_testing:
-        wandb.log({"AE train loss": tr_loss, "AE val loss": val_loss}, step=epoch)
+        wandb.log({
+            "AE train loss": tr_loss,
+            "AE val exposure loss": val_loss,
+            "AE val physics loss": val_physics_loss,
+        }, step=epoch)
 
     if val_loss < best_val:
         best_val = val_loss
@@ -231,11 +269,8 @@ for epoch in range(args.epochs):
                 "std": std.cpu(),
             },
             "weighting": {
-                "method": "generator_only_all_events",
-                "class_balancing": False,
+                **ae_weighting_metadata,
                 "nuisance_balancing": False,
-                "normalization": "divide_by_training_generator_weight_mean",
-                "normalization_divisor": generator_weight_normalization,
                 "included_labels": sorted(
                     int(value) for value in labels.unique().tolist()),
                 "included_event_counts": {
@@ -245,6 +280,10 @@ for epoch in range(args.epochs):
                 "generator": generator_metadata,
                 "split_seed": args.manualSeed,
                 "validation_fraction": args.val_split,
+            },
+            "validation_losses": {
+                "exposure": val_loss,
+                "physics": val_physics_loss,
             },
             "data_signature": data_signature,
             "epoch": epoch + 1,

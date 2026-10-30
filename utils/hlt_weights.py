@@ -1,10 +1,11 @@
 """Weighting and split utilities for the HLT AE/NURD workflow.
 
-The AE uses the physics generator measure directly across every class. NURD
-training additionally targets equal total mass for every background class and
-for every occupied continuous-nuisance stratum inside that class. The strata
-are used only to estimate NURD weights; the critic always receives the
-continuous nuisance value.
+The immutable physics measure is retained for evaluation. AE optimization can
+either use it literally or equalize parent-process exposure while preserving
+generator-weight ratios inside each parent. NURD training additionally targets
+equal total mass for every target class and occupied continuous-nuisance
+stratum inside that class. The strata estimate training weights only; the
+critic always receives the continuous nuisance value.
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ WEIGHT_KEYS = (
 EVENT_ID_KEYS = ("eventid", "event_id", "eventids", "event_ids")
 WEIGHT_SCOPE_KEYS = ("weight_scope", "scope")
 WEIGHT_SCOPES = {"auto", "all_events", "single_label"}
+AE_WEIGHTING_SCHEMES = {"physics", "parent_balanced"}
 
 
 def tensor_sha256(value) -> str:
@@ -416,6 +418,83 @@ def normalize_generator_weights_for_split(
         (generator_weights[train_indices] / normalization).float(),
         (generator_weights[validation_indices] / normalization).float(),
         normalization,
+    )
+
+
+def prepare_ae_exposure_weights(
+    labels: torch.Tensor,
+    physics_weights: torch.Tensor,
+    train_indices: torch.Tensor,
+    validation_indices: torch.Tensor,
+    scheme: str = "physics",
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, object]]:
+    """Build AE optimization weights without modifying the physics measure.
+
+    ``physics`` reproduces the historical corrected workflow: one global
+    rescaling preserves every cross-section and generator-weight ratio.
+    ``parent_balanced`` fits one factor per parent label on the training split,
+    giving every parent equal training mass while preserving all relative
+    generator weights inside that parent. The same fitted factors are applied
+    to validation, so validation never determines an optimization weight.
+
+    Returns exposure train/validation weights, separately normalized physics
+    train/validation weights for diagnostics, and serializable provenance.
+    """
+    if scheme not in AE_WEIGHTING_SCHEMES:
+        raise ValueError(
+            f"AE weighting scheme must be one of {sorted(AE_WEIGHTING_SCHEMES)}, "
+            f"got {scheme!r}.")
+
+    labels = torch.as_tensor(labels).long().reshape(-1)
+    physics_weights = torch.as_tensor(physics_weights).double().reshape(-1)
+    train_indices = torch.as_tensor(train_indices).long().reshape(-1)
+    validation_indices = torch.as_tensor(validation_indices).long().reshape(-1)
+    if labels.numel() != physics_weights.numel():
+        raise ValueError("AE labels and physics weights must align.")
+
+    physics_train, physics_validation, physics_normalization = (
+        normalize_generator_weights_for_split(
+            physics_weights, train_indices, validation_indices))
+
+    class_factors: Dict[int, float] = {}
+    exposure_weights = physics_weights
+    if scheme == "parent_balanced":
+        class_factors = fit_class_balance_factors(
+            labels[train_indices], physics_weights[train_indices])
+        exposure_weights = apply_class_balance_factors(
+            labels, physics_weights, class_factors, normalize_mean=False)
+
+    exposure_train, exposure_validation, exposure_normalization = (
+        normalize_generator_weights_for_split(
+            exposure_weights, train_indices, validation_indices))
+    method = (
+        "generator_only_all_events"
+        if scheme == "physics"
+        else "parent_balanced_generator_shape"
+    )
+    metadata: Dict[str, object] = {
+        "scheme": scheme,
+        "method": method,
+        "class_balancing": scheme == "parent_balanced",
+        "class_factors": class_factors,
+        "normalization": "divide_by_training_exposure_weight_mean",
+        "normalization_divisor": exposure_normalization,
+        "physics_normalization_divisor": physics_normalization,
+        "training_class_mass": effective_mass_by_class(
+            labels[train_indices], exposure_train),
+        "validation_class_mass": effective_mass_by_class(
+            labels[validation_indices], exposure_validation),
+        "physics_training_class_mass": effective_mass_by_class(
+            labels[train_indices], physics_train),
+        "physics_validation_class_mass": effective_mass_by_class(
+            labels[validation_indices], physics_validation),
+    }
+    return (
+        exposure_train,
+        exposure_validation,
+        physics_train,
+        physics_validation,
+        metadata,
     )
 
 

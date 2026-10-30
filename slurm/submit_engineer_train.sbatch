@@ -40,6 +40,7 @@ BALANCE_CLIP_QUANTILE="${BALANCE_CLIP_QUANTILE:-0.995}"
 BALANCE_STRATA="${BALANCE_STRATA:-20}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
 TARGET_SCHEME="${TARGET_SCHEME:-parent4}"
+AE_WEIGHTING_SCHEME="${AE_WEIGHTING_SCHEME:-physics}"
 AE_EXP="${AE_EXP:-ae_engineer_$RUN_TAG}"
 NURD_EXP="${NURD_EXP:-hlt_nurd_engineer_$RUN_TAG}"
 AE_CKPT="$BASE/checkpoints/hlt/hlt/$AE_EXP/checkpoint_ae.pth"
@@ -86,6 +87,7 @@ echo "NURD maximum epochs: $NURD_EPOCHS"
 echo "NURD LR schedule epochs: $LR_SCHEDULE_EPOCHS"
 echo "NURD enabled: $NURD_ENABLED"
 echo "Target scheme: $TARGET_SCHEME"
+echo "AE weighting scheme: $AE_WEIGHTING_SCHEME"
 echo "Critic start epoch: $CRITIC_START_EPOCH (0 means epoch 1)"
 echo "Critic shuffle: $CRITIC_SHUFFLE_MODE"
 echo "Critic-only warm-up epochs: $CRITIC_WARMUP_EPOCHS"
@@ -111,6 +113,7 @@ else
     --data "$TRAIN_PT" \
     --gen_weight_path "$GEN_WEIGHT_TRAIN" \
     --generator_weight_label 1 \
+    --ae_weighting_scheme "$AE_WEIGHTING_SCHEME" \
     --epochs 100 \
     --batch_size 4096 \
     --lr 1e-3 \

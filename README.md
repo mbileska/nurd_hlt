@@ -290,6 +290,31 @@ and their matching NPZ weights so the generic launchers cannot silently fall
 back to the old Mequinna inputs. The launcher also requires the validator's
 `converted_v1/FULL_VALIDATION_PASSED` marker before it will submit any job.
 
+### Parent-balanced AE ablation
+
+The AE optimization measure is independently selectable with
+`AE_WEIGHTING_SCHEME=physics|parent_balanced`. `physics` is the default and
+preserves the literal cross-section mixture. `parent_balanced` fits factors on
+the saved AE training split so QCD, W+jets, Z+jets, and ttbar each contribute
+25% of the AE loss and feature-scaling measure. It preserves generator-weight
+ratios inside each parent and applies the training factors unchanged to
+validation. The original aligned physics weights remain in the checkpoint and
+are still used for physics-weighted diagnostics and final evaluation.
+
+The controlled full comparison has a dedicated launcher:
+
+```bash
+bash slurm/launch_parent_balanced_ae_ablation.sh \
+  train3m_v1_decay8_ae_parentbal_v1 0.3
+```
+
+It uses the validated train3M tensors, trains a new parent-balanced AE, trains
+the decay8 classifier for 50 epochs with NURD disabled, and submits one
+dependent statistically filtered held-out evaluation. Existing outputs are
+never overwritten. The AE checkpoint records its scheme, fitted parent
+factors, exposure and physics class masses, and both exposure-weighted and
+physics-weighted validation losses.
+
 ## Canonical Della run
 
 From the repository root:
