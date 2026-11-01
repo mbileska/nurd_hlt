@@ -64,6 +64,36 @@ def test_validation_uses_training_joint_factors_without_refitting():
         {0: 0.5, 1: 0.5}, abs=1e-6)
 
 
+def test_one_stratum_is_class_only_balance_without_nuisance_dependence():
+    labels = torch.tensor([0, 0, 1, 1, 1, 1])
+    nuisance = torch.tensor([0.01, 1000.0, 0.1, 1.0, 10.0, 100.0])
+    base = torch.tensor([1.0, 3.0, 2.0, 4.0, 8.0, 16.0])
+
+    weights, spec = fit_joint_balance(
+        labels, nuisance, base, n_strata=1, clip_quantile=1.0)
+
+    assert spec["method"] == "uniform_class_only"
+    assert spec["binning"] == "class_only"
+    assert spec["requested_strata"] == 1
+    assert spec["effective_strata"] == 1
+    assert spec["occupied"] == {0: [0], 1: [0]}
+    assert effective_mass_by_class(labels, weights) == pytest.approx(
+        {0: 0.5, 1: 0.5}, abs=1e-6)
+    # Only one constant factor is applied per class, so the physics-weight
+    # ratios inside each class are unchanged.
+    assert float(weights[1] / weights[0]) == pytest.approx(3.0)
+    assert float(weights[3] / weights[2]) == pytest.approx(2.0)
+    assert float(weights[4] / weights[2]) == pytest.approx(4.0)
+    assert float(weights[5] / weights[2]) == pytest.approx(8.0)
+
+    val_labels = torch.tensor([0, 1])
+    val_nuisance = torch.tensor([-1.0e9, 1.0e9])
+    val_base = torch.tensor([5.0, 7.0])
+    val_weights = apply_joint_balance(
+        val_labels, val_nuisance, val_base, spec)
+    assert torch.isfinite(val_weights).all()
+
+
 def test_legacy_generator_weights_apply_only_to_qcd_and_validate_length(tmp_path):
     labels = torch.tensor([0, 1, 1, 2, 3])
     path = tmp_path / "weights.pt"

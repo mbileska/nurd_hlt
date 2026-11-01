@@ -171,8 +171,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--val_split", type=float, default=0.1)
     parser.add_argument("--balance_strata", type=int, default=20,
-                        help="Training-only histogram strata used to estimate weights; "
-                             "never passed to the critic.")
+                        help=("Training-only histogram strata used to estimate "
+                              "weights; never passed to the critic. One selects "
+                              "class-only balancing with no nuisance strata."))
     parser.add_argument(
         "--balance_binning",
         choices=("log_fixed", "weighted_quantile"),

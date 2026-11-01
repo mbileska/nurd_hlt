@@ -315,6 +315,11 @@ never overwritten. The AE checkpoint records its scheme, fitted parent
 factors, exposure and physics class masses, and both exposure-weighted and
 physics-weighted validation losses.
 
+For the follow-up classifier isolation test, `BALANCE_STRATA=1` has explicit
+class-only semantics: it equalizes target-class mass but does not use AE score
+bins to estimate event weights. Values of two or more retain the continuous
+nuisance-stratified behavior.
+
 ## Canonical Della run
 
 From the repository root:

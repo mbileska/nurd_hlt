@@ -580,10 +580,11 @@ def fit_joint_balance(
     The generator-weighted mass of every occupied nuisance stratum is equal
     within a class before clipping, and every class receives equal total mass.
     Strata and clipping are internal weight-estimation devices and are never
-    passed to the model or critic.
+    passed to the model or critic. ``n_strata=1`` is an explicit class-only
+    ablation: it balances class mass without using the nuisance coordinate.
     """
-    if int(n_strata) < 2:
-        raise ValueError("n_strata must be at least two.")
+    if int(n_strata) < 1:
+        raise ValueError("n_strata must be at least one.")
     if binning not in {"weighted_quantile", "log_fixed"}:
         raise ValueError(
             "binning must be 'weighted_quantile' or 'log_fixed'.")
@@ -600,7 +601,18 @@ def fit_joint_balance(
     class_factors = fit_class_balance_factors(labels, base_weights)
     quantile_weights = apply_class_balance_factors(
         labels, base_weights, class_factors, normalize_mean=False).double()
-    if binning == "weighted_quantile":
+    effective_binning = binning
+    if int(n_strata) == 1:
+        # With no internal edge, bucketize assigns every finite nuisance value
+        # to stratum zero. Infinite outer edges also make the training-fitted
+        # contract valid for any finite validation nuisance value.
+        transform = {"kind": "identity"}
+        transformed_nuisance = nuisance
+        edges = torch.tensor(
+            [-float("inf"), float("inf")], dtype=torch.float32)
+        range_quantiles = None
+        effective_binning = "class_only"
+    elif binning == "weighted_quantile":
         transform = {"kind": "identity"}
         transformed_nuisance = nuisance
         edges = weighted_quantile(
@@ -639,7 +651,7 @@ def fit_joint_balance(
         edges = torch.linspace(
             float(lower), float(upper), int(n_strata) + 1,
             dtype=torch.float32)
-    if edges.numel() < 3:
+    if int(n_strata) > 1 and edges.numel() < 3:
         raise ValueError(
             "The continuous nuisance has too few distinct values for balancing.")
     strata = _assign_strata(transformed_nuisance, edges)
@@ -662,8 +674,12 @@ def fit_joint_balance(
 
     spec = {
         "version": 2,
-        "method": "uniform_class_and_occupied_continuous_nuisance_strata",
-        "binning": binning,
+        "method": (
+            "uniform_class_only"
+            if int(n_strata) == 1
+            else "uniform_class_and_occupied_continuous_nuisance_strata"
+        ),
+        "binning": effective_binning,
         "transform": transform,
         "range_quantiles": range_quantiles,
         "edges": edges.cpu(),
