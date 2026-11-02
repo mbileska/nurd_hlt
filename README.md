@@ -320,6 +320,24 @@ class-only semantics: it equalizes target-class mass but does not use AE score
 bins to estimate event weights. Values of two or more retain the continuous
 nuisance-stratified behavior.
 
+The taxonomy-only parent4 control reuses the completed parent-balanced AE,
+keeps the class-only classifier weighting, and disables NURD. Therefore the
+only physics-model change relative to the decay8 class-only run is the target
+map. By default it expects the established parent-balanced AE experiment;
+`PARENT_BALANCED_AE_EXP` can name an equivalent validated checkpoint:
+
+```bash
+bash slurm/launch_parent4_taxonomy_control.sh \
+  train3m_v1_parent4_parentbal_classonly_v1 0.3
+```
+
+The classifier starts from the aligned all-event physics weights, then
+equalizes the four parent totals. Inside each parent it preserves the
+generator-weight ratios and clips only the top 0.5% of effective weights, as
+in the decay8 class-only control. Fine decay, HT, and QCD hard-pT categories
+remain in the converted metadata for stratified splitting and diagnostics;
+they are not discarded by the parent4 target map.
+
 ## Canonical Della run
 
 From the repository root:
