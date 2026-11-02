@@ -321,9 +321,11 @@ bins to estimate event weights. Values of two or more retain the continuous
 nuisance-stratified behavior.
 
 The taxonomy-only parent4 control reuses the completed parent-balanced AE,
-keeps the class-only classifier weighting, and disables NURD. Therefore the
-only physics-model change relative to the decay8 class-only run is the target
-map. By default it expects the established parent-balanced AE experiment;
+uses class-only classifier weighting, and disables NURD. The target map is the
+intended modeling change. Class balancing is consequently refit over the four
+parents, giving each parent 25% exposure instead of allowing W and Z to gain
+extra total mass merely because decay8 gives each three child labels. By
+default it expects the established parent-balanced AE experiment;
 `PARENT_BALANCED_AE_EXP` can name an equivalent validated checkpoint:
 
 ```bash
