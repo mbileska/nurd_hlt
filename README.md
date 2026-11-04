@@ -340,6 +340,24 @@ in the decay8 class-only control. Fine decay, HT, and QCD hard-pT categories
 remain in the converted metadata for stratified splitting and diagnostics;
 they are not discarded by the parent4 target map.
 
+After that classifier-only control has completed, the full parent4 NURD
+continuation is launched with:
+
+```bash
+bash slurm/launch_parent4_full_nurd.sh \
+  <completed_parent4_baseline_tag> <new_parent4_nurd_tag> 0.3
+```
+
+This reuses both the parent-balanced AE and the selected classifier checkpoint.
+It retains class-only weighting (25% mass per parent), uses within-class
+weighted critic shuffling, trains the critic alone for five epochs, ramps the
+information coefficient to 0.1 over fifteen epochs, and then trains for twenty
+epochs at full strength.  The continuation learning rate is `3e-5`, checkpoint
+selection is disabled until the warm-up and ramp finish, and every epoch is
+saved for validation-only checkpoint scans. Environment overrides ending in
+`_OVERRIDE` expose the schedule intentionally without allowing unrelated shell
+settings to contaminate the parent4 contract.
+
 ## Canonical Della run
 
 From the repository root:
