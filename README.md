@@ -358,6 +358,38 @@ saved for validation-only checkpoint scans. Environment overrides ending in
 `_OVERRIDE` expose the schedule intentionally without allowing unrelated shell
 settings to contaminate the parent4 contract.
 
+## Full physics-AE / decay8 / NURD comparison
+
+`slurm/launch_physics_decay8_full_nurd.sh` submits five sequential jobs on the
+validated train3M split: a **fresh physics-weighted AE**, a decay8
+classifier/SupCon baseline, its statistically filtered held-out evaluation, a
+warm-started NURD continuation, and a second held-out evaluation. The AE uses
+the aligned cross-section-times-generator weights with no parent balancing.
+The classifier, SupCon, and NURD losses use class-only balance fitted on the
+training split (`BALANCE_STRATA=1`), preserving physical ratios within each
+decay target. The outer held-out split always uses the original physics weights.
+
+On Della after pulling the campaign commit:
+
+```bash
+cd /home/mb7126/nurd_hlt
+git pull --ff-only origin dismembered-nurd-implementation
+RUN_TAG="train3m_physics_decay8_full_$(date +%Y%m%d_%H%M%S)"
+bash slurm/launch_physics_decay8_full_nurd.sh "$RUN_TAG" 0.3
+```
+
+Defaults are AE 150 epochs maximum (patience 25), classifier-only 80 maximum,
+then NURD 80 maximum (patience 20). The NURD critic trains for five epochs
+without encoder penalty, the penalty ramps over fifteen epochs to 0.1, and
+early stopping is forbidden until **25 more full-strength epochs** have been
+completed (earliest stop epoch 45). Best/last and every-fifth-epoch classifier
+checkpoints are kept. Each stage is a separate 20-hour Slurm allocation and
+starts only when its predecessor exits successfully; the five jobs do not
+occupy GPUs concurrently. Increase a limit via `AE_EPOCHS`,
+`BASELINE_EPOCHS`, or `NURD_EPOCHS` before launching, but check the per-job
+walltime. The two held-out evaluations are for the predeclared comparison,
+not for choosing a post-ramp checkpoint; inspect validation first if tuning.
+
 ## Canonical Della run
 
 From the repository root:

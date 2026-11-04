@@ -24,6 +24,8 @@ RUN_TAG="${RUN_TAG:?RUN_TAG must be supplied by the launcher}"
 CODE_COMMIT="${CODE_COMMIT:?CODE_COMMIT must be supplied by the launcher}"
 CONTRAST_WEIGHT="${CONTRAST_WEIGHT:?CONTRAST_WEIGHT must be supplied by the launcher}"
 NURD_EPOCHS="${NURD_EPOCHS:-40}"
+NURD_PATIENCE="${NURD_PATIENCE:-15}"
+MIN_POST_RAMP_EPOCHS="${MIN_POST_RAMP_EPOCHS:-0}"
 LR_SCHEDULE_EPOCHS="${LR_SCHEDULE_EPOCHS:-$NURD_EPOCHS}"
 NURD_ENABLED="${NURD_ENABLED:-0}"
 CRITIC_START_EPOCH="${CRITIC_START_EPOCH:-0}"
@@ -39,6 +41,8 @@ BALANCE_BINNING="${BALANCE_BINNING:-log_fixed}"
 BALANCE_CLIP_QUANTILE="${BALANCE_CLIP_QUANTILE:-0.995}"
 BALANCE_STRATA="${BALANCE_STRATA:-20}"
 CHECKPOINT_EVERY="${CHECKPOINT_EVERY:-5}"
+AE_EPOCHS="${AE_EPOCHS:-100}"
+AE_PATIENCE="${AE_PATIENCE:-20}"
 TARGET_SCHEME="${TARGET_SCHEME:-parent4}"
 AE_WEIGHTING_SCHEME="${AE_WEIGHTING_SCHEME:-physics}"
 AE_EXP="${AE_EXP:-ae_engineer_$RUN_TAG}"
@@ -84,6 +88,8 @@ echo "AE experiment: $AE_EXP"
 echo "NURD experiment: $NURD_EXP"
 echo "SupCon weight: $CONTRAST_WEIGHT"
 echo "NURD maximum epochs: $NURD_EPOCHS"
+echo "NURD patience: $NURD_PATIENCE"
+echo "Minimum post-ramp epochs: $MIN_POST_RAMP_EPOCHS"
 echo "NURD LR schedule epochs: $LR_SCHEDULE_EPOCHS"
 echo "NURD enabled: $NURD_ENABLED"
 echo "Target scheme: $TARGET_SCHEME"
@@ -114,7 +120,8 @@ else
     --gen_weight_path "$GEN_WEIGHT_TRAIN" \
     --generator_weight_label 1 \
     --ae_weighting_scheme "$AE_WEIGHTING_SCHEME" \
-    --epochs 100 \
+    --epochs "$AE_EPOCHS" \
+    --patience "$AE_PATIENCE" \
     --batch_size 4096 \
     --lr 1e-3 \
     --latent_dim 16 \
@@ -167,7 +174,8 @@ python train_hlt.py \
   --num_layers 4 \
   --dim_ff 512 \
   --linear_dim 16 \
-  --patience 15 \
+  --patience "$NURD_PATIENCE" \
+  --min_post_ramp_epochs "$MIN_POST_RAMP_EPOCHS" \
   --checkpoint_every "$CHECKPOINT_EVERY" \
   --exp_name "$NURD_EXP" \
   --project_name hlt \

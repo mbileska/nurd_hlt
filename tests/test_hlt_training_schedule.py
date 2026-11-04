@@ -8,6 +8,7 @@ from train_hlt import (
     checkpoint_selection_start_epoch,
     cosine_lr_multiplier,
     information_weight_for_epoch,
+    minimum_early_stop_epoch,
     nurd_active_for_epoch,
 )
 
@@ -48,6 +49,15 @@ def test_critic_warmup_and_linear_information_ramp():
     assert checkpoint_selection_start_epoch(
         1, 3, critic_warmup_epochs=2, lambda_info_ramp_epochs=4,
         selection_after_ramp=1) == 8
+    # Epoch 8 first reaches full strength; require five additional epochs.
+    assert minimum_early_stop_epoch(8, 5) == 13
+
+
+def test_minimum_post_ramp_early_stop_epoch_rejects_invalid_values():
+    with pytest.raises(ValueError, match="positive"):
+        minimum_early_stop_epoch(0, 5)
+    with pytest.raises(ValueError, match="non-negative"):
+        minimum_early_stop_epoch(8, -1)
 
 
 def test_zero_length_ramp_preserves_sharp_switch_after_optional_warmup():

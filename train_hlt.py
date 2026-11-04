@@ -252,6 +252,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--contrast_temp", type=float, default=0.05)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument(
+        "--min_post_ramp_epochs", type=int, default=0,
+        help=("Minimum number of epochs strictly after the information ramp "
+              "before early stopping is allowed. Requires NURD and "
+              "--selection_after_ramp=1; zero preserves prior behavior."),
+    )
+    parser.add_argument(
         "--checkpoint_every", type=int, default=0,
         help=("Save a loadable epoch snapshot every N epochs; zero disables "
               "periodic snapshots. A final-state snapshot is also saved when enabled."))
@@ -317,6 +323,14 @@ def checkpoint_selection_start_epoch(
     if lambda_info_ramp_epochs:
         return start + critic_warmup_epochs + lambda_info_ramp_epochs - 1
     return start + critic_warmup_epochs
+
+
+def minimum_early_stop_epoch(selection_start_epoch: int,
+                             min_post_ramp_epochs: int) -> int:
+    """First epoch eligible for early stopping after full-strength training."""
+    if selection_start_epoch < 1 or min_post_ramp_epochs < 0:
+        raise ValueError("Selection epoch must be positive and minimum non-negative.")
+    return selection_start_epoch + min_post_ramp_epochs
 
 
 def information_weight_for_epoch(
@@ -658,6 +672,12 @@ def main(argv=None):
         raise ValueError("checkpoint_every must be non-negative.")
     if args.lr_schedule_epochs < 0:
         raise ValueError("lr_schedule_epochs must be non-negative.")
+    if args.min_post_ramp_epochs < 0:
+        raise ValueError("min_post_ramp_epochs must be non-negative.")
+    if args.min_post_ramp_epochs and not (
+            args.nurd_enabled and args.selection_after_ramp):
+        raise ValueError(
+            "min_post_ramp_epochs requires NURD and selection_after_ramp.")
     if not 0.5 <= args.balance_clip_quantile <= 1.0:
         raise ValueError("balance_clip_quantile must lie in [0.5, 1.0].")
     selection_start_epoch = checkpoint_selection_start_epoch(
@@ -668,6 +688,12 @@ def main(argv=None):
         raise ValueError(
             "The critic must start within the requested epochs: "
             f"start={selection_start_epoch}, epochs={args.epochs}.")
+    early_stop_start_epoch = minimum_early_stop_epoch(
+        selection_start_epoch, args.min_post_ramp_epochs)
+    if early_stop_start_epoch > args.epochs:
+        raise ValueError(
+            "Not enough epochs for the requested post-ramp training: "
+            f"first_early_stop={early_stop_start_epoch}, epochs={args.epochs}.")
 
     set_random_seed(args.manualSeed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -799,9 +825,9 @@ def main(argv=None):
         logger.info("Warm-start provenance: %s", warm_start)
     logger.info(
         "Optimization schedule: maximum_epochs=%d lr_schedule_epochs=%d "
-        "patience=%d checkpoint_every=%d",
+        "patience=%d checkpoint_every=%d first_early_stop_epoch=%d",
         args.epochs, lr_schedule_epochs, args.patience,
-        args.checkpoint_every)
+        args.checkpoint_every, early_stop_start_epoch)
     logger.info("Weighting metadata: %s", preprocessing["weighting"])
 
     best_val = math.inf
@@ -916,7 +942,7 @@ def main(argv=None):
             logger.info("Saved best checkpoint: %s", main_checkpoint_path)
         else:
             bad_epochs += 1
-            if bad_epochs >= args.patience:
+            if epoch >= early_stop_start_epoch and bad_epochs >= args.patience:
                 logger.info("Early stopping after %d non-improving epochs.", bad_epochs)
                 break
 
