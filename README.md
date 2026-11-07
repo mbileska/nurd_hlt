@@ -390,6 +390,44 @@ occupy GPUs concurrently. Increase a limit via `AE_EPOCHS`,
 walltime. The two held-out evaluations are for the predeclared comparison,
 not for choosing a post-ramp checkpoint; inspect validation first if tuning.
 
+### Full-data lambda=1 NURD control, with interim validation scans
+
+This control reuses the **same physics-weighted AE and selected NURD-off
+decay8 classifier** from `train3m_physics_decay8_full_20261104_142222`.
+It trains on the complete 2,066,347-event outer-training split with the same
+class-only loss weights, split, architecture, seed, optimizer, five-epoch
+critic warm-up, fifteen-epoch ramp, and 25-epoch minimum after the ramp as the
+lambda=0.1 continuation. The controlled training change is
+`LAMBDA_INFO=1.0`; model/critic snapshots are saved every **two** epochs. The
+trainer still reports classification validation every epoch. No held-out
+evaluation is submitted automatically: scan saved checkpoints on the saved
+training/validation split first.
+
+```bash
+cd /home/mb7126/nurd_hlt
+git pull --ff-only origin dismembered-nurd-implementation
+BASE_RUN=train3m_physics_decay8_full_20261104_142222
+RUN_TAG="train3m_physics_decay8_lambda1_$(date +%Y%m%d_%H%M%S)"
+bash slurm/launch_physics_decay8_lambda1_control.sh "$BASE_RUN" "$RUN_TAG"
+```
+
+Once the training log says a periodic checkpoint has been saved, a small
+validation-only scan can run while training continues. For example, after
+epochs 20 and 30 have finished:
+
+```bash
+source slurm/train3m_environment.sh
+export AE_EXP="ae_engineer_${BASE_RUN}"
+bash slurm/launch_validation_checkpoint_scan.sh "$RUN_TAG" 20 30
+```
+
+The scan fits QCD MD on saved training rows and reports weighted QCD closure
+on disjoint saved validation rows; it does not open the outer held-out test.
+Each scan is a separate GPU job, so pick a few informative epochs rather than
+scanning every two-epoch checkpoint. The training allocation is capped at
+20 hours; periodic checkpoints make partial progress inspectable, but the
+trainer currently has no optimizer-state resume if that cap is reached.
+
 ## Canonical Della run
 
 From the repository root:

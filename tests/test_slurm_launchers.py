@@ -309,3 +309,109 @@ def test_validation_scan_accepts_reused_ae_checkpoint(tmp_path):
     arguments = capture.read_text(encoding="utf-8")
     assert f'AE_CKPT={baseline_ae}' in arguments
     assert "EPOCHS_CSV=1,3,13" in arguments
+
+
+def test_physics_decay8_lambda1_control_reuses_baseline_and_only_submits_training(
+    tmp_path,
+):
+    source_slurm = Path(__file__).parents[1] / "slurm"
+    slurm = tmp_path / "slurm"
+    slurm.mkdir()
+    for name in (
+        "launch_physics_decay8_lambda1_control.sh",
+        "train3m_environment.sh",
+    ):
+        shutil.copy2(source_slurm / name, slurm / name)
+
+    base = tmp_path / "base"
+    converted = base / "data/train3M_v1/converted_v1"
+    (converted / "train").mkdir(parents=True)
+    (converted / "test").mkdir(parents=True)
+    (converted / "FULL_VALIDATION_PASSED").touch()
+    for path in (
+        converted / "train/sample.json",
+        converted / "test/sample.json",
+        converted / "weight_train.npz",
+        converted / "weight_test.npz",
+    ):
+        path.write_text("input", encoding="utf-8")
+
+    baseline = "train3m_physics_decay8_full_20261104_142222"
+    ae_checkpoint = (
+        base / "checkpoints/hlt/hlt"
+        / f"ae_engineer_{baseline}/checkpoint_ae.pth"
+    )
+    classifier_checkpoint = (
+        base / "checkpoints/hlt/hlt"
+        / f"hlt_nurd_engineer_{baseline}_baseline/checkpoint_main.pth.tar"
+    )
+    for checkpoint in (ae_checkpoint, classifier_checkpoint):
+        checkpoint.parent.mkdir(parents=True)
+        checkpoint.write_bytes(b"checkpoint")
+
+    capture = tmp_path / "submitted.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/bin/bash\n"
+        "if [[ \"$1\" == rev-parse ]]; then echo deadbeef; fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    fake_git.chmod(0o755)
+    fake_sbatch = fake_bin / "sbatch"
+    fake_sbatch.write_text(
+        "#!/bin/bash\n"
+        "printf '%s\\n' \"$@\" > \"$SBATCH_CAPTURE\"\n"
+        "for name in RUN_TAG AE_EXP WARM_START_CKPT REUSE_AE "
+        "AE_WEIGHTING_SCHEME TARGET_SCHEME NURD_ENABLED "
+        "CRITIC_SHUFFLE_MODE CRITIC_WARMUP_EPOCHS "
+        "LAMBDA_INFO_RAMP_EPOCHS LAMBDA_INFO NURD_EPOCHS "
+        "NURD_PATIENCE MIN_POST_RAMP_EPOCHS BALANCE_STRATA "
+        "CHECKPOINT_EVERY TRAIN_PT GEN_WEIGHT_TRAIN; do\n"
+        "  printf '%s=%s\\n' \"$name\" \"${!name}\" >> \"$SBATCH_CAPTURE\"\n"
+        "done\n"
+        "echo 12345\n",
+        encoding="utf-8",
+    )
+    fake_sbatch.chmod(0o755)
+
+    environment = os.environ.copy()
+    environment.update({
+        "BASE": str(base),
+        "SBATCH_CAPTURE": str(capture),
+        "PATH": f"{fake_bin}:{environment['PATH']}",
+        "LAMBDA_INFO": "0.1",
+        "TARGET_SCHEME": "parent4",
+        "BALANCE_STRATA": "20",
+    })
+    result = subprocess.run(
+        [
+            "bash", str(slurm / "launch_physics_decay8_lambda1_control.sh"),
+            baseline, "new_lambda1",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert "Training job:    12345" in result.stdout
+    assert "No held-out evaluation submitted." in result.stdout
+    submitted = capture.read_text(encoding="utf-8")
+    assert "submit_engineer_train.sbatch" in submitted
+    assert "submit_engineer_dual_eval.sbatch" not in submitted
+    assert f"WARM_START_CKPT={classifier_checkpoint}" in submitted
+    assert f"AE_EXP=ae_engineer_{baseline}" in submitted
+    assert f"TRAIN_PT={converted / 'train/sample.json'}" in submitted
+    assert f"GEN_WEIGHT_TRAIN={converted / 'weight_train.npz'}" in submitted
+    for expected in (
+        "REUSE_AE=1", "AE_WEIGHTING_SCHEME=physics", "TARGET_SCHEME=decay8",
+        "NURD_ENABLED=1", "CRITIC_SHUFFLE_MODE=weighted_within_class",
+        "CRITIC_WARMUP_EPOCHS=5", "LAMBDA_INFO_RAMP_EPOCHS=15",
+        "LAMBDA_INFO=1.0", "NURD_EPOCHS=80", "NURD_PATIENCE=20",
+        "MIN_POST_RAMP_EPOCHS=25", "BALANCE_STRATA=1",
+        "CHECKPOINT_EVERY=2",
+    ):
+        assert expected in submitted
