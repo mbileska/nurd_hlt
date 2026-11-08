@@ -415,3 +415,79 @@ def test_physics_decay8_lambda1_control_reuses_baseline_and_only_submits_trainin
         "CHECKPOINT_EVERY=2",
     ):
         assert expected in submitted
+
+
+def test_conditional_md_launcher_uses_train_only_and_selected_checkpoint(tmp_path):
+    source_slurm = Path(__file__).parents[1] / "slurm"
+    slurm = tmp_path / "slurm"
+    slurm.mkdir()
+    for name in (
+        "launch_conditional_md_calibration.sh",
+        "train3m_environment.sh",
+    ):
+        shutil.copy2(source_slurm / name, slurm / name)
+
+    base = tmp_path / "base"
+    converted = base / "data/train3M_v1/converted_v1"
+    (converted / "train").mkdir(parents=True)
+    (converted / "test").mkdir(parents=True)
+    (converted / "FULL_VALIDATION_PASSED").touch()
+    for path in (
+        converted / "train/sample.json",
+        converted / "test/sample.json",
+        converted / "weight_train.npz",
+        converted / "weight_test.npz",
+    ):
+        path.write_text("input", encoding="utf-8")
+    run = "lambda1"
+    ae_exp = "ae_engineer_physics"
+    checkpoint = (
+        base / "checkpoints/hlt/hlt"
+        / f"hlt_nurd_engineer_{run}/checkpoint_main.pth.tar")
+    ae = base / "checkpoints/hlt/hlt" / ae_exp / "checkpoint_ae.pth"
+    for path in (checkpoint, ae):
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"checkpoint")
+
+    capture = tmp_path / "submitted.txt"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    git = fake_bin / "git"
+    git.write_text(
+        "#!/bin/bash\n"
+        "if [[ \"$1\" == rev-parse ]]; then echo deadbeef; fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    git.chmod(0o755)
+    sbatch = fake_bin / "sbatch"
+    sbatch.write_text(
+        "#!/bin/bash\n"
+        "printf '%s\\n' \"$@\" > \"$SBATCH_CAPTURE\"\n"
+        "for name in CHECKPOINT AE_CKPT TRAIN_PT TRAIN_WEIGHTS OUTDIR AE_BINS; do\n"
+        "  printf '%s=%s\\n' \"$name\" \"${!name}\" >> \"$SBATCH_CAPTURE\"\n"
+        "done\n"
+        "echo 12345\n",
+        encoding="utf-8",
+    )
+    sbatch.chmod(0o755)
+    environment = os.environ.copy()
+    environment.update({
+        "BASE": str(base),
+        "SBATCH_CAPTURE": str(capture),
+        "PATH": f"{fake_bin}:{environment['PATH']}",
+    })
+    result = subprocess.run(
+        ["bash", str(slurm / "launch_conditional_md_calibration.sh"),
+         run, ae_exp],
+        check=True, capture_output=True, text=True, env=environment,
+    )
+    assert "Job:           12345" in result.stdout
+    submitted = capture.read_text(encoding="utf-8")
+    assert f"CHECKPOINT={checkpoint}" in submitted
+    assert f"AE_CKPT={ae}" in submitted
+    assert f"TRAIN_PT={converted / 'train/sample.json'}" in submitted
+    assert f"TRAIN_WEIGHTS={converted / 'weight_train.npz'}" in submitted
+    assert "AE_BINS=20" in submitted
+    assert "submit_conditional_md_calibration.sbatch" in submitted
+    assert "test/sample.json" not in submitted

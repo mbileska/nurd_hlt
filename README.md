@@ -428,6 +428,43 @@ scanning every two-epoch checkpoint. The training allocation is capped at
 20 hours; periodic checkpoints make partial progress inspectable, but the
 trainer currently has no optimizer-state resume if that cap is reached.
 
+### Score-level conditional MD calibration diagnostic
+
+`scripts/run_conditional_md_calibration.py` tests whether the observed AE--MD
+dependence is stable enough to calibrate **without retraining either model**.
+It fits the usual physics-weighted QCD PCA/MD reference and a piecewise
+weighted empirical CDF of MD conditional on log10(AE loss), using only QCD
+events in the checkpoint's saved *training* split. The default 20 AE bins
+carry equal QCD physics mass and must each have ESS at least 200. The fitted
+map is frozen before application to the disjoint saved *validation* QCD rows.
+
+The report compares raw and calibrated ABCD nonclosure with identical region
+ESS requirements and also reports the median on grid cells valid in **both**
+scans. It saves bin-level effective statistics, a portable calibration NPZ,
+validation scores/weights, and side-by-side grid and curve plots. It never
+opens the outer test split, and its outcome does not establish signal
+sensitivity: the transformation uses AE loss and can change signal ranking.
+Do not tune bin count or select a final analysis on the outer test sample.
+
+On Della, to compare the selected full-campaign lambda=0.1 and lambda=1.0
+checkpoints under this exact validation protocol:
+
+```bash
+cd /home/mb7126/nurd_hlt
+git pull --ff-only origin dismembered-nurd-implementation
+BASE_RUN=train3m_physics_decay8_full_20261104_142222
+AE_EXP="ae_engineer_${BASE_RUN}"
+bash slurm/launch_conditional_md_calibration.sh "${BASE_RUN}_nurd" "$AE_EXP"
+bash slurm/launch_conditional_md_calibration.sh \
+  train3m_physics_decay8_lambda1_20261107_132516 "$AE_EXP"
+```
+
+Each command submits one validation-only GPU job. Its printed output directory
+contains `conditional_md_report.json`, `conditional_md_fit_train_qcd.npz`,
+`validation_qcd_scores.npz`, and `plots/`. Raw-vs-calibrated closure on the
+same validation events is the meaningful first test; compare the two models
+only after checking their bin ESS and the full closure curves.
+
 ## Canonical Della run
 
 From the repository root:
