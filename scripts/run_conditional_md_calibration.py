@@ -149,7 +149,7 @@ def main(argv=None):
     print(f"QCD: fit={len(train_qcd)}, validation={len(validation_qcd)}", flush=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ae, _ = load_ae(str(ae_path), metadata["ae_scaler"], device)
+    ae = load_ae(str(ae_path), metadata["ae_scaler"], device)
     train_ae = _compute_ae_scores(
         ae, metadata["ae_scaler"], raw["obj"], train_qcd,
         device, args.ae_batch_size)

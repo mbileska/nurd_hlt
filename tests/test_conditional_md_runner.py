@@ -45,7 +45,7 @@ def test_runner_uses_saved_training_split_and_writes_reusable_fit(
                         lambda *_args: (np.arange(n_train), np.arange(n_train, n)))
     monkeypatch.setattr(runner, "file_sha256", lambda _path: "sha")
     monkeypatch.setattr(runner.torch, "load", lambda *_args, **_kwargs: metadata)
-    monkeypatch.setattr(runner, "load_ae", lambda *_args: (object(), {}))
+    monkeypatch.setattr(runner, "load_ae", lambda *_args: object())
     monkeypatch.setattr(runner, "_compute_ae_scores",
                         lambda _model, _scaler, obj_data, indices, *_rest:
                         obj_data[indices, 0, 0].numpy())
