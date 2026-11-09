@@ -249,6 +249,8 @@ def main():
     ae_score, md_score = ae_score[keep], md_score[keep]
     categories = heldout["background_category"][indices].numpy()
     event_ids = heldout["event_id"][indices].numpy()
+    jets = heldout["obj"][indices, :10, 0].numpy().astype(np.float64)
+    ht10_ge30 = np.where(jets >= 30.0, jets, 0.0).sum(axis=1)
     if np.unique(event_ids, axis=0).shape[0] != len(event_ids):
         raise ValueError("Held-out QCD event IDs are not unique")
     qcd_weights = weights[indices]
@@ -260,7 +262,8 @@ def main():
     np.savez_compressed(
         output_dir / "qcd_events.npz", event_id=event_ids,
         background_category=categories, ae_score=ae_score, md_score=md_score,
-        physics_weight=qcd_weights, region=np.asarray(REGIONS)[codes])
+        physics_weight=qcd_weights, ht10_ge30=ht10_ge30,
+        region=np.asarray(REGIONS)[codes])
     with (output_dir / "region_composition.csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader()
@@ -272,6 +275,7 @@ def main():
         "qcd_events": len(indices),
         "global_report_match": True,
         "categories": CATEGORY_NAMES,
+        "ht_definition": "sum of pT >= 30 GeV for first 10 pT-sorted ScoutingPFJet rows in obj; lower bound on full jet HT",
         "regions": rows,
     }
     (output_dir / "region_composition.json").write_text(

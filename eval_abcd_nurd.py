@@ -36,6 +36,7 @@ from models.hlt_autoencoder import HLTAutoencoder
 from utils.hlt_data import load_hlt_sample
 from utils.hlt_targets import TARGET_SCHEMES, checkpoint_target_labels
 from utils.hlt_weights import file_sha256, load_generator_weights, sample_signature
+from utils.hlt_weights import stratified_split_indices
 
 
 # ── ABCD helpers (identical to eval_abcd.py) ─────────────────────────────────
@@ -481,6 +482,14 @@ def ABCD(config):
             {0: "Z+jets", 1: "QCD", 2: "ttbar", 3: "W+jets"},
         ).items()
     }
+    external_parent4 = bool(config.get("external_parent4_view", False))
+    if external_parent4:
+        if target_scheme != "decay8" or config.get("min_md"):
+            raise ValueError("External parent4 view requires a decay8 checkpoint and QCD-only MD")
+        if not config.get("reference_pt") or not config.get("reference_weight_path"):
+            raise ValueError("External parent4 view needs independent reference data and weights")
+        class_names = {0: "Z+jets", 1: "QCD", 2: "ttbar", 3: "W+jets"}
+    input_preprocessing = None if external_parent4 else preprocessing
     expected_ae_sha256 = main_ckpt.get("ae_checkpoint_sha256")
     if not expected_ae_sha256 or file_sha256(
             config["ae_ckpt"]) != expected_ae_sha256:
@@ -514,14 +523,29 @@ def ABCD(config):
             load_physics_weights(
                 config["reference_weight_path"], reference_pt,
                 source_parent_qcd_label))
-        reference_fit_indices, selection_indices = checkpoint_reference_indices(
-            main_ckpt, reference_signature, reference_metadata)
+        if external_parent4:
+            reference_labels = load_hlt_sample(reference_pt)["label"].long().reshape(-1)
+            if not set(reference_labels.unique().tolist()).issubset({0, 1, 2, 3}):
+                raise ValueError("External reference must have parent4 labels 0--3")
+            fit, select = stratified_split_indices(
+                reference_labels, float(config.get("external_val_fraction", .2)),
+                int(config.get("external_reference_seed", 42)),
+                weights=torch.from_numpy(reference_physics))
+            reference_fit_indices = fit.numpy()
+            selection_indices = select.numpy()
+        else:
+            reference_fit_indices, selection_indices = checkpoint_reference_indices(
+                main_ckpt, reference_signature, reference_metadata)
 
     test_physics = None
     if config.get("gen_weight_path"):
         test_physics, _test_metadata, _test_signature = load_physics_weights(
             config["gen_weight_path"], config["test_pt"],
             source_parent_qcd_label)
+    if external_parent4:
+        test_labels = load_hlt_sample(config["test_pt"])["label"].long().reshape(-1)
+        if not set(test_labels.unique().tolist()).issubset({0, 1, 2, 3}):
+            raise ValueError("External test must have parent4 labels 0--3")
 
     # ── AE scores ─────────────────────────────────────────────────────────────
     print("Computing AE scores (bkg)...", flush=True)
@@ -540,7 +564,9 @@ def ABCD(config):
 
     # ── axis 2 scores (MD or logit) ───────────────────────────────────────────
     use_logit  = config.get("axis2_logit", False)
-    axis2_label = "1-P(QCD)" if use_logit else "NURD Contrastive score (MD)"
+    axis2_label = ("1-P(QCD)" if use_logit else
+                   "Classifier latent QCD MD" if external_parent4 else
+                   "NURD Contrastive score (MD)")
     axis2_log_scale = not use_logit   # MD → log y; logit ∈ [0,1] → linear y
 
     # always need latents for PCA embedding plots; get logits too when requested
@@ -548,14 +574,14 @@ def ABCD(config):
         print("Axis 2 = 1-P(QCD) logit mode.", flush=True)
         latents_all, logits_all, labels = embed_pf(
             model, config["test_pt"], device, return_logits=True,
-            preprocessing=preprocessing)
+            preprocessing=input_preprocessing)
         con_bkg = compute_logit_axis2(logits_all, qcd_label=qcd_label)
         class_transforms = []   # not used in logit mode
         md_mu = md_W = None
         if reference_pt:
             reference_latents, reference_logits, reference_labels = embed_pf(
                 model, reference_pt, device, return_logits=True,
-                preprocessing=preprocessing)
+                preprocessing=input_preprocessing)
             reference_axis2 = compute_logit_axis2(
                 reference_logits, qcd_label=qcd_label)
     else:
@@ -578,7 +604,7 @@ def ABCD(config):
             reference_pt=reference_pt,
             reference_weights=reference_physics,
             reference_fit_indices=reference_fit_indices,
-            preprocessing=preprocessing,
+            preprocessing=input_preprocessing,
             class_names=class_names,
             qcd_label=qcd_label,
         )
@@ -638,11 +664,16 @@ def ABCD(config):
         selection_axis1 = ae_reference[selection_mask]
         selection_axis2 = reference_axis2[selection_mask]
         selection_weights = reference_physics[selection_mask]
+        reference_role = (
+            "external legacy reference-train rows" if external_parent4
+            else "saved training rows")
+        selection_role = (
+            "external legacy reference-validation QCD rows" if external_parent4
+            else "saved validation QCD rows")
         print(
-            "Held-out protocol: MD fit on "
-            f"{len(reference_fit_indices)} saved training rows; thresholds selected "
-            f"on {selection_mask.sum()} saved validation QCD rows; independent test "
-            "is report-only.", flush=True)
+            f"Held-out protocol: MD fit on {len(reference_fit_indices)} "
+            f"{reference_role}; thresholds selected on {selection_mask.sum()} "
+            f"{selection_role}; independent test is report-only.", flush=True)
 
     # ── signal (optional) ─────────────────────────────────────────────────────
     sig_axis1 = sig_axis2 = sig_axis2_pca = None
@@ -763,7 +794,9 @@ def ABCD(config):
             "A_hat": report_A_hat,
             "nonclosure": report_nc,
             "region_statistics": report_statistics,
-            "selection_source": "saved_training_validation_split",
+            "selection_source": (
+                "external_parent4_reference_split" if external_parent4
+                else "saved_training_validation_split"),
         })
         report_weights = (
             np.ones(len(axis1_qcd), dtype=np.float64)
@@ -1174,6 +1207,15 @@ def ABCD(config):
         value for value in curve_abs_nonclosure if np.isfinite(value)])
     diagnostics = {
         "evaluation_protocol": best["selection_source"],
+        "external_parent4_view": external_parent4,
+        "source_target_scheme": target_scheme,
+        "report_label_scheme": "parent4" if external_parent4 else target_scheme,
+        "reference_sample": reference_pt,
+        "report_sample": config["test_pt"],
+        "external_reference_seed": (
+            int(config.get("external_reference_seed", 42)) if external_parent4 else None),
+        "external_val_fraction": (
+            float(config.get("external_val_fraction", .2)) if external_parent4 else None),
         "qcd_events": int(len(axis1_qcd)),
         "weighted_qcd": bool(gen_weights_qcd is not None),
         "statistical_filter": {
@@ -1289,5 +1331,10 @@ if __name__ == "__main__":
         "--target_scheme", choices=TARGET_SCHEMES, default=None,
         help=("Optional assertion of the checkpoint target taxonomy. The "
               "checkpoint remains the authoritative source."))
+    parser.add_argument("--external_parent4_view", action="store_true",
+                        help="Opt-in domain-transfer evaluation of a decay8 checkpoint "
+                             "on external parent4 data; never changes normal evaluation")
+    parser.add_argument("--external_val_fraction", type=float, default=.2)
+    parser.add_argument("--external_reference_seed", type=int, default=42)
     args = parser.parse_args()
     ABCD(vars(args))

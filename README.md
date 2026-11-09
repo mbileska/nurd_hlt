@@ -618,6 +618,49 @@ The diagnostic closure plots use only the saved training/validation split and
 are intended to locate bugs, not to select a result after inspecting held-out
 data.
 
+## Train3M lambda and legacy-domain audits (opt-in)
+
+From the Della checkout after pulling this commit:
+
+```bash
+BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
+bash slurm/launch_qcd_lambda_pair_audit.sh qcd_lambda01_vs_1_$(date +%Y%m%d_%H%M%S)
+bash slurm/launch_physics_decay8_lambda25_control.sh \
+  train3m_physics_decay8_full_20261104_142222 \
+  train3m_physics_decay8_lambda25_$(date +%Y%m%d_%H%M%S)
+bash slurm/launch_decay8_parent4_legacy_eval.sh \
+  hlt_nurd_engineer_train3m_physics_decay8_lambda1_20261107_132516 \
+  decay8_lambda1_mequinna_$(date +%Y%m%d_%H%M%S)
+```
+
+The first job recomputes per-event AE and QCD-only MD scores for both
+checkpoints on the identical validated train3M test and validation rows. It
+checks exact event IDs, weights, AE scores, and saved ABCD region yields. The
+paired report under `$BASE/outputs/<audit_tag>/paired/` compares fixed
+validation-fitted cuts at matched weighted QCD A efficiencies, performs a
+paired Poisson event bootstrap, and shows validation-to-test weighted MD
+shifts within QCD 15--50 GeV and reconstructed HT thirds. It is diagnostic:
+the outer test set has already been inspected, and this does not replace a
+new blind sample or account for cross-section/systematic uncertainty.
+
+The second launcher reuses the exact physical-weighted AE and baseline
+classifier, with class-only classifier balancing. Relative to the lambda-one
+control, it changes only the maximum information penalty from 1 to 2.5. It
+submits training plus an after-success statistically-valid held-out evaluation.
+The checkpoint is under `$BASE/checkpoints/hlt/hlt/hlt_nurd_engineer_<tag>/`;
+regular closure plots and `evaluation_summary.json` go under
+`$BASE/outputs/<tag>_eval_stat_valid/`.
+
+The last job is a standalone Mequinna domain-transfer diagnostic. It does not
+retrain or relabel a checkpoint. It adds decay8 probabilities into parent4
+probabilities, refits the QCD MD reference on legacy training QCD, chooses
+thresholds on a disjoint legacy validation split, and reports on the legacy
+test split. Results and regular closure plots go under
+`$BASE/outputs/<tag>_legacy_parent4/`. Bare legacy weights remain QCD-only
+with unit weights on non-QCD rows; there are no event IDs to verify alignment.
+Do not compare its closure directly to train3M held-out closure as though the
+input domains and physics measures were identical.
+
 ## Repository map
 
 - `train_ae.py`, `train_hlt.py`: the only training entry points.
