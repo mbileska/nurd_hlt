@@ -651,6 +651,14 @@ The checkpoint is under `$BASE/checkpoints/hlt/hlt/hlt_nurd_engineer_<tag>/`;
 regular closure plots and `evaluation_summary.json` go under
 `$BASE/outputs/<tag>_eval_stat_valid/`.
 
+To test whether the closure trend continues at lambda 5 without changing
+SupCon or the model/weight contract, use
+`slurm/launch_physics_decay8_lambda5_control.sh` with the same baseline run
+and a fresh tag. This is a stress test: the selected lambda-2.5 checkpoint
+closed much better but had only 31.3% decay8 validation balanced accuracy,
+with several W/tau classes nearly absent. Do not change SupCon in the same
+run or infer improved overall performance from closure alone.
+
 The last job is a standalone Mequinna domain-transfer diagnostic. It does not
 retrain or relabel a checkpoint. It adds decay8 probabilities into parent4
 probabilities, refits the QCD MD reference on legacy training QCD, chooses

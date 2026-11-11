@@ -417,6 +417,83 @@ def test_physics_decay8_lambda1_control_reuses_baseline_and_only_submits_trainin
         assert expected in submitted
 
 
+def test_physics_decay8_lambda5_keeps_lambda25_contract(tmp_path):
+    source_slurm = Path(__file__).parents[1] / "slurm"
+    slurm = tmp_path / "slurm"
+    slurm.mkdir()
+    for name in (
+        "launch_physics_decay8_lambda25_control.sh",
+        "launch_physics_decay8_lambda5_control.sh",
+        "train3m_environment.sh",
+    ):
+        shutil.copy2(source_slurm / name, slurm / name)
+
+    base = tmp_path / "base"
+    converted = base / "data/train3M_v1/converted_v1"
+    (converted / "train").mkdir(parents=True)
+    (converted / "test").mkdir(parents=True)
+    (converted / "FULL_VALIDATION_PASSED").touch()
+    for path in (
+        converted / "train/sample.json", converted / "test/sample.json",
+        converted / "weight_train.npz", converted / "weight_test.npz",
+    ):
+        path.write_text("input", encoding="utf-8")
+
+    baseline = "train3m_physics_decay8_full_20261104_142222"
+    for path in (
+        base / "checkpoints/hlt/hlt" / f"ae_engineer_{baseline}/checkpoint_ae.pth",
+        base / "checkpoints/hlt/hlt"
+        / f"hlt_nurd_engineer_{baseline}_baseline/checkpoint_main.pth.tar",
+    ):
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"checkpoint")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    git = fake_bin / "git"
+    git.write_text(
+        '#!/bin/bash\nif [[ "$1" == rev-parse ]]; then echo deadbeef; fi\n',
+        encoding="utf-8",
+    )
+    git.chmod(0o755)
+    sbatch = fake_bin / "sbatch"
+    sbatch.write_text(
+        '#!/bin/bash\n'
+        'printf "lambda=%s supcon=%s scheme=%s ae=%s strata=%s '
+        'warmup=%s ramp=%s epochs=%s patience=%s ckpt=%s\\n" '
+        '"$LAMBDA_INFO" "$CONTRAST_WEIGHT" "$TARGET_SCHEME" '
+        '"$AE_WEIGHTING_SCHEME" "$BALANCE_STRATA" '
+        '"$CRITIC_WARMUP_EPOCHS" "$LAMBDA_INFO_RAMP_EPOCHS" '
+        '"$NURD_EPOCHS" "$NURD_PATIENCE" "$WARM_START_CKPT" '
+        '>> "$SBATCH_CAPTURE"\n'
+        'printf "args=%s\\n" "$*" >> "$SBATCH_CAPTURE"\n'
+        'echo 12345\n',
+        encoding="utf-8",
+    )
+    sbatch.chmod(0o755)
+    capture = tmp_path / "submitted.txt"
+    environment = os.environ.copy()
+    environment.update({
+        "BASE": str(base), "SBATCH_CAPTURE": str(capture),
+        "PATH": f"{fake_bin}:{environment['PATH']}",
+        "LAMBDA_INFO": "9", "CONTRAST_WEIGHT": "9",
+        "TARGET_SCHEME": "parent4", "BALANCE_STRATA": "20",
+    })
+    result = subprocess.run(
+        ["bash", str(slurm / "launch_physics_decay8_lambda5_control.sh"),
+         baseline, "lambda5_control"],
+        check=True, capture_output=True, text=True, env=environment,
+    )
+    submitted = capture.read_text(encoding="utf-8")
+    assert submitted.count("lambda=5.0") == 2
+    assert "supcon=0.3 scheme=decay8 ae=physics strata=1 " in submitted
+    assert "warmup=5 ramp=15 epochs=80 patience=20" in submitted
+    assert f"ckpt={base}/checkpoints/hlt/hlt/hlt_nurd_engineer_{baseline}_baseline" in submitted
+    assert "submit_engineer_train.sbatch" in submitted
+    assert "submit_engineer_dual_eval.sbatch" in submitted
+    assert "Schedule: warm-up 5, ramp 15 to lambda=5.0" in result.stdout
+
+
 def test_conditional_md_launcher_uses_train_only_and_selected_checkpoint(tmp_path):
     source_slurm = Path(__file__).parents[1] / "slurm"
     slurm = tmp_path / "slurm"
