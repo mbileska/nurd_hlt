@@ -27,7 +27,7 @@ import torch
 import torch.backends.cudnn as cudnn
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 from dataset.hlt_smcocktail_dataset import build_hlt_datasets
 from models.hlt_autoencoder import HLTAutoencoder
@@ -249,6 +249,12 @@ def build_parser() -> argparse.ArgumentParser:
               "with the same data, AE, targets, split, and weighting setup."),
     )
     parser.add_argument("--contrast_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--ce_weight", type=float, choices=(0.0, 1.0), default=1.0,
+        help=("Classification CE coefficient. Zero gives a pure supervised "
+              "contrastive encoder (NURD must be disabled); the classifier "
+              "head and its accuracy are then untrained/meaningless."),
+    )
     parser.add_argument("--contrast_temp", type=float, default=0.05)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument(
@@ -582,7 +588,7 @@ def train_epoch(
         else:
             contrast_loss = latent.sum() * 0.0
         total_loss = (
-            ce_loss
+            args.ce_weight * ce_loss
             + information_weight * information_loss
             + args.contrast_weight * contrast_loss
         )
@@ -608,6 +614,9 @@ def validate(
     device: torch.device,
     critic_shuffle_mode: str,
     nurd_active: bool,
+    contrastive_loss=None,
+    contrast_weight: float = 0.0,
+    ce_weight: float = 1.0,
 ) -> Dict[str, object]:
     model.eval()
     critic.eval()
@@ -636,10 +645,18 @@ def validate(
                 critic_loss, critic_accuracy, context_accuracy)
         else:
             information = latent.sum() * 0.0
+        if ce_weight == 0.0:
+            if contrastive_loss is None or contrast_weight <= 0.0:
+                raise ValueError("Pure SupCon validation requires a contrastive loss.")
+            embeddings = model.get_embeddings(latent)
+            contrast = contrastive_loss(embeddings, labels, weights)
+            total = contrast_weight * contrast
+        else:
+            contrast = latent.sum() * 0.0
+            total = weighted_mean(ce, weights)
         metrics.update_main(
             logits, labels, weights, ce,
-            weighted_mean(ce, weights), information,
-            latent.sum() * 0.0)
+            total, information, contrast)
     summary = metrics.summary()
     summary["nurd_active"] = bool(nurd_active)
     return summary
@@ -662,8 +679,14 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
     if args.critic_steps < 1:
         raise ValueError("critic_steps must be at least one.")
-    if args.lambda_info < 0.0 or args.contrast_weight < 0.0:
+    if args.lambda_info < 0.0 or args.contrast_weight < 0.0 or args.ce_weight < 0.0:
         raise ValueError("Loss weights must be non-negative.")
+    pure_supcon = args.ce_weight == 0.0
+    if pure_supcon and (args.nurd_enabled or args.contrast_weight <= 0.0
+                        or args.warm_start_ckpt):
+        raise ValueError(
+            "Pure SupCon requires NURD disabled, positive contrast_weight, "
+            "and no classifier warm start.")
     if args.critic_start_epoch < 0:
         raise ValueError("critic_start_epoch must be non-negative.")
     if args.critic_warmup_epochs < 0 or args.lambda_info_ramp_epochs < 0:
@@ -750,8 +773,16 @@ def main(argv=None):
         pin_memory=pin_memory,
         drop_last=True,
     )
+    # Validation SupCon depends on within-batch positives and negatives.
+    # Converted data are ordered by parent, so use one fixed mixed-class order
+    # rather than evaluating batches of only one parent or reshuffling each epoch.
+    validation_data = val_dataset
+    if pure_supcon:
+        generator = torch.Generator().manual_seed(args.manualSeed + 104729)
+        validation_data = Subset(
+            val_dataset, torch.randperm(len(val_dataset), generator=generator).tolist())
     val_loader = DataLoader(
-        val_dataset,
+        validation_data,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -771,6 +802,9 @@ def main(argv=None):
         num_tokens=train_dataset.num_tokens,
         dropout=args.dropout,
     ).to(device)
+    if pure_supcon:
+        for parameter in model.classifier.parameters():
+            parameter.requires_grad_(False)
     warm_start = None
     if args.warm_start_ckpt:
         if not os.path.isfile(args.warm_start_ckpt):
@@ -781,7 +815,8 @@ def main(argv=None):
             ae_checkpoint_sha256)
     critic = HLTCritic(args.latent_dim, num_classes).to(device)
     model_optimizer = torch.optim.Adam(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        (parameter for parameter in model.parameters() if parameter.requires_grad),
+        lr=args.lr, weight_decay=args.weight_decay)
     critic_optimizer = torch.optim.Adam(
         critic.parameters(), lr=args.critic_lr,
         weight_decay=args.critic_weight_decay)
@@ -829,7 +864,15 @@ def main(argv=None):
         args.epochs, lr_schedule_epochs, args.patience,
         args.checkpoint_every, early_stop_start_epoch)
     logger.info("Weighting metadata: %s", preprocessing["weighting"])
+    if pure_supcon:
+        logger.info(
+            "Objective: pure SupCon (CE coefficient=0); classifier logits and "
+            "accuracy are untrained diagnostics, not performance metrics.")
 
+    selected_metric = "contrastive_loss" if pure_supcon else "weighted_ce"
+    selection_description = (
+        "training-fit-weighted_validation_supcon" if pure_supcon
+        else "training-fit-weighted_validation_ce")
     best_val = math.inf
     bad_epochs = 0
     main_checkpoint_path = os.path.join(directory, "checkpoint_main.pth.tar")
@@ -851,7 +894,8 @@ def main(argv=None):
             information_weight)
         val_metrics = validate(
             model, critic, val_loader, device, args.critic_shuffle_mode,
-            nurd_active)
+            nurd_active, contrastive_loss=contrastive_loss if pure_supcon else None,
+            contrast_weight=args.contrast_weight, ce_weight=args.ce_weight)
         if model_scheduler is not None:
             model_scheduler.step()
         logger.info(format_metrics("train", epoch, train_metrics))
@@ -891,8 +935,9 @@ def main(argv=None):
             "ae_scaler": preprocessing["ae_scaler"],
             "preprocessing": preprocessing,
             "ae_checkpoint_sha256": ae_checkpoint_sha256,
-            "selection_metric": "training-fit-weighted_validation_ce",
-            "selection_value": float(val_metrics["weighted_ce"]),
+            "selection_metric": selection_description,
+            "selection_value": float(val_metrics[selected_metric]),
+            "classification_head_trained": not pure_supcon,
             "nurd_active": nurd_active,
             "effective_lambda_info": information_weight,
             "train_metrics": train_metrics,
@@ -914,11 +959,13 @@ def main(argv=None):
                 selection_start_epoch)
             continue
 
-        if val_metrics["weighted_ce"] < best_val:
-            best_val = float(val_metrics["weighted_ce"])
+        if val_metrics[selected_metric] < best_val:
+            best_val = float(val_metrics[selected_metric])
             bad_epochs = 0
             payload = dict(current_payload)
-            payload["checkpoint_role"] = "best_weighted_validation_ce"
+            payload["checkpoint_role"] = (
+                "best_weighted_validation_supcon" if pure_supcon
+                else "best_weighted_validation_ce")
             torch.save(payload, main_checkpoint_path)
             torch.save({
                 "epoch": epoch,
@@ -927,15 +974,19 @@ def main(argv=None):
             }, critic_checkpoint_path)
             if wandb is not None:
                 wandb.run.summary["selected_epoch"] = epoch
-                wandb.run.summary[
-                    "selected_validation_balanced_accuracy"
-                ] = val_metrics["balanced_accuracy"]
-                wandb.run.summary[
-                    "selected_validation_weighted_accuracy"
-                ] = val_metrics["weighted_accuracy"]
-                wandb.run.summary[
-                    "selected_weighted_validation_ce"
-                ] = val_metrics["weighted_ce"]
+                if pure_supcon:
+                    wandb.run.summary[
+                        "selected_validation_supcon_loss"] = best_val
+                else:
+                    wandb.run.summary[
+                        "selected_validation_balanced_accuracy"
+                    ] = val_metrics["balanced_accuracy"]
+                    wandb.run.summary[
+                        "selected_validation_weighted_accuracy"
+                    ] = val_metrics["weighted_accuracy"]
+                    wandb.run.summary[
+                        "selected_weighted_validation_ce"
+                    ] = val_metrics["weighted_ce"]
                 wandb.run.summary[
                     "selected_effective_lambda_info"
                 ] = information_weight
@@ -957,9 +1008,11 @@ def main(argv=None):
     history_path = os.path.join(directory, "training_history.json")
     with open(history_path, "w", encoding="utf-8") as output:
         json.dump(history, output, indent=2)
-    logger.info("Done. best weighted validation CE=%.6f", best_val)
+    logger.info("Done. best %s=%.6f", selection_description, best_val)
     if wandb is not None:
-        wandb.run.summary["best_weighted_validation_ce"] = best_val
+        wandb.run.summary[
+            "best_weighted_validation_supcon" if pure_supcon
+            else "best_weighted_validation_ce"] = best_val
         wandb.finish()
 
 

@@ -468,6 +468,11 @@ def ABCD(config):
 
     # ── load models ───────────────────────────────────────────────────────────
     model, main_ckpt = load_nurd_model(config["ckpt"], device)
+    pure_supcon = main_ckpt.get("classification_head_trained") is False
+    if pure_supcon and config.get("axis2_logit"):
+        raise ValueError(
+            "The classifier head is untrained in a pure-SupCon checkpoint; "
+            "evaluate the QCD-latent MD score instead of --axis2_logit.")
     preprocessing = main_ckpt.get("preprocessing", {})
     target_scheme = str(preprocessing.get("target_scheme", "parent4"))
     requested_target_scheme = config.get("target_scheme")
@@ -566,6 +571,7 @@ def ABCD(config):
     use_logit  = config.get("axis2_logit", False)
     axis2_label = ("1-P(QCD)" if use_logit else
                    "Classifier latent QCD MD" if external_parent4 else
+                   "Pure-SupCon latent QCD MD" if pure_supcon else
                    "NURD Contrastive score (MD)")
     axis2_log_scale = not use_logit   # MD → log y; logit ∈ [0,1] → linear y
 
@@ -978,7 +984,7 @@ def ABCD(config):
         ax.axhline(t2_opt, color="black", linestyle="--", linewidth=1.0)
         ax.set_xscale("log"); ax.set_yscale("log")
         ax.set_xlabel("AE reco loss", fontsize=fs)
-        ax.set_ylabel("NURD Contrastive score (PCA-MD)", fontsize=fs)
+        ax.set_ylabel(axis2_label, fontsize=fs)
         ax.set_title("AE vs PCA-MD — all classes (scatter)")
         ax.legend(markerscale=10, fontsize=fs_legend)
         plt.tick_params(axis="x", labelsize=fs_leg)
@@ -1032,7 +1038,7 @@ def ABCD(config):
 
         ax.set_xscale("log"); ax.set_yscale("log")
         ax.set_xlabel("AE reco loss", fontsize=fs)
-        ax.set_ylabel("NURD Contrastive score (PCA-MD)", fontsize=fs)
+        ax.set_ylabel(axis2_label, fontsize=fs)
         ax.axvline(t1_opt, color="black", linestyle="--", linewidth=1.0)
         ax.axhline(t2_opt, color="black", linestyle="--", linewidth=1.0)
         ax.set_title("AE vs PCA-MD — KDE contours")

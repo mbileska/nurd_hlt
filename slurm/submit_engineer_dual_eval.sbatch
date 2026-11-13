@@ -32,6 +32,7 @@ SIGNAL_PT="${SIGNAL_PT:-$BASE/data/hlt_signal_TpTp.pt}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$BASE/outputs/${RUN_TAG}_eval}"
 STATISTICALLY_VALID_CLOSURE="${STATISTICALLY_VALID_CLOSURE:-0}"
 TARGET_SCHEME="${TARGET_SCHEME:-parent4}"
+PLOT_PROJECTOR_KDE="${PLOT_PROJECTOR_KDE:-0}"
 
 mkdir -p "$BASE/logs" "$BASE/outputs" "$BASE/wandb" "$OUTPUT_ROOT/held-out"
 if [[ "$TARGET_SCHEME" == "parent4" ]]; then
@@ -87,6 +88,13 @@ python eval_abcd_nurd.py \
   --wandb_run_name "${RUN_TAG}_held_out${WANDB_EVAL_SUFFIX}" \
   "${STATISTICS_ARGS[@]}" \
   "${SIGNAL_ARGS[@]}"
+
+if [[ "$PLOT_PROJECTOR_KDE" == "1" ]]; then
+  python scripts/plot_pure_supcon_projector.py \
+    --checkpoint "$NURD_CKPT" \
+    --sample "$HELDOUT_PT" \
+    --output-dir "$OUTPUT_ROOT/held-out/plots"
+fi
 
 SUMMARY_ARGS=()
 if [[ "$TARGET_SCHEME" == "parent4" ]]; then

@@ -669,6 +669,31 @@ with unit weights on non-QCD rows; there are no event IDs to verify alignment.
 Do not compare its closure directly to train3M held-out closure as though the
 input domains and physics measures were identical.
 
+## Pure-SupCon representation controls (opt-in)
+
+`CE_WEIGHT=0` disables classification CE and freezes the classifier head;
+`NURD_ENABLED=0` disables the critic. The encoder and projector are trained
+only by supervised contrastive loss. The best checkpoint minimizes a
+deterministic, mixed-class **validation SupCon loss**, not validation CE.
+Classifier accuracy and the logit axis are not meaningful for these runs.
+
+On Della, use the validated train3M split and the existing physics-weighted AE:
+
+```bash
+cd /home/mb7126/nurd_hlt
+bash slurm/launch_pure_supcon_sweep.sh pure_sc_$(date +%Y%m%d_%H%M%S)
+```
+
+The launcher queues 0.1, 0.3, and 0.5 coefficients sequentially, each followed
+by the ordinary weighted held-out AE-vs-QCD-MD evaluation. The usual
+`hist2d_pca_md_kde.png` is in score space; the additional
+`projector_pca_kde_by_class.png` directly visualizes the SupCon-optimized
+representation. The latter fits PCA only for descriptive display and is not
+used for model or threshold selection. Because CE is zero, changing the
+SupCon coefficient only rescales the sole objective; it is **not** a test of
+the CE/SupCon balance. Any differences largely reflect optimization scale
+and its interaction with weight decay.
+
 ## Repository map
 
 - `train_ae.py`, `train_hlt.py`: the only training entry points.

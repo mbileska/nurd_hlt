@@ -23,6 +23,7 @@ GEN_WEIGHT_TRAIN="${GEN_WEIGHT_TRAIN:-$MEQUINNA_DIR/weight_train.pt}"
 RUN_TAG="${RUN_TAG:?RUN_TAG must be supplied by the launcher}"
 CODE_COMMIT="${CODE_COMMIT:?CODE_COMMIT must be supplied by the launcher}"
 CONTRAST_WEIGHT="${CONTRAST_WEIGHT:?CONTRAST_WEIGHT must be supplied by the launcher}"
+CE_WEIGHT="${CE_WEIGHT:-1}"
 NURD_EPOCHS="${NURD_EPOCHS:-40}"
 NURD_PATIENCE="${NURD_PATIENCE:-15}"
 MIN_POST_RAMP_EPOCHS="${MIN_POST_RAMP_EPOCHS:-0}"
@@ -87,6 +88,7 @@ echo "Weights: $GEN_WEIGHT_TRAIN"
 echo "AE experiment: $AE_EXP"
 echo "NURD experiment: $NURD_EXP"
 echo "SupCon weight: $CONTRAST_WEIGHT"
+echo "CE weight: $CE_WEIGHT"
 echo "NURD maximum epochs: $NURD_EPOCHS"
 echo "NURD patience: $NURD_PATIENCE"
 echo "Minimum post-ramp epochs: $MIN_POST_RAMP_EPOCHS"
@@ -166,6 +168,7 @@ python train_hlt.py \
   --selection_after_ramp "$SELECTION_AFTER_RAMP" \
   --lambda_info "$LAMBDA_INFO" \
   --contrast_weight "$CONTRAST_WEIGHT" \
+  --ce_weight "$CE_WEIGHT" \
   --weight_decay 5e-3 \
   --embed_size 128 \
   --latent_dim 6 \
