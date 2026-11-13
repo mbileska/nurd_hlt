@@ -6,10 +6,13 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
-set -euo pipefail
+# Cluster module/Conda initialization may read an unset PS1, so enable
+# nounset only after the environment has been activated.
+set -eo pipefail
 module load anaconda3/2025.12
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate disco
+set -u
 export MPLCONFIGDIR="$BASE/matplotlib"
 mkdir -p "$MPLCONFIGDIR"
 cd "${CODE_DIR:?}"

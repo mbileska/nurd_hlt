@@ -31,6 +31,12 @@ def test_extraction_contract():
     assert pdg_categories(pf[:, :, 6])[active].tolist() == [0, 2]
 
 
+def test_batch_shell_defers_nounset_until_after_conda():
+    script = (Path(__file__).resolve().parents[1]
+              / "slurm/submit_input_domain_comparison.sbatch").read_text()
+    assert script.index("conda activate disco") < script.index("set -u\n")
+
+
 def test_cli_writes_exactly_ten_figures(tmp_path):
     n = 16
     labels = np.tile(np.arange(4, dtype=np.int64), 4)
