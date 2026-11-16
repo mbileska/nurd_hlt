@@ -694,6 +694,56 @@ SupCon coefficient only rescales the sole objective; it is **not** a test of
 the CE/SupCon balance. Any differences largely reflect optimization scale
 and its interaction with weight decay.
 
+### Frozen encoder/projector separation audit
+
+After all three pure-SupCon runs finish, submit **one** GPU analysis job:
+
+```bash
+bash slurm/launch_representation_audit.sh train3m_puresc_20261113_174126
+```
+
+This does not train or alter either network. It recovers each checkpoint's saved
+training/validation indices, checks the input/physics-weight/AE fingerprints,
+and requires identical splits across the three models. The outer test is not
+opened. All saved training rows are used for a fixed-C multinomial logistic
+probe, with a training-weight-fitted StandardScaler and the checkpoint's
+training-fitted class/physics effective weights. Validation accuracy, macro
+recall, and confusion matrices are reported under raw, training-effective, and
+physical measures; these measures must not be conflated.
+
+kNN uses a fixed seed, at most 5,000 uniformly selected training examples per
+decay class, and k=25. The main vote is inverse-distance times the training
+effective event weight, corrected for the support's class-dependent inclusion
+probability. An inverse-distance-only control uses exactly the same neighbors.
+Encoder kNN uses training-standardized coordinates; projector kNN uses the
+normalized projector output directly (Euclidean/cosine-equivalent ranking).
+No k, C, or score orientation is selected on validation. Probe convergence and
+representation covariance eigenvalues are recorded.
+
+Parent4 reports both summed decay probabilities and mapped decay argmax. This
+is an aggregation diagnostic, **not** training a new parent4 probe. MD fits use
+all training QCD with unmodified physics weights in each representation, with
+the existing eigenvalue floor of 1e-6. Both the QCD reference and the AE/MD
+percentile thresholds are training-fitted; disjoint validation reports weighted
+ABCD closure. These grids are not directly identical to older held-out scans
+whose percentile thresholds came from validation.
+
+The launcher prints the output directory. It contains `audit_summary.json`,
+`probe_metrics.csv`, and one directory per run, each with eight PNGs:
+
+- `linear_confusion_{raw,training_effective}.png` and
+  `knn_confusion_{raw,training_effective}.png`: encoder/projector by decay8/parent4;
+- `md_discrimination.png`: raw and physics-weighted class-vs-QCD ROC AUC;
+- `md_closure_validation.png`: matched reference-percentile grids and curves;
+- `md_distributions.png`: per-class physics-weighted score distributions;
+- `md_qcd_ae_plane.png`: genuinely physics-weighted QCD AE-vs-MD histograms.
+
+Compact probe/MD fits and event-aligned validation embeddings, probabilities,
+scores, weights, categories, and IDs are saved in NPZ files. No PF tensors or
+training embeddings are copied. Good class separation does not by itself imply
+QCD closure or signal sensitivity; this audit distinguishes representation,
+scalar-score, and weighting effects before another network training run.
+
 ## Repository map
 
 - `train_ae.py`, `train_hlt.py`: the only training entry points.
