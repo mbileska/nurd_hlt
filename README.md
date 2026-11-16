@@ -873,6 +873,46 @@ agreement; `selected_validation_scores.npz` and `training_qcd_reference.npz`
 retain the compact all-class scores/latents and fitted reference for future
 plotting. No PF tensors are copied and no source tail outputs are overwritten.
 
+## Full-sample QCD-MD versus 1-P(QCD) evaluation
+
+This standalone, evaluation-only control defaults to the selected full-model
+lambda=1 checkpoint (`train3m_physics_decay8_lambda1_20261107_132516`) and its
+exact physics-weighted AE. It runs `eval_abcd_nurd.py` twice, changing axis 2
+only via the existing `--axis2_logit` flag. There is **no top-10% selection,
+resampling, conditional calibration, or retraining**. Both modes use the full
+converted train3M held-out sample and original aligned physics weights.
+QCD MD is fit on the saved training QCD; each mode selects its own usual cuts
+on saved validation QCD, then applies those numerical cuts to held-out data.
+This deliberately reproduces ordinary evaluation, not matched efficiencies.
+
+```bash
+cd /home/mb7126/nurd_hlt
+export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
+TAG="lambda1_md_vs_pqcd_$(date +%Y%m%d_%H%M%S)"
+bash slurm/launch_abcd_axis_comparison.sh "$TAG" gpu
+```
+
+The GPU is generic (no A100 constraint); pass `cpu` instead for CPU-only
+inference. One job evaluates the modes sequentially. `MODEL_CKPT` and
+`AE_CKPT` may explicitly override the checkpoint paths; the evaluator checks
+the exact AE hash and saved reference split. The optional existing TpTp
+benchmark gets the usual plots if available; use `INCLUDE_SIGNAL=0` to omit it.
+
+Results are in `$BASE/outputs/${TAG}_axis_comparison/`:
+
+- `qcd_md/held-out/plots/` and `one_minus_pqcd/held-out/plots/`: usual evaluator figures.
+- Each mode also has `diagnostics.json` and `abcd_thresholds.json` under `held-out/`.
+- `axis_comparison.csv` and `.json`: closure, predicted/observed with sumw2
+  uncertainty, thresholds, grid summaries, and actual weighted QCD A efficiency.
+- `comparison_manifest.json`: commands and immutable input file hashes.
+
+The comparison fails if accepted event masks, sample signatures, physical
+weights, validation selection masks, or conserved QCD totals differ. The
+normal evaluator's existing plot/count conventions are retained: raw-count
+histograms/KDEs are not substituted for physics-weighted closure. Grid
+summaries are descriptive; held-out data never choose the working point.
+No existing output is overwritten.
+
 ## Repository map
 
 - `train_ae.py`, `train_hlt.py`: the only training entry points.

@@ -36,7 +36,7 @@ from models.hlt_autoencoder import HLTAutoencoder
 from utils.hlt_data import load_hlt_sample
 from utils.hlt_targets import TARGET_SCHEMES, checkpoint_target_labels
 from utils.hlt_weights import file_sha256, load_generator_weights, sample_signature
-from utils.hlt_weights import stratified_split_indices
+from utils.hlt_weights import stratified_split_indices, tensor_sha256
 
 
 # ── ABCD helpers (identical to eval_abcd.py) ─────────────────────────────────
@@ -543,6 +543,7 @@ def ABCD(config):
                 main_ckpt, reference_signature, reference_metadata)
 
     test_physics = None
+    _test_metadata = _test_signature = None
     if config.get("gen_weight_path"):
         test_physics, _test_metadata, _test_signature = load_physics_weights(
             config["gen_weight_path"], config["test_pt"],
@@ -882,7 +883,7 @@ def ABCD(config):
                      f"|test non-closure|={100.0*abs(best['nonclosure']):.2f}%\n"
                      f"{wp_validity_label}")
     ax.set_xlabel("Percentile threshold, axis 1 (AE reco loss)", fontsize=fs_leg)
-    ax.set_ylabel("Percentile threshold, axis 2 (NURD contrastive MD)", fontsize=fs_leg)
+    ax.set_ylabel(f"Percentile threshold, axis 2 ({axis2_label})", fontsize=fs_leg)
     ax.set_title("ABCD closure scan (full grid)", fontsize=fs_leg)
     ax.legend(loc="lower left", fontsize=12, framealpha=0.9)
     fig.tight_layout()
@@ -1213,6 +1214,36 @@ def ABCD(config):
         value for value in curve_abs_nonclosure if np.isfinite(value)])
     diagnostics = {
         "evaluation_protocol": best["selection_source"],
+        "axis2_score": (
+            "one_minus_qcd_probability" if use_logit else
+            "minimum_background_mahalanobis" if config.get("min_md") else
+            "qcd_mahalanobis"),
+        # Audit-only metadata: does not change inference, cuts, or counting.
+        "population_audit": {
+            "report_events_before_mask": int(len(mask)),
+            "report_events_after_mask": int(mask.sum()),
+            "accepted_event_mask_sha256": tensor_sha256(mask),
+            "report_data_signature": _test_signature,
+            "report_physics_weight_sha256": (
+                _test_metadata["effective_physics_weight_sha256"]
+                if _test_metadata is not None else None),
+            "report_weight_scope": (
+                _test_metadata["weight_scope"]
+                if _test_metadata is not None else None),
+            "reference_data_signature": reference_signature,
+            "reference_physics_weight_sha256": (
+                reference_metadata["effective_physics_weight_sha256"]
+                if reference_pt else None),
+            "reference_fit_indices_sha256": (
+                tensor_sha256(reference_fit_indices)
+                if reference_pt else None),
+            "threshold_selection_indices_sha256": (
+                tensor_sha256(selection_indices)
+                if reference_pt else None),
+            "threshold_selection_event_mask_sha256": (
+                tensor_sha256(selection_mask)
+                if reference_pt else None),
+        },
         "external_parent4_view": external_parent4,
         "source_target_scheme": target_scheme,
         "report_label_scheme": "parent4" if external_parent4 else target_scheme,
