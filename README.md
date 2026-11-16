@@ -744,6 +744,60 @@ training embeddings are copied. Good class separation does not by itself imply
 QCD closure or signal sensitivity; this audit distinguishes representation,
 scalar-score, and weighting effects before another network training run.
 
+## AE-tail validation closure (CPU-only)
+
+For a full-network baseline, the default is the selected lambda=1 decay8 model
+`train3m_physics_decay8_lambda1_20261107_132516` (epoch 22), not a pure-SupCon
+model. The existing physical AE and full-training-QCD MD reference are frozen.
+
+```bash
+bash slurm/launch_ae_tail_validation.sh lambda1_top10_$(date +%Y%m%d_%H%M%S)
+```
+
+One CPU job (4 cores, 12 GB, two-hour limit; **no GPU**) scores the AE on the
+saved validation rows. It reuses `raw_md` from the existing lambda=1 cache under
+`outputs/train3m_physics_decay8_lambda1_20261107_132516_conditional_md_20261108_154347/`.
+Only the uncalibrated MD field is used; conditional calibration is **not**
+applied. Cache checkpoint/AE hashes, row membership, physics weights, reference
+population counts, and recomputed AE scores are checked before interpretation.
+If the cache is missing or incompatible, the job refuses to proceed rather than
+silently doing full CPU PF inference. `AE_TAIL_CACHE_DIR` can name another
+compatible conditional-MD cache directory.
+
+The default `raw-all` selects exactly the highest-AE 10% of validation **rows
+across all eight background classes**, with deterministic source-row tie
+breaking. This is not necessarily 10% of the physical QCD rate. The optional
+second argument `physics-qcd` instead applies the validation-fitted, weighted
+QCD 90th-percentile AE boundary to all classes, including boundary ties:
+
+```bash
+bash slurm/launch_ae_tail_validation.sh lambda1_physical_tail physics-qcd
+```
+
+Both modes are exploratory validation diagnostics. Within the retained QCD
+population, the AE and MD thresholds are rescanned at conditional weighted
+percentiles 0.50--0.98. The original tail boundary is **not** used as the ABCD
+AE split, which would empty C and D. The fixed reported working point is the
+conditional median/median, not the best closure cell. The reference remains
+the original, unrestricted training QCD reference; it is not refit in the tail.
+Closure uses physics weights with the existing per-region ESS minimums
+A/B/C=50 and D=500. Insufficient cells remain masked even if the entire tail
+grid fails the requirements.
+
+Results are in `outputs/<tag>_ae_tail_validation/`: `tail_summary.json`, six
+plots under `plots/`, event-aligned AE-selection and QCD-score NPZ files, scan
+arrays, and a category/region composition CSV when QCD survives. The plots are
+`closure_scan_2d.png`, `cut_and_count_bkg_check.png`,
+`closure_effective_statistics.png`, `qcd_ae_md.png`,
+`selection_retention.png`, and `ae_selection.png`. No classification probe,
+signal inference, model training, or held-out sample access occurs. Improved
+tail closure would apply only to that selected population, not establish
+global factorization or signal sensitivity.
+
+Use a separate code checkout if other jobs are still queued/running: existing
+launchers check their submitted commit and deliberately fail if their checkout
+has changed underneath them.
+
 ## Repository map
 
 - `train_ae.py`, `train_hlt.py`: the only training entry points.
