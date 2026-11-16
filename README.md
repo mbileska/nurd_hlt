@@ -822,6 +822,57 @@ Use a separate code checkout if other jobs are still queued/running: existing
 launchers check their submitted commit and deliberately fail if their checkout
 has changed underneath them.
 
+### The complete usual evaluation plot suite for the selected tail
+
+After a `physics-all` tail job completes, generate the normal per-class plots,
+KDE, PCA, profiles, and standalone closure figures without changing the models,
+AE selection, or saved ABCD thresholds:
+
+```bash
+bash slurm/launch_ae_tail_standard_plots.sh latest lambda1_tail_visuals cpu
+# Or use a specific source directory and optionally any generic GPU:
+bash slurm/launch_ae_tail_standard_plots.sh \
+  "$BASE/outputs/<tag>_ae_tail_validation" lambda1_tail_visuals_gpu gpu
+```
+
+`latest` selects the newest completed **physics-all** tail report, not the
+newest raw-MC diagnostic. The launcher prints the exact source directory.
+The default is CPU-only (24-hour walltime cap, 4 cores, 48 GB); `gpu` requests
+one generic GPU with an eight-hour cap, never specifically an A100. This job
+is more work than the quick tail scan: the old scalar-QCD cache does not store
+the all-class latents. It performs frozen inference on the full training QCD
+reference and selected validation events, verifies the rebuilt QCD MD against
+the original cache, then keeps the cached QCD values exactly. There is **no
+network training** and no held-out background access. Benchmark TpTp overlays
+are included if `data/hlt_signal_TpTp.pt` exists; `INCLUDE_SIGNAL=0` disables them.
+The signal receives the same background-defined AE cut and does not affect the
+mixture, reference, or percentile selection.
+
+The output `outputs/<plot-tag>_standard_plots/plots/` contains the ordinary
+filenames, including `hist2d_pca_md_kde.png`, `hist2d_pca_md_scatter.png`,
+`hist2d_by_class_combined.png`, `hist2d_bkg.png`, each `hist2d_<class>.png`,
+`pca_scatter_embeddings.png`, `pca_corner.png`, the four `profile_*.png` figures,
+`closure_scan_2d.png`, and `cut_and_count_bkg_check.png` (plus `hist2d_TpTp.png`
+when signal survives). Figure canvases, fonts, DPI, class colors, log axes,
+and KDE contour heights match `eval_abcd_nurd.py`: score plots 8x6 inches,
+histograms 6x5, closure grid 7.5x6.5, 200 DPI. The corner retains its usual wide
+layout. Titles explicitly say validation, not held-out.
+
+Unlike the historical raw-count displays, histograms and KDEs use the original
+physics weights; profiles use weighted means and effective-statistics errors.
+Class KDEs are conditional **shapes**, not relative parent yields. Scatter/PCA
+plots use fixed-seed, per-class physics-weighted draws for display only;
+resampled points are never used in ABCD, fitting, KDE, or uncertainty estimates.
+The PCA reference is fitted on physics-weighted training QCD, not selected
+validation. Closure retains the original effective-count mask. Standard display
+limits (100% closure color cap, ratio axis 0--1.5) are preserved; the source
+summary's numerical values remain uncapped.
+
+`plot_suite_metadata.json` records the weighting/display protocol and cache
+agreement; `selected_validation_scores.npz` and `training_qcd_reference.npz`
+retain the compact all-class scores/latents and fitted reference for future
+plotting. No PF tensors are copied and no source tail outputs are overwritten.
+
 ## Repository map
 
 - `train_ae.py`, `train_hlt.py`: the only training entry points.
