@@ -24,7 +24,7 @@ def test_literal_top_ten_percent_across_all_classes_not_physics_measure():
     labels[-10:] = 2
     weights = np.ones(100)
     weights[0] = 1e9
-    selected, report = tail.select_tail(scores, labels, weights, np.arange(100))
+    selected, report = tail.select_tail(scores, labels, weights, np.arange(100), measure="raw-all")
     assert np.array_equal(np.flatnonzero(selected), np.arange(90, 100))
     assert report["ae_boundary"] == 90
     assert report["selected_raw_fraction"] == .1
@@ -34,9 +34,9 @@ def test_tied_raw_scores_use_row_id_not_class():
     scores = np.ones(10)
     labels = np.arange(10) % 8
     rows = np.arange(10)[::-1]
-    selected, _ = tail.select_tail(scores, labels, np.ones(10), rows, fraction=.2)
+    selected, _ = tail.select_tail(scores, labels, np.ones(10), rows, fraction=.2, measure="raw-all")
     assert set(rows[selected]) == {0, 1}
-    second, _ = tail.select_tail(scores, labels[::-1], np.ones(10), rows, fraction=.2)
+    second, _ = tail.select_tail(scores, labels[::-1], np.ones(10), rows, fraction=.2, measure="raw-all")
     assert np.array_equal(selected, second)
 
 
@@ -48,6 +48,48 @@ def test_physics_qcd_quantile_applies_same_cut_to_all_classes():
     selected, report = tail.select_tail(scores, labels, weights, np.arange(10), measure="physics-qcd")
     assert report["ae_boundary"] == 0
     assert selected.all()  # all boundary ties kept, not falsely reported as exact 10%
+
+
+def test_default_uses_full_physics_mixture_before_selection_not_raw_or_qcd_only():
+    scores = np.arange(1000, dtype=float)
+    labels = np.r_[np.ones(900, dtype=int), np.full(100, 2)]
+    weights = np.r_[np.full(900, 10.), np.ones(100)]
+    before = scores.copy()
+    rows = np.arange(1000)
+    selected, result = tail.select_tail(scores, labels, weights, rows)
+    assert result["measure"] == "physics-all"
+    assert result["reference_population"] == "all_backgrounds"
+    assert result["ae_boundary"] == 818
+    assert result["selected_rows"] != 100
+    fraction = weights[selected].sum() / weights.sum()
+    assert .1 <= fraction <= .1 + result["reference_boundary_physics_fraction"]
+    _, qcd = tail.select_tail(scores, labels, weights, rows, measure="physics-qcd")
+    assert qcd["ae_boundary"] != result["ae_boundary"]
+    # Cross-section factors on other parents must affect the all-parent cut.
+    alternate = weights.copy()
+    alternate[labels == 2] *= 1000
+    _, changed = tail.select_tail(scores, labels, alternate, rows)
+    assert changed["ae_boundary"] > 900
+    # No class balancing, use of labels, score multiplication, or random draw.
+    permuted, _ = tail.select_tail(scores, labels[::-1], weights * 17, rows)
+    assert np.array_equal(permuted, selected)
+    assert np.array_equal(scores, before)
+
+
+def test_weighted_histogram_suppresses_hard_qcd_and_preserves_physical_parent_rates():
+    ae = np.array([.1, .2, 1000., 10000., .3, .4])
+    labels = np.array([1, 1, 1, 1, 2, 3])
+    weights = np.array([100., 100., 1e-8, 1e-8, 1., 1.])
+    hist = tail.selection_histograms(ae, labels, weights)
+    qcd_index = list(hist["class_labels"]).index(1)
+    high_bins = hist["bin_edges"][:-1] > 100
+    assert np.isclose(hist["raw_per_class_fraction"][qcd_index, high_bins].sum(), .5)
+    assert hist["physics_per_class_fraction"][qcd_index, high_bins].sum() < 1e-9
+    assert np.isclose(hist["physics_mixture_total"].sum(), 1)
+    assert np.allclose(hist["physics_per_class_fraction"].sum(axis=1), 1)
+    assert np.isclose(hist["physics_mixture_class_contributions"][qcd_index].sum(),
+                      weights[labels == 1].sum() / weights.sum())
+    assert hist["physics_mixture_class_contributions"][qcd_index].sum() > .98
 
 
 def test_tail_abcd_thresholds_are_within_tail_not_original_ae_cut():
@@ -92,7 +134,8 @@ def test_cpu_end_to_end_cache_reuse_and_outputs(tmp_path, monkeypatch):
               "event_id": torch.arange(n)[:, None]}
     data, weights = tmp_path / "train.pt", tmp_path / "weights.pt"
     torch.save(sample, data)
-    torch.save(torch.ones(n), weights)
+    torch.save({"weights": torch.ones(n), "weight_scope": "all_events",
+                "event_id": sample["event_id"]}, weights)
     ae_config = {"features": 8, "latent_dim": 3,
                  "encoder_config": {"nodes": [12]}, "decoder_config": {"nodes": [12, 8]}}
     ae = HLTAutoencoder(ae_config).eval()
@@ -133,9 +176,16 @@ def test_cpu_end_to_end_cache_reuse_and_outputs(tmp_path, monkeypatch):
     assert result["heldout_sample_accessed"] is False
     assert result["device"] == "cpu"
     assert result["md_calibration_applied"] is False
-    assert result["selection"]["selected_rows"] == 16
+    assert result["selection"]["measure"] == "physics-all"
+    assert result["evaluation_weighting"]["weights_applied_before_percentile_selection"] is True
+    assert result["evaluation_weighting"]["class_balancing_applied"] is False
+    retained_mass = result["selection"]["selected_physics_fraction_all_backgrounds"]
+    assert .1 <= retained_mass <= .1 + result["selection"]["reference_boundary_physics_fraction"]
     assert result["scans"]["tail"]["valid_points"] == 0
     assert len(list((output / "plots").glob("*.png"))) == 6
+    with np.load(output / "ae_selection_histograms.npz") as hist:
+        assert np.isclose(hist["physics_mixture_total"].sum(), 1)
+    assert (output / "abcd_cut_coordinates.csv").is_file()
     with np.load(output / "validation_qcd_scores.npz") as saved:
         assert saved["source_row_index"].tolist() == qcd_rows.tolist()
         assert np.array_equal(saved["raw_md"], np.arange(len(qcd_rows)) + 1.)
@@ -167,7 +217,7 @@ def test_launcher_requests_cpu_and_no_gpu(tmp_path):
     binary = tmp_path / "bin"
     binary.mkdir()
     (binary / "git").write_text("#!/bin/bash\nif [[ $1 == rev-parse ]]; then echo commit; fi\n")
-    (binary / "sbatch").write_text('#!/bin/bash\nprintf "%s\\n" "$@" > "$CAPTURE"\necho 1234\n')
+    (binary / "sbatch").write_text('#!/bin/bash\nprintf "%s\\n" "$@" "measure=$SELECTION_MEASURE" > "$CAPTURE"\necho 1234\n')
     for path in binary.iterdir():
         path.chmod(0o755)
     env = os.environ.copy()
@@ -180,6 +230,7 @@ def test_launcher_requests_cpu_and_no_gpu(tmp_path):
                             env=env, check=True, capture_output=True, text=True)
     assert "Job: 1234" in result.stdout
     assert "--partition=cpu" in capture.read_text()
+    assert "measure=physics-all" in capture.read_text()
     assert "--gres" not in capture.read_text()
     batch = (slurm / "submit_ae_tail_validation.sbatch").read_text()
     assert "#SBATCH --partition=cpu" in batch

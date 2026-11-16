@@ -2,17 +2,17 @@
 # CPU-only lambda=1 validation-tail closure using cached raw QCD MD scores.
 set -euo pipefail
 if (( $# < 1 || $# > 2 )); then
-  echo "Usage: bash slurm/launch_ae_tail_validation.sh UNIQUE_TAG [raw-all|physics-qcd]" >&2
+  echo "Usage: bash slurm/launch_ae_tail_validation.sh UNIQUE_TAG [physics-all|raw-all|physics-qcd]" >&2
   exit 2
 fi
 TAG="$1"
-SELECTION_MEASURE="${2:-raw-all}"
+SELECTION_MEASURE="${2:-physics-all}"
 if [[ ! "$TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
   echo "ERROR: invalid tag" >&2
   exit 2
 fi
-if [[ "$SELECTION_MEASURE" != raw-all && "$SELECTION_MEASURE" != physics-qcd ]]; then
-  echo "ERROR: selection measure must be raw-all or physics-qcd" >&2
+if [[ "$SELECTION_MEASURE" != physics-all && "$SELECTION_MEASURE" != raw-all && "$SELECTION_MEASURE" != physics-qcd ]]; then
+  echo "ERROR: selection measure must be physics-all, raw-all, or physics-qcd" >&2
   exit 2
 fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -55,6 +55,7 @@ JOB="$(sbatch --parsable --partition=cpu --job-name="${TAG}_aetail" \
 echo "Job: $JOB"
 echo "Baseline: $RUN (selected checkpoint, no retraining)"
 echo "Selection: top 10%; $SELECTION_MEASURE"
+echo "Physical mixture: original generator × cross-section weights, before AE percentile selection; no class balancing"
 echo "Resources: CPU only; cached uncalibrated QCD MD; AE inference only"
 echo "Output: $OUTDIR"
 echo "Summary: $OUTDIR/tail_summary.json"

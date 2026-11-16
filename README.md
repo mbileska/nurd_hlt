@@ -764,17 +764,27 @@ If the cache is missing or incompatible, the job refuses to proceed rather than
 silently doing full CPU PF inference. `AE_TAIL_CACHE_DIR` can name another
 compatible conditional-MD cache directory.
 
-The default `raw-all` selects exactly the highest-AE 10% of validation **rows
-across all eight background classes**, with deterministic source-row tie
-breaking. This is not necessarily 10% of the physical QCD rate. The optional
-second argument `physics-qcd` instead applies the validation-fitted, weighted
-QCD 90th-percentile AE boundary to all classes, including boundary ties:
+The default is now **`physics-all`**: use the original aligned, all-event
+generator × cross-section weights to define the physical mixture of all four
+generated parents (eight decay targets). Compute the mixture's weighted AE
+90th percentile, then apply that one AE boundary to every validation event.
+The weights are applied to the percentile distribution **before selection**,
+not added only after ranking raw rows. No class balance, nuisance balance,
+additional genWeight multiplication, score/input multiplication, or random
+resampling is performed. Legacy QCD-only weight files are rejected in this
+mode. Boundary ties are included and the achieved weighted fraction is reported.
+The retained 10% refers to the physical mixture's mass, not the number of stored
+MC rows. This cocktail is not a replacement for real zero-bias data.
+
+Explicit opt-in controls remain available: `physics-qcd` computes the boundary
+from weighted QCD alone, while `raw-all` retains exactly the highest-scoring 10%
+of raw rows with deterministic source-row tie breaking. Neither is the default:
 
 ```bash
 bash slurm/launch_ae_tail_validation.sh lambda1_physical_tail physics-qcd
 ```
 
-Both modes are exploratory validation diagnostics. Within the retained QCD
+All modes are exploratory validation diagnostics. Within the retained QCD
 population, the AE and MD thresholds are rescanned at conditional weighted
 percentiles 0.50--0.98. The original tail boundary is **not** used as the ABCD
 AE split, which would empty C and D. The fixed reported working point is the
@@ -789,7 +799,21 @@ plots under `plots/`, event-aligned AE-selection and QCD-score NPZ files, scan
 arrays, and a category/region composition CSV when QCD survives. The plots are
 `closure_scan_2d.png`, `cut_and_count_bkg_check.png`,
 `closure_effective_statistics.png`, `qcd_ae_md.png`,
-`selection_retention.png`, and `ae_selection.png`. No classification probe,
+`selection_retention.png`, and `ae_selection.png`. The selection figure now has
+three clearly separated panels using identical full-range AE bins:
+
+- the generator/cross-section-weighted mixture, with one common all-parent
+  normalization (so relative parent rates are preserved);
+- weighted per-class shapes, normalized separately and labeled as shapes;
+- raw per-class MC coverage, explicitly labeled as **not** the physical mixture.
+
+Its dashed boundary is the all-class AE preselection, not the later ABCD split.
+`ae_selection_histograms.npz` stores the numerical bin contents, including the
+weighted mixture total and each parent's/decay class's contribution. The run
+also writes `abcd_cut_coordinates.csv` with the actual AE/MD cut values in the
+full and selected populations, and annotates their median splits on the plots.
+The summary records the achieved mixture retention and original weight checksum.
+No classification probe,
 signal inference, model training, or held-out sample access occurs. Improved
 tail closure would apply only to that selected population, not establish
 global factorization or signal sensitivity.
