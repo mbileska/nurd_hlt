@@ -1000,6 +1000,66 @@ frozen scores are only a diagnostic: both sides mix AE-seen and AE-unseen rows
 and are not new independent validation. Common-composition adjustments are
 descriptive only and do not change physical evaluation weights.
 
+## Opt-in random-category AE-only control
+
+```bash
+TAG="ae_phys_randomsplit_$(date +%Y%m%d_%H%M%S)"
+bash slurm/launch_ae_random_control.sh "$TAG"
+```
+
+This stays on the current branch and does not change the default legacy AE
+split or any classifier/NURD campaign. One generic GPU is requested, with no
+explicit partition, GPU model, exclusion list, or node constraint. The job
+requests 4 CPU cores, 16 GB host memory, and a six-hour limit. It trains one
+fresh AE, not SupCon/classifier/NURD. The architecture is copied from the
+existing physical AE; optimizer defaults are those of the original full AE
+campaign: Adam 1e-3, batch 4096, cosine schedule, 150 maximum epochs, patience
+25. `AE_EPOCHS`/`AE_PATIENCE` may explicitly override those budgets.
+
+The complete original outer-training sample is randomly partitioned **by
+event within each fine generator category**, with no weight sorting:
+
+- 90% AE fitting/scaler fitting;
+- 5% validation for epoch selection/early stopping;
+- 2.5% threshold calibration;
+- 2.5% independent internal rate check.
+
+Fractions are approximate for small categories; every role gets at least
+one event per category (categories with fewer than four events are rejected).
+Physics weights remain unchanged; no class balancing or top-10% training is
+performed. Exact indices, category/weight/sample fingerprints, and run config
+are archived. The training interface is opt-in via `train_ae.py --split_plan
+... --output_dir ...`; a control output directory must not already exist.
+
+Results live under `$BASE/outputs/${TAG}_AE_random_control/`:
+
+- `baseline_checkpoint_ae.pth`: exact snapshot of the original AE; source and
+  snapshot hashes are verified before declaring completion.
+- `ae_random_category/checkpoint_ae.pth`: selected new AE, separate from all
+  existing checkpoints, plus epoch history and training log.
+- `random_split_plan.pth`, `control_manifest.json`: immutable split plan and
+  explicit command/budget/provenance.
+- `AE_control_summary.json`, `rate_comparison.csv`, `plots/`: frozen AE-only
+  rate transfer, learning curve, and same-event held-out comparison.
+- `frozen_AE_scores.npz`: old/new scores in original row order with event IDs.
+
+After freezing the new AE, each AE defines its own physical-mixture 90th
+percentile on a reference it did not use for gradient training. The old AE
+uses its reconstructed original validation pool (also used historically for
+epoch selection); the new AE uses its independently reserved calibration
+pool. Both numerical thresholds are then reported on the **same outer
+held-out events**, never used to select the new epoch or either threshold.
+This is a frozen comparison on previously inspected MC, not a new blind test.
+The control changes the role layout as well as randomizing assignment:
+the original AE used 90/10%, whereas the new one separates early stopping,
+calibration, and checking. It is not an isolated test of the seed alone.
+
+Within-model train/unseen differences and acceptance transfer are meaningful;
+absolute standardized MSE between AEs is not directly comparable because
+their training-fitted scalers differ. Fixed-cut errors do not include finite
+calibration uncertainty. No ABCD closure or signal-sensitivity claim is made,
+and the new AE is never substituted into old NURD evaluations automatically.
+
 ## Repository map
 
 - `train_ae.py`, `train_hlt.py`: the only training entry points.

@@ -16,12 +16,14 @@ import os
 import math
 import logging
 import random
+import json
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 from models.hlt_autoencoder import HLTAutoencoder
 from utils.hlt_data import load_hlt_sample
+from utils.hlt_ae_control import validate_roles
 from utils.hlt_weights import (
     AE_WEIGHTING_SCHEMES,
     effective_mass_by_class,
@@ -29,6 +31,7 @@ from utils.hlt_weights import (
     prepare_ae_exposure_weights,
     sample_signature,
     stratified_split_indices,
+    tensor_sha256,
     weighted_mean_and_std,
 )
 
@@ -74,7 +77,14 @@ parser.add_argument("--exp_name",   default="ae",   type=str)
 parser.add_argument("--project_name", default="hlt", type=str)
 parser.add_argument("--local_testing", default=0,   type=int)
 parser.add_argument("--manualSeed", default=42,     type=int)
+parser.add_argument("--split_plan", default=None, type=str,
+                    help="Opt-in explicit four-role AE split plan; legacy split remains default")
+parser.add_argument("--output_dir", default=None, type=str,
+                    help="New output directory for a standalone control; must not already exist")
 args = parser.parse_args()
+
+if args.output_dir is not None and os.path.exists(args.output_dir):
+    raise FileExistsError(f"Refusing to overwrite AE control directory: {args.output_dir}")
 
 if not args.local_testing:
     import wandb
@@ -84,7 +94,7 @@ if not args.local_testing:
 
 # ── Setup ─────────────────────────────────────────────────────────────────────
 
-directory = f"checkpoints/hlt/{args.project_name}/{args.exp_name}/"
+directory = args.output_dir or f"checkpoints/hlt/{args.project_name}/{args.exp_name}/"
 os.makedirs(directory, exist_ok=True)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -117,6 +127,8 @@ physics_weights, generator_metadata = load_generator_weights(
     sample=raw,
     weight_scope=args.generator_weight_scope,
 )
+category_signature = (tensor_sha256(raw["background_category"][:len(labels)])
+                      if args.split_plan is not None and "background_category" in raw else None)
 del raw
 
 # flatten first 4 features per candidate: [N, n_cands, 4] → [N, n_cands*4]
@@ -127,9 +139,23 @@ del obj
 
 # ── Train / val split ─────────────────────────────────────────────────────────
 
-idx_tr, idx_val = stratified_split_indices(
-    labels, val_fraction=args.val_split, seed=args.manualSeed,
-    weights=physics_weights)
+split_metadata = {"strategy": "legacy_weight_balanced", "seed": args.manualSeed}
+if args.split_plan is None:
+    idx_tr, idx_val = stratified_split_indices(
+        labels, val_fraction=args.val_split, seed=args.manualSeed,
+        weights=physics_weights)
+else:
+    plan = torch.load(args.split_plan, map_location="cpu", weights_only=False)
+    if (plan["data_signature"] != data_signature
+            or plan["physics_weight_sha256"] != generator_metadata["effective_physics_weight_sha256"]
+            or plan["background_category_sha256"] != category_signature):
+        raise ValueError("AE split plan does not match sample and original physics weights")
+    roles = validate_roles(plan["indices"], len(labels))
+    idx_tr, idx_val = (torch.from_numpy(roles[key]) for key in ("train", "validation"))
+    split_metadata = {"strategy": "event_random_fine_category_four_role", "seed": plan["seed"],
+                      "calibration_indices": torch.from_numpy(roles["calibration"]),
+                      "check_indices": torch.from_numpy(roles["check"])}
+split_metadata.update(train_indices=idx_tr.cpu(), validation_indices=idx_val.cpu())
 (
     weights_tr,
     weights_val,
@@ -203,6 +229,7 @@ scheduler = torch.optim.lr_scheduler.LambdaLR(optim, get_lr)
 
 best_val  = float("inf")
 bad_epochs = 0
+history = []
 ckpt_path = os.path.join(directory, "checkpoint_ae.pth")
 
 for epoch in range(args.epochs):
@@ -246,11 +273,18 @@ for epoch in range(args.epochs):
     val_loss = val_numerator / max(val_denominator, 1e-12)
     val_physics_loss = (
         val_physics_numerator / max(val_physics_denominator, 1e-12))
+    history.append({"epoch": epoch+1, "train_loss": tr_loss,
+                    "validation_loss": val_loss, "validation_physics_loss": val_physics_loss})
+    with open(os.path.join(directory, "ae_training_history.json"), "w") as history_file:
+        json.dump(history, history_file, indent=2)
 
     log.debug(
         f"Epoch {epoch+1}/{args.epochs}  train={tr_loss:.6f}  "
         f"val_exposure={val_loss:.6f}  val_physics={val_physics_loss:.6f}  "
         f"lr={scheduler.get_last_lr()[0]:.2e}")
+    if args.split_plan is not None:
+        print(f"AE control epoch {epoch+1}/{args.epochs}: train={tr_loss:.6f}, "
+              f"selection-validation={val_physics_loss:.6f}", flush=True)
     if not args.local_testing:
         wandb.log({
             "AE train loss": tr_loss,
@@ -278,14 +312,17 @@ for epoch in range(args.epochs):
                     for value in labels.unique().tolist()
                 },
                 "generator": generator_metadata,
-                "split_seed": args.manualSeed,
-                "validation_fraction": args.val_split,
+                "split_seed": split_metadata["seed"],
+                "validation_fraction": (float(len(idx_val)/len(labels)) if args.split_plan else args.val_split),
+                "split_strategy": split_metadata["strategy"],
             },
             "validation_losses": {
                 "exposure": val_loss,
                 "physics": val_physics_loss,
             },
             "data_signature": data_signature,
+            "split": split_metadata,
+            "config": vars(args),
             "epoch": epoch + 1,
         }, ckpt_path)
         log.debug(f"  → saved best checkpoint ({ckpt_path})")
