@@ -468,6 +468,10 @@ def ABCD(config):
 
     # ── load models ───────────────────────────────────────────────────────────
     model, main_ckpt = load_nurd_model(config["ckpt"], device)
+    if main_ckpt.get("pilot_protocol"):
+        raise ValueError(
+            "This fixed-budget pilot has separate calibration/check roles. "
+            "Use its pilot_comparison.json and pilot evaluator, not the ordinary validation-selection protocol.")
     pure_supcon = main_ckpt.get("classification_head_trained") is False
     if pure_supcon and config.get("axis2_logit"):
         raise ValueError(

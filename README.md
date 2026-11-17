@@ -1060,10 +1060,97 @@ their training-fitted scalers differ. Fixed-cut errors do not include finite
 calibration uncertainty. No ABCD closure or signal-sensitivity claim is made,
 and the new AE is never substituted into old NURD evaluations automatically.
 
+## Matched original-AE full/tail NURD pilot
+
+```bash
+export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
+TAG="lambda1_matched_tail_$(date +%Y%m%d_%H%M%S)"
+bash slurm/launch_tail_nurd_pilot.sh "$TAG"
+```
+
+This standalone pilot preserves the original physics-weighted AE and the
+selected full-model lambda=1 checkpoint (Nov. 7 run, epoch 22). It does not
+replace either with the random-split AE control. The completed control's
+`frozen_AE_scores.npz` supplies **original-AE scores only**, verified against
+the source AE hash, event IDs, and a small direct AE scoring parity check.
+The default cache is
+`$BASE/outputs/ae_phys_randomsplit_20261117_150546_AE_random_control`;
+`AE_CACHE_DIR` can point to an equivalent completed control directory.
+
+The fixed all-background physical-mixture 90th-percentile threshold is fit
+on the **original AE's gradient-unseen validation rows**, not on its
+reconstruction-training rows. AE membership is archived when available or
+reconstructed with the original saved seed, fraction, parent labels, and
+weights, as checked by the preceding split audit. Original AE validation
+also selected the AE epoch: it is gradient-unseen, not wholly independent
+of AE model selection. Some calibration rows were seen historically by the
+source classifier; that overlap is reported, not called a blind sample.
+
+Both new classifier continuations exclude every calibration row. The full
+arm uses the remaining source-classifier training rows; the tail arm uses
+their subset above the frozen AE threshold. Thus no formerly held-back
+classifier rows are promoted into training. Both arms clone the exact same
+encoder, projector, classifier **and critic** states. Fresh Adam states,
+constant LR 3e-5, lambda=1 from the first update, SupCon=0.3, original nuisance
+standardization, and weighted-within-class critic sampling are common.
+Class-only physics-weighted balancing and 0.995 per-class weight clipping are
+fit on each training population separately; no AE-loss-stratum balancing or
+AE training is introduced.
+
+The default is **4,000 encoder updates per arm**, batch 512, with the source
+critic-update ratio retained. This is a short adaptation pilot, not another
+full training or an equal-number-of-epochs comparison. Batch size differs
+from the historical 4096 but is common between arms; SupCon is batch-dependent.
+`PILOT_UPDATES` and `PILOT_BATCH_SIZE` override the common budget. There is no
+new ramp, early stopping, or checking-based epoch selection. Training metrics
+are logged every 500 updates; only update-2000 and final checkpoints are saved
+with the defaults. One GPU runs both arms sequentially (4 CPU cores, 48 GB host
+memory, 12-hour limit); no partition, GPU model, or node constraint is requested.
+
+Only **after both final checkpoints exist**, the job opens the common outer
+held-out sample and applies the same numerical AE threshold. This is the
+pilot's checking sample, separate from calibration. Previously inspected MC
+is an exploratory check, not a fresh blind result. The frozen source classifier
+is also evaluated to distinguish common continuation drift from tail focusing.
+
+For each model, QCD MD uses the same full eligible training-QCD reference
+population, refit in that model's encoder latent. Calibration-tail QCD fixes
+an AE median cut and an MD cut targeting 10% joint A-region efficiency within
+the tail. No cut minimizes checking nonclosure. Classification is measured
+on identical selected checking events with a common full-training-fitted
+weight specification; ABCD always uses original physical weights. A paired
+event bootstrap compares tail minus full nonclosure with cuts fixed; it does
+not include calibration, retraining, or systematic uncertainties. Nominal
+region ESS requirements remain A/B/C >= 50 and D >= 500; failing them is
+reported, not hidden by loosening the requirements. Descriptive grids never
+select a checkpoint or a threshold.
+
+Outputs in `$BASE/outputs/${TAG}_tail_nurd_pilot/`:
+
+- `pilot_manifest.json`, `pilot_roles.npz`, `class_statistics.csv`: source
+  lineage, explicit role indices, frozen threshold, class counts and physical ESS.
+- Source AE/classifier snapshots; original checkpoint paths are never overwritten.
+- `full/` and `tail/`: `checkpoint_final.pth.tar`, sparse update checkpoints,
+  `training_history.json`, and `training_weights.json` (optimization ESS/class mass).
+- `pilot_comparison.json`: source/full/tail classification and matched-cut
+  checking closure, region ESS, acceptance transfer, and paired uncertainty.
+- Three `*_checking_QCD.npz` files: identical checking IDs, AE/MD scores,
+  physical weights, and region membership for independent recounting.
+- Eight figures in `plots/`: source/full/tail weighted score planes and grids,
+  matched-point comparison, and per-class classification comparison. Grid
+  colors use `|predicted/observed - 1|`; the legacy JSON `absolute_nonclosure`
+  instead divides the yield difference by the predicted yield.
+
+Pilot checkpoints are explicitly tagged. Ordinary `eval_abcd_nurd.py` refuses
+them rather than silently reusing the source checkpoint's incompatible
+calibration roles; use the standalone pilot comparison above.
+
 ## Repository map
 
-- `train_ae.py`, `train_hlt.py`: the only training entry points.
-- `eval_abcd_nurd.py`: the only ABCD evaluation implementation.
+- `train_ae.py`, `train_hlt.py`: main training entry points; standalone fixed-budget
+  pilots reuse their models/losses and are documented above.
+- `eval_abcd_nurd.py`: canonical ABCD evaluation; standalone audits reuse region
+  counting utilities with explicit role/cut protocols.
 - `dataset/hlt_smcocktail_dataset.py`: HLT tensor preprocessing and datasets.
 - `models/`: AE, classifier/encoder, and critic definitions.
 - `utils/hlt_weights.py`: generator/effective weighting and split metadata.
