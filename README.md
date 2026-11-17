@@ -943,6 +943,46 @@ The optimization-weight preview uses the existing class-only recipe with
 never changes the physical weights used for selection or evaluation. No
 training jobs are submitted; inspect the report before launching the pilot.
 
+## Frozen preparation train/validation split audit
+
+```bash
+bash slurm/launch_tail_split_audit.sh latest "lambda1_split_audit_$(date +%Y%m%d_%H%M%S)"
+```
+
+`latest` resolves a completed pilot preparation. An explicit preparation
+directory can be used instead. The audit requests one CPU core, 8 GB, and
+30 minutes, with no explicit partition or GPU request. It reads the original
+outer-training manifest and the prepared AE scores, never held-out data.
+Only a small deterministic object sample is rescored for arithmetic parity;
+there is no PF-encoder inference, retraining, or replacement split.
+
+The audit fails on checkpoint/sample/weight/ID/label/split inconsistencies,
+duplicate composite IDs, unreproducible selection, scaler differences, or
+AE scoring mismatches. It checks reproduction of the saved classifier split,
+seed sensitivity, and reconstructs AE membership from saved AE split metadata.
+Historical AE checkpoints did not store row indices: reconstruction is labeled
+as such and checked against saved parent-process mass summaries, not presented
+as independently proven historical membership.
+
+Outputs in `$BASE/outputs/<tag>_split_audit/`:
+
+- `split_audit_summary.json`: integrity checks, scoring parity, QCD retention,
+  overlap, composition-adjusted comparisons, and uncertainty summaries.
+- CSVs for all QCD AE-input coordinates, category/weight-stratum composition,
+  and reconstructed AE/classifier membership overlap.
+- Eight plots under `plots/`: weighted AE and hardness CDFs, largest input
+  shifts, membership retention, category composition, retention by weight,
+  bootstrap gap, and randomized-assignment reference gap.
+- `uncertainty_replicates.npz`: bootstrap and diagnostic resplit results.
+
+The event-level Poisson bootstrap refits the all-background training threshold
+in each replicate while holding the trained AE fixed. It describes conditional
+MC precision, not uncertainty from retraining or a formal null test for the
+weight-balanced splitter. Random fine-category-stratified reassignments of
+frozen scores are only a diagnostic: both sides mix AE-seen and AE-unseen rows
+and are not new independent validation. Common-composition adjustments are
+descriptive only and do not change physical evaluation weights.
+
 ## Repository map
 
 - `train_ae.py`, `train_hlt.py`: the only training entry points.
