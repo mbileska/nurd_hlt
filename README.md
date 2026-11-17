@@ -913,6 +913,36 @@ histograms/KDEs are not substituted for physics-weighted closure. Grid
 summaries are descriptive; held-out data never choose the working point.
 No existing output is overwritten.
 
+## Training-defined top-10% pilot preparation (no training)
+
+```bash
+bash slurm/launch_tail_pilot_preparation.sh "lambda1_tailprep_$(date +%Y%m%d_%H%M%S)"
+```
+
+This small CPU job scores only the frozen AE, not the PF encoder. It uses
+the lambda=1 checkpoint's exact saved classifier train/validation partition
+of `converted_v1/train/sample.json`. The 90th percentile is fit on **training
+rows only**, using original all-background physics weights without class
+balancing. The same numerical cut is applied to validation; no held-out file
+is read. Training nuisance arithmetic is used, and progress/ETA is printed.
+
+Results under `$BASE/outputs/<tag>_pilot_preparation/` include:
+
+- `preparation_report.json`: frozen threshold, achieved retention including
+  boundary ties, class-coverage checks, provenance, physical and optimization
+  ESS, and low-ESS warnings. `class_coverage_ready` is not a closure guarantee.
+- `class_statistics.csv`: all eight classes in each selected split, raw
+  counts, weighted yields, physical ESS/N, and class-balanced statistics.
+- `pilot_selection.npz`: original and selected split indices, event IDs,
+  AE scores, physical weights, and proposed effective optimization weights.
+- `pilot_preparation.pth`: train-fitted class-only balancing/clipping spec
+  and provenance. It does not contain a newly trained network.
+
+The optimization-weight preview uses the existing class-only recipe with
+0.995 clipping, fit on selected training rows and reused on validation. It
+never changes the physical weights used for selection or evaluation. No
+training jobs are submitted; inspect the report before launching the pilot.
+
 ## Repository map
 
 - `train_ae.py`, `train_hlt.py`: the only training entry points.
