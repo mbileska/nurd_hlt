@@ -4,7 +4,7 @@ import json
 import sys
 import torch
 
-from scripts.prepare_tail_pilot import freeze_selection, main, summarize, validate_split, weight_stats
+from scripts.prepare_tail_pilot import freeze_selection, main, report_json, summarize, validate_split, weight_stats
 
 
 def test_threshold_is_training_only_physics_weighted_not_raw():
@@ -21,6 +21,13 @@ def test_threshold_is_training_only_physics_weighted_not_raw():
     assert np.array_equal(st, new_st)
     assert len(sv) == 2 and len(new_sv) == 0
     assert selected.all()  # A large boundary weight can exceed nominal 10%; ties explicit.
+
+
+def test_report_handles_numpy_scalars_including_numpy2_float32_results():
+    encoded=report_json({'fraction':np.float32(.125),'count':np.int64(8),'ready':np.bool_(True)})
+    assert json.loads(encoded)=={'fraction':.125,'count':8,'ready':True}
+    with pytest.raises(ValueError):
+        report_json({'bad':np.float32(np.nan)})
 
 
 def test_split_rejects_leakage_and_missing_rows():
@@ -84,3 +91,20 @@ def test_end_to_end_preparation_saves_selection_not_training(tmp_path, monkeypat
     with np.load(output/'pilot_selection.npz') as data:
         assert np.all(data['ae_score'][data['selected_train_indices']] >= 81)
         assert not np.intersect1d(data['selected_train_indices'],data['selected_validation_indices']).size
+    # Reproduce an old preparation that wrote cache/PTH/CSV but failed JSON
+    # serialization with a NumPy float32 value; recover without AE inference.
+    from scripts.recover_tail_preparation_report import recover
+    original_hash=file_sha256(output/'pilot_selection.npz')
+    original_csv=(output/'class_statistics.csv').read_bytes()
+    payload=torch.load(output/'pilot_preparation.pth',map_location='cpu',weights_only=False)
+    payload['provenance']['classes'][0]['class_balanced_mass_fraction']=np.float32(.125)
+    torch.save(payload,output/'pilot_preparation.pth')
+    (output/'preparation_report.json').unlink()
+    recover(output,ae_path)
+    recovered=json.loads((output/'preparation_report.json').read_text())
+    assert recovered['ae_threshold']==report['ae_threshold']
+    assert recovered['classes'][0]['class_balanced_mass_fraction']==.125
+    assert file_sha256(output/'pilot_selection.npz')==original_hash
+    assert (output/'class_statistics.csv').read_bytes()==original_csv
+    with pytest.raises(FileExistsError):
+        recover(output,ae_path)

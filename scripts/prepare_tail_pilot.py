@@ -17,6 +17,15 @@ from utils.hlt_weights import (
 )
 
 
+def report_json(report):
+    """Serialize NumPy scalars consistently across NumPy 1.x and 2.x promotion."""
+    def scalar(value):
+        if isinstance(value, np.generic):
+            return value.item()
+        raise TypeError(f"Unsupported report value: {type(value).__name__}")
+    return json.dumps(report, indent=2, default=scalar, allow_nan=False)
+
+
 def validate_split(train, validation, size):
     train, validation = (np.asarray(v, dtype=np.int64) for v in (train, validation))
     combined = np.concatenate((train, validation))
@@ -67,7 +76,7 @@ def summarize(labels, weights, train, validation, selected_train, selected_valid
                          "source_events": len(source_rows), **stats,
                          "raw_retention": len(selected_rows)/len(source_rows) if len(source_rows) else 0.,
                          "physics_retention": stats["sum_weights"]/source_mass if source_mass else 0.,
-                         "fraction_of_selected_physics": stats["sum_weights"]/total if total else 0.})
+                         "fraction_of_selected_physics": float(stats["sum_weights"]/total) if total else 0.})
     return rows
 
 
@@ -153,7 +162,7 @@ def main():
                                   else (selected_validation, effective_validation))
             stats = weight_stats(effective[labels[indices] == row["label"]])
             row["class_balanced_effective_events"] = stats["effective_events"]
-            row["class_balanced_mass_fraction"] = stats["sum_weights"]/effective.sum() if effective.sum() else 0.
+            row["class_balanced_mass_fraction"] = float(stats["sum_weights"]/float(effective.sum())) if effective.sum() else 0.
     report = {
         "protocol": "training_only_physics_all_AE_top10_pilot_preparation",
         "classifier_checkpoint": str(args.checkpoint.resolve()),
@@ -180,6 +189,8 @@ def main():
         "note": "Class coverage is not a claim of sufficient ABCD region statistics. No test/held-out inference. "
                 "Freeze this threshold for both pilot branches' validation comparisons.",
     }
+    # Validate report serialization before writing any output artifacts.
+    serialized_report = report_json(report)
     args.output_dir.mkdir(parents=True)
     np.savez_compressed(args.output_dir/"pilot_selection.npz", ae_score=scores, label=labels,
                         physics_weight=physical, event_id=raw["event_id"].numpy(), selected=selected,
@@ -191,7 +202,7 @@ def main():
     with (args.output_dir/"class_statistics.csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
         writer.writeheader(); writer.writerows(rows)
-    (args.output_dir/"preparation_report.json").write_text(json.dumps(report, indent=2))
+    (args.output_dir/"preparation_report.json").write_text(serialized_report)
     print(f"Frozen TRAINING-derived AE threshold: {cut:.9g}", flush=True)
     for row in rows:
         print(f"{row['split']:10s} {row['name']:12s} N={row['events']:8d} "

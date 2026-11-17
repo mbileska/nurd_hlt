@@ -943,6 +943,23 @@ The optimization-weight preview uses the existing class-only recipe with
 never changes the physical weights used for selection or evaluation. No
 training jobs are submitted; inspect the report before launching the pilot.
 
+If an older preparation wrote `pilot_selection.npz`, `pilot_preparation.pth`,
+and the CSV but failed to write JSON (e.g. a NumPy 2 float32 serialization
+error), do not repeat inference. Recover the missing report with:
+
+```bash
+python -m scripts.recover_tail_preparation_report \
+  --preparation-dir /path/to/existing_pilot_preparation \
+  --ae-checkpoint "$BASE/checkpoints/hlt/hlt/ae_engineer_train3m_physics_decay8_full_20261104_142222/checkpoint_ae.pth"
+```
+
+Recovery verifies checkpoint hashes, original cached weight/ID checksums,
+saved and selected indices, the frozen threshold, and per-class statistics.
+It creates only the missing JSON and refuses to overwrite an existing report.
+The NPZ, PTH, CSV, scores, weights, and split remain unchanged. Future
+preparations explicitly normalize NumPy scalar serialization and validate
+JSON before writing output artifacts.
+
 ## Frozen preparation train/validation split audit
 
 ```bash

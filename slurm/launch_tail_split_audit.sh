@@ -27,7 +27,11 @@ PY
 fi
 PREP_DIR="$(cd "$PREP_DIR" && pwd -P)"
 for file in preparation_report.json pilot_selection.npz; do
-  test -s "$PREP_DIR/$file"
+  if [[ ! -s "$PREP_DIR/$file" ]]; then
+    echo "ERROR: preparation is incomplete; missing $PREP_DIR/$file" >&2
+    echo "Inspect the preparation job stderr. If pilot_preparation.pth and pilot_selection.npz exist, recover the report without inference." >&2
+    exit 2
+  fi
 done
 AE_CKPT="$BASE/checkpoints/hlt/hlt/ae_engineer_train3m_physics_decay8_full_20261104_142222/checkpoint_ae.pth"
 WEIGHTS="$BASE/data/train3M_v1/converted_v1/weight_train.npz"
@@ -37,8 +41,12 @@ if [[ -e "$OUTDIR" ]]; then
   echo "ERROR: refusing to overwrite $OUTDIR" >&2
   exit 2
 fi
-test -s "$AE_CKPT"
-test -s "$WEIGHTS"
+for path in "$AE_CKPT" "$WEIGHTS"; do
+  if [[ ! -s "$path" ]]; then
+    echo "ERROR: required audit input missing: $path" >&2
+    exit 2
+  fi
+done
 export BASE CODE_DIR CODE_COMMIT PREP_DIR AE_CKPT WEIGHTS OUTDIR
 mkdir -p "$BASE/logs"
 JOB="$(sbatch --parsable --job-name="${TAG}_split_audit" --export=ALL \
