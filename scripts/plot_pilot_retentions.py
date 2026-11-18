@@ -16,7 +16,15 @@ COLORS = {'full':'tab:blue','tail':'tab:green'}
 LABELS = ['100%','20%','10%']
 
 
-def render(plan, results, calibration, checking, grids, checking_selection, names, output, kde_grid=64):
+def render(plan, results, calibration, checking, grids, checking_selection, names, output, kde_grid=64,
+           branches=BRANCHES, fractions=FRACTIONS, probabilities=PROBABILITIES):
+    # Optional dimensions let the double-NURD experiment reuse exactly the same
+    # weighted scientific plots without changing historical study defaults.
+    BRANCHES, FRACTIONS, PROBABILITIES = branches, fractions, probabilities
+    COLORS = dict(zip(branches, ('tab:blue', 'tab:green')))
+    LABELS = [f'{f:.0%}' for f in fractions]
+    positions = range(len(fractions))
+    n_branches, n_fractions = len(branches), len(fractions)
     output = Path(output); output.mkdir()
     cuts = plan['AE_thresholds']; minimums = plan['minimum_region_ESS']
     primary = target_name(plan['primary_overall_QCD_A_target'])
@@ -28,14 +36,14 @@ def render(plan, results, calibration, checking, grids, checking_selection, name
             for branch in BRANCHES:
                 values = [results[branch][fraction_name(f)][target_name(target)][role] for f in FRACTIONS]
                 ys = [v['predicted_over_observed'] if v is not None else np.nan for v in values]
-                ax.plot(range(3), ys, color=COLORS[branch], alpha=.4)
+                ax.plot(positions, ys, color=COLORS[branch], alpha=.4)
                 for x,value in enumerate(values):
                     if value is None: continue
                     if np.isfinite(value['predicted_over_observed']) and np.isfinite(value['ratio_uncertainty']):
                         ax.errorbar(x,value['predicted_over_observed'],yerr=value['ratio_uncertainty'],
                                     fmt='o' if value['statistically_valid'] else 'x',color=COLORS[branch])
                 ax.plot([],[],color=COLORS[branch],marker='o',label=branch+' model')
-            ax.axhline(1,c='black',ls='--');ax.set_xticks(range(3),LABELS)
+            ax.axhline(1,c='black',ls='--');ax.set_xticks(positions,LABELS)
             ax.set(xlabel='Retained physical mixture',ylabel='Predicted / observed QCD',
                    title=f'{"Calibration (tuned)" if row==0 else "Checking (fixed cuts)"}; target A/N={target:.1%}')
             ax.legend(fontsize=9)
@@ -43,32 +51,32 @@ def render(plan, results, calibration, checking, grids, checking_selection, name
 
     fig,axes=plt.subplots(1,2,figsize=(13,5))
     for role,selection,color in (('calibration',plan['calibration_selection'],'tab:blue'),('checking',checking_selection,'tab:orange')):
-        axes[0].plot(range(3),[selection[fraction_name(f)]['all_backgrounds']['retention']*100 for f in FRACTIONS],
+        axes[0].plot(positions,[selection[fraction_name(f)]['all_backgrounds']['retention']*100 for f in FRACTIONS],
                      'o-',color=color,label=role)
     axes[0].set(ylabel='Retained physical mixture (%)',xlabel='Requested retention');axes[0].legend()
     for branch in BRANCHES:
         for role,style in (('calibration_candidate','--'),('checking_point','-')):
             values=[results[branch][fraction_name(f)][primary][role] for f in FRACTIONS]
-            axes[1].plot(range(3),[np.nan if v is None else v['A_efficiency_overall_QCD']*100 for v in values],
+            axes[1].plot(positions,[np.nan if v is None else v['A_efficiency_overall_QCD']*100 for v in values],
                          marker='o',ls=style,color=COLORS[branch],label=f'{branch}: '+('calibration' if role.startswith('cal') else 'checking'))
     axes[1].axhline(plan['primary_overall_QCD_A_target']*100,c='black',ls=':')
     axes[1].set(ylabel='A / original QCD yield (%)',xlabel='Retained physical mixture');axes[1].legend(fontsize=8)
-    for ax in axes: ax.set_xticks(range(3),LABELS)
+    for ax in axes: ax.set_xticks(positions,LABELS)
     finish(fig,output/'acceptance_transfer.png')
 
     fig,axes=plt.subplots(2,2,figsize=(13,10))
     for role,selection,color in (('calibration',plan['calibration_selection'],'tab:blue'),('checking',checking_selection,'tab:orange')):
-        axes[0,0].plot(range(3),[selection[fraction_name(f)]['QCD']['selected_effective_events'] for f in FRACTIONS],
+        axes[0,0].plot(positions,[selection[fraction_name(f)]['QCD']['selected_effective_events'] for f in FRACTIONS],
                        'o-',color=color,label=role)
-        axes[0,1].plot(range(3),[selection[fraction_name(f)]['QCD']['events']*selection[fraction_name(f)]['QCD']['raw_retention'] for f in FRACTIONS],
+        axes[0,1].plot(positions,[selection[fraction_name(f)]['QCD']['events']*selection[fraction_name(f)]['QCD']['raw_retention'] for f in FRACTIONS],
                        'o-',color=color,label=role)
     axes[0,0].set(ylabel='Selected QCD effective events');axes[0,1].set(ylabel='Selected QCD raw rows')
-    for ax in axes[0]: ax.set_xticks(range(3),LABELS);ax.legend()
+    for ax in axes[0]: ax.set_xticks(positions,LABELS);ax.legend()
     for ax,role in zip(axes[1],('calibration_candidate','checking_point')):
         for k,(branch,f) in enumerate((b,f) for b in BRANCHES for f in FRACTIONS):
             value=results[branch][fraction_name(f)][primary][role]
             if value is not None:
-                ax.bar(np.arange(4)+(k-2.5)*.12,[value['regions'][r]['effective_count'] for r in 'ABCD'],
+                ax.bar(np.arange(4)+(k-(n_branches*n_fractions-1)/2)*.12,[value['regions'][r]['effective_count'] for r in 'ABCD'],
                        width=.12,label=f'{branch}, {f:.0%}')
         ax.scatter(range(4),minimums,marker='_',s=400,c='black',label='ESS requirement')
         ax.set_xticks(range(4),list('ABCD'));ax.set(yscale='log',ylabel='Region effective events',title=role)
@@ -76,7 +84,7 @@ def render(plan, results, calibration, checking, grids, checking_selection, name
     finish(fig,output/'effective_statistics.png')
 
     for role in ('calibration','checking'):
-        fig,axes=plt.subplots(2,3,figsize=(18,10))
+        fig,axes=plt.subplots(n_branches,n_fractions,figsize=(6*n_fractions,5*n_branches),squeeze=False)
         for row,branch in enumerate(BRANCHES):
             for col,f in enumerate(FRACTIONS):
                 key=fraction_name(f);grid=grids[branch][key][role];ax=axes[row,col]
@@ -94,7 +102,7 @@ def render(plan, results, calibration, checking, grids, checking_selection, name
                        title=f'{branch}, {f:.0%}: '+('diagnostic only' if role=='checking' else 'descriptive grid'))
         finish(fig,output/f'{role}_closure_scans.png')
 
-    fig,axes=plt.subplots(2,3,figsize=(18,10))
+    fig,axes=plt.subplots(n_branches,n_fractions,figsize=(6*n_fractions,5*n_branches),squeeze=False)
     for row,branch in enumerate(BRANCHES):
         for col,f in enumerate(FRACTIONS):
             key=fraction_name(f);ax=axes[row,col]
@@ -117,8 +125,8 @@ def render(plan, results, calibration, checking, grids, checking_selection, name
             ax.legend(fontsize=8)
     finish(fig,output/'matched_acceptance_cut_curves.png')
 
-    fig_qcd,axes_qcd=plt.subplots(2,3,figsize=(18,10))
-    fig_regions,axes_regions=plt.subplots(2,3,figsize=(18,10))
+    fig_qcd,axes_qcd=plt.subplots(n_branches,n_fractions,figsize=(6*n_fractions,5*n_branches),squeeze=False)
+    fig_regions,axes_regions=plt.subplots(n_branches,n_fractions,figsize=(6*n_fractions,5*n_branches),squeeze=False)
     skipped={};display_limits={}
     for row,branch in enumerate(BRANCHES):
         for col,f in enumerate(FRACTIONS):

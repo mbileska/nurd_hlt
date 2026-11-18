@@ -1288,6 +1288,110 @@ view limits only. Blank scan cells fail statistics, not zero nonclosure.
 No signal sample is evaluated: these results cannot establish a sensitivity
 optimum or alone justify choosing an analysis retention threshold on real data.
 
+## Double-NURD experiment (branch `double-nurd-experiment`)
+
+This is a **matched fixed-update continuation**, not a new AE training or two
+independent anomaly networks. It preserves the original physical AE and the
+full lambda=1 checkpoint, and trains two arms sequentially on one generic GPU:
+
+| Arm | Supervised training | Dependence objectives |
+|---|---|---|
+| `global` | Full eligible decay8 sample; CE + 0.3 SupCon | Global physical QCD, lambda=1 |
+| `double` | Exactly the same sample, weights and starting model | Same global critic + independent tail-QCD critic, ramping to lambda=1 |
+
+The tail is the **existing frozen top-10% physical all-background AE cut**,
+defined on AE-gradient-unseen calibration rows. Both arms exclude every
+calibration row from new optimization. The tail critic's real anchors AND
+shuffled nuisance donors are restricted to tail training QCD. Global and tail
+critics independently estimate real-versus-product density ratios between
+the encoder latent and fixed standardized AE loss. The encoder minimizes
+
+```
+L = L_CE + 0.3 L_SupCon + L_info_global + lambda_tail(t) L_info_tail
+```
+
+The control omits the final term. There is no conditional-CDF transformation,
+MD-score substitution, AE refitting, hard-QCD deletion, or held-out training.
+
+Weighting is deliberately explicit:
+
+- CE/SupCon: the same training-fitted class-only physical weights, with the
+  existing per-class 0.995 clipping, fitted ONCE on common eligible rows.
+- Critics and encoder information losses: the original **unclipped physical
+  QCD measure** in their respective full/tail training populations, sampled
+  with replacement proportional to physical weight and then given UNIT loss
+  weights. Weights enter once, not in both sampling and the loss. Repeated
+  training draws do not increase physical effective event statistics.
+- Every ABCD yield, threshold quantile, MD reference and KDE: original physical
+  weights, without classifier class factors or clipping. Cross sections are
+  already included in the weight file; they are not applied a second time.
+
+Both arms clone the source model and global critic; the tail critic is
+independent and initially fresh. Adam states restart identically. Critics
+receive 300 warm-up updates with encoder parameters AND BN buffers frozen.
+The global coefficient remains 1; the tail coefficient reaches 1 over the
+first 1,000 encoder updates. Default budget is **6,000 encoder updates per
+arm**, hence **5,000 updates strictly after the tail ramp**. No CE-based early
+stopping or best-checkpoint selection cuts this short. Save every 2,000
+updates plus final; logs every 100 updates include timing and rough ETA.
+Critics train on the same eval-mode representation used for gradient-enabled
+information forwards; CE/SupCon use train mode. Both arms use batch 512,
+constant LR 3e-5, three critic steps per encoder update and gradient norm cap 10.
+
+On Della, from a checkout of this branch:
+
+```bash
+cd /home/mb7126/nurd_hlt
+module load anaconda3/2026.7
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate disco
+export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
+TAG="double_nurd_$(date +%Y%m%d_%H%M%S)"
+bash slurm/launch_double_nurd_experiment.sh "$TAG" | tee "/tmp/${TAG}.launch"
+```
+
+The launcher verifies the source/AE/cache/dataset paths, refuses existing
+outputs, and archives the committed code so branch switches cannot change a
+queued job. It submits **one training job for BOTH arms** and **one dependent
+evaluation job**. Both request `gpu:1`, four CPUs and 48 GB host memory, with
+no explicit partition, GPU model or node constraint. Time limits are 20 hours
+for training and eight for evaluation, not runtime predictions.
+Optional environment overrides: `PILOT_UPDATES`, `PILOT_BATCH_SIZE`,
+`TAIL_RAMP_UPDATES`, `MIN_POST_RAMP_UPDATES`, `D_MIN_ESS`, `AE_CACHE_DIR`.
+The launcher rejects a budget shorter than ramp + minimum post-ramp period.
+
+Outputs:
+
+- `$BASE/outputs/${TAG}_double_nurd/`: source checkpoint/AE copies, provenance,
+  role indices, class physical statistics, per-arm training histories and
+  `global/checkpoint_final.pth.tar`, `double/checkpoint_final.pth.tar`.
+  `training_complete.json` appears only after BOTH final models exist.
+- `$BASE/outputs/${TAG}_double_nurd_eval/`: `double_nurd_comparison.json`,
+  `comparison.csv`, frozen calibration cut plan, per-event scores/IDs/weights,
+  reusable grid NPZs, and `plots/` with full + top-10% weighted class KDEs,
+  QCD planes, ABCD closure grids/curves, yields, region ESS, acceptance transfer
+  and classification confusion matrices.
+- `$BASE/logs/${TAG}_{doubletrain,doubleeval}-JOB.{out,err}`: job logs.
+
+The evaluator fits one physics-weighted full-training-QCD MD reference per
+model and reuses it for BOTH selections. It freezes all calibration-derived
+cuts before opening checking events; checking never ranks cuts or epochs.
+The primary A target is 1% of the ORIGINAL full QCD physical yield, with
+0.5%/2% supporting targets and A/B/C ESS >=50, D ESS >=100. Candidate AE
+positions cover 5--99% inside each selected calibration QCD population; absent
+valid candidates remain absent. Historical ordinary MD scoring is preserved,
+but the explicitly role-separated pilot cut protocol is not numerically the
+same as the ordinary evaluator's threshold search. Use this standalone
+evaluator, not the ordinary evaluator's legacy checkpoint split metadata.
+
+Compare both closure AND per-class classification. A >5 percentage-point
+balanced-accuracy loss against the matched control is flagged, not hidden by
+checking-based model reselection. Adding the tail term also increases total
+regularization: if successful, a global-only lambda=2 follow-up can distinguish
+extra strength from tail specialization. Historical source-calibration
+exposure and AE epoch selection are documented: this remains exploratory
+previously inspected MC, not a blind test or a signal-sensitivity claim.
+
 ## Repository map
 
 - `train_ae.py`, `train_hlt.py`: main training entry points; standalone fixed-budget
