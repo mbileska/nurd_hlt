@@ -1145,6 +1145,69 @@ Pilot checkpoints are explicitly tagged. Ordinary `eval_abcd_nurd.py` refuses
 them rather than silently reusing the source checkpoint's incompatible
 calibration roles; use the standalone pilot comparison above.
 
+## Frozen pilot cut-position study and KDE plots
+
+```bash
+PILOT="$BASE/outputs/lambda1_matched_tail_20261117_181652_tail_nurd_pilot"
+TAG="tail_cutstudy_$(date +%Y%m%d_%H%M%S)"
+bash slurm/launch_tail_grid_study.sh "$PILOT" "$TAG"
+```
+
+This is frozen inference and cut analysis, **not training**. By default it uses
+the tail-focused final pilot checkpoint. `PILOT_BRANCH=full` or `source` can
+explicitly study a fixed control instead; no model is automatically selected.
+The original all-background AE threshold, selected calibration/checking roles,
+physical event weights, and each model's previously fitted training-QCD MD
+mean/whitening remain fixed. There is no MD refit, score regression, conditional
+calibration transform, rotation of axes, or removal of hard QCD.
+
+Calibration QCD alone defines a 91x91 grid of AE/MD percentiles from 0.05 to
+0.95 within the existing AE tail. A candidate must pass the nominal A/B/C>=50,
+D>=500 region ESS requirements and have QCD A efficiency between 2% and 25%
+of the tail throughout a 3x3 neighborhood. The objective is the neighborhood's
+median `|predicted/observed-1|` plus central ratio uncertainty. This is a
+closure/stability search, **not a signal-sensitivity optimum**. The report also
+flags whether all neighboring ratios are within 20% of one; a best available
+candidate need not have acceptable closure.
+
+`frozen_cut_plan.json` is written before checking inference or opening its
+background manifest. If no stable candidate exists, the result stays `null`;
+the statistics criteria are not silently weakened. Original pilot cuts then
+appear only as an explicitly labeled reference in plots. Checking evaluates
+the frozen candidate, reuses identical numerical grid thresholds for diagnostic
+plots, and cannot choose a different cut. Its QCD scores/IDs/weights are checked
+against the pilot's saved QCD cache and original point. A fixed-cut paired
+bootstrap compares the candidate to that original point; calibration-selection,
+retraining and systematic uncertainties are not included. All of this remains
+exploratory on previously inspected MC, not a new blind confirmation.
+
+One generic GPU is requested for the missing frozen calibration-QCD and
+checking-all-class inference (4 CPU cores, 48 GB host memory, six-hour job
+limit). No explicit partition, GPU model or node constraint is used. KDEs use
+original physical weights once, with no weighted-resampling approximation.
+Display limits cover the weighted 0.1--99.9% range for QCD or the union of those
+ranges across classes. These are view limits only: all valid events still enter
+KDE fitting, region counts and saved score arrays. KDE shapes are normalized
+per class and do not show their relative expected rates. No signal efficiency
+or sensitivity claim is made without a benchmark signal evaluation.
+
+Results in `$BASE/outputs/${TAG}_tail_grid_study/`:
+
+- `frozen_cut_plan.json`, `grid_study_summary.json`: calibration-only selection,
+  checking result, original-point recount, uncertainty, feasibility and provenance.
+- `calibration_QCD_scores.npz`, `checking_all_class_scores.npz`: reusable scores,
+  event IDs, weights, labels and (for checking) encoder latent vectors.
+- `calibration_grid.npz`, `checking_grid.npz`, `cut_scan.csv`: numerical cut
+  locations and grid yields, ESS, efficiencies and ratios.
+- Ten plots under `plots/`: calibration/checking closure scans, A-efficiency
+  maps, closure-versus-efficiency curves, weighted QCD cut plane, class KDEs,
+  per-class score planes, score marginals, PCA scatter and ABCD region yields.
+
+White scan cells fail region-statistics requirements; they do not mean zero
+nonclosure. Scan colors use `|predicted/observed-1|`, while the legacy
+`absolute_nonclosure` JSON field divides the yield difference by the prediction.
+Checking plots never rank cuts or models, even if another cell looks better.
+
 ## Repository map
 
 - `train_ae.py`, `train_hlt.py`: main training entry points; standalone fixed-budget
