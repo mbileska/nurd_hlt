@@ -1208,6 +1208,86 @@ nonclosure. Scan colors use `|predicted/observed-1|`, while the legacy
 `absolute_nonclosure` JSON field divides the yield difference by the prediction.
 Checking plots never rank cuts or models, even if another cell looks better.
 
+## Frozen 100% / 20% / 10% retention comparison
+
+```bash
+PILOT="$BASE/outputs/lambda1_matched_tail_20261117_181652_tail_nurd_pilot"
+TAG="pilot_retentions_$(date +%Y%m%d_%H%M%S)"
+bash slurm/launch_pilot_retention_comparison.sh "$PILOT" "$TAG"
+```
+
+This standalone evaluation compares **both saved full/tail pilot checkpoints**
+at three AE preselections. No network is trained, no AE or MD reference is
+refit, and original checkpoints and prior study defaults remain untouched.
+100% means no AE preselection, not pooling training/calibration/checking events.
+20% and 10% are the physics-weighted all-background calibration-mixture upper
+tails. The calibration pool is the complete original AE-gradient-unseen pool;
+all its rows were excluded from both pilot continuations. The 10% threshold
+must reproduce the pilot's frozen threshold. Original AE validation also selected
+its epoch, and the source classifier historically saw some calibration rows;
+this remains the same exploratory checkpoint lineage, not new blind MC.
+
+The new study's default region requirements are **A/B/C ESS >= 50 and D ESS >=
+100**, relaxed from the earlier D>=500. `D_MIN_ESS` may explicitly override D
+before submission. Every point reports its actual ESS, yield uncertainty,
+validity under the new requirements, and whether it also passes the old D>=500
+rule. No thresholds in earlier evaluators are changed.
+
+Comparisons use **overall QCD A-region acceptance relative to the original
+unselected QCD mixture**, not acceptance within each tail. The primary target
+is 1%, with 0.5% and 2% as additional diagnostics. For every calibration-derived
+AE cut, the MD cut is fit on calibration high-AE QCD to match that overall A
+yield. This yields an iso-acceptance curve: cut positions can vary without
+changing the intended overall background budget. Weighted event discreteness
+is allowed up to 5% relative mismatch; otherwise the point is ineligible.
+
+At each target and model/retention combination, three consecutive AE-cut
+positions must all meet the statistics and acceptance criteria. The candidate
+minimizes their median `|predicted/observed-1|` plus central ratio uncertainty.
+If no candidate qualifies, it remains null. This is not an unconstrained scan
+allowed to win simply by accepting substantially more background.
+
+**All six model/retention plans, including all three acceptance targets, are
+saved before opening checking events.** The same numerical cuts are applied
+unchanged on checking; its actual A acceptance is reported, not retuned to hit
+1%. Each model's frozen original training-QCD mean/whitening is reused. The
+old top-10% checking QCD scores/IDs/weights must reproduce the existing pilot
+cache. All grids on checking are descriptive only, never used to pick a new
+cut, model or retained fraction.
+
+One generic GPU job performs full-range calibration-QCD and full-range
+checking inference once per model, reusing the scores for all fractions.
+No explicit partition, GPU model or node constraint is requested (4 CPU cores,
+48 GB host memory, six-hour limit). Exact physics weights remain unchanged;
+there is no AE-loss-stratum balancing, conditional calibration transform,
+hard-QCD removal, or MC event replication to inflate effective statistics.
+The 10%-adapted model is merely evaluated at 20%/100%, not newly trained there.
+
+Results in `$BASE/outputs/${TAG}_retention_comparison/`:
+
+- `frozen_comparison_plan.json`: calibration thresholds, all candidate choices,
+  matching tolerance, role/provenance checks and statistics requirements.
+- `retention_comparison.json`, `comparison.csv`: matched-rate closure,
+  realized calibration/checking acceptance, region yields/ESS/uncertainties,
+  all-class preselection statistics, and primary paired full-vs-tail-model
+  bootstrap results. Fixed-cut bootstrap omits calibration-selection,
+  retraining and systematic uncertainties.
+- `full_calibration_QCD.npz`, `tail_calibration_QCD.npz`, and the two
+  `*_checking_all_classes.npz` files: complete reusable scores, IDs, weights,
+  categories/labels and checking latent vectors, with no duplicated fraction
+  score dumps.
+- Per-model/per-fraction grid NPZs and 14 figures under `plots/`: closure at
+  matched overall acceptance, retention/rate transfer, effective statistics,
+  calibration/checking closure maps, iso-acceptance cut curves, weighted QCD
+  planes and region yields, plus six standard-size class KDEs in
+  `plots/{full,tail}/{f100,f020,f010}/`.
+
+KDEs apply original physical weights once and normalize each class shape;
+they do not show relative process rates. Weighted display quantiles affect
+view limits only. Blank scan cells fail statistics, not zero nonclosure.
+No signal sample is evaluated: these results cannot establish a sensitivity
+optimum or alone justify choosing an analysis retention threshold on real data.
+
 ## Repository map
 
 - `train_ae.py`, `train_hlt.py`: main training entry points; standalone fixed-budget
