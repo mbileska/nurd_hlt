@@ -131,6 +131,9 @@ def decorate_score_axes(ax, point, title, large=True, large_labels=None):
 
 
 def render_suite(data, names, report, grid, reference, output, signal=None, kde_grid=200):
+    context = report.get("plot_context", {})
+    population = context.get("population", "AE-selected validation")
+    point_label = context.get("point_label", "Fixed conditional threshold")
     output.mkdir(parents=True, exist_ok=False)
     ae, md, labels, weights, latent = (data[k] for k in ("ae", "md", "label", "weight", "latent"))
     original_plot_rows = len(ae)
@@ -159,16 +162,17 @@ def render_suite(data, names, report, grid, reference, output, signal=None, kde_
     if point is not None:
         nc = point["absolute_nonclosure"]
         value = "undefined" if nc is None else f"{100 * nc:.2f}%"
-        ax.scatter([.5], [.5], marker="*" if point["statistically_valid"] else "X", s=400,
+        position = point.get("plot_percentiles", [.5, .5])
+        ax.scatter([position[0]], [position[1]], marker="*" if point["statistically_valid"] else "X", s=400,
                    color="red", edgecolor="black", zorder=5,
-                   label=f"Fixed conditional median/median\n|nonclosure|={value}\n"
+                   label=f"{context.get('scan_point_label', 'Fixed conditional median/median')}\n|nonclosure|={value}\n"
                          + ("valid statistics" if point["statistically_valid"] else "insufficient statistics"))
         ax.legend(loc="lower left", fontsize=12)
     if not finite.size:
         ax.text(.5, .65, "No statistically valid grid cells", ha="center", transform=ax.transAxes)
-    ax.set_xlabel("Conditional percentile, axis 1 (AE reco loss)", fontsize=TICK_FS)
-    ax.set_ylabel("Conditional percentile, axis 2 (NURD MD)", fontsize=TICK_FS)
-    ax.set_title("ABCD closure scan — AE-selected validation", fontsize=TICK_FS)
+    ax.set_xlabel(context.get("scan_xlabel", "Conditional percentile, axis 1 (AE reco loss)"), fontsize=TICK_FS)
+    ax.set_ylabel(context.get("scan_ylabel", "Conditional percentile, axis 2 (NURD MD)"), fontsize=TICK_FS)
+    ax.set_title(context.get("scan_title", "ABCD closure scan — AE-selected validation"), fontsize=TICK_FS)
     fig.tight_layout()
     save(fig, output / "closure_scan_2d.png")
 
@@ -192,10 +196,10 @@ def render_suite(data, names, report, grid, reference, output, signal=None, kde_
         efficiency = point["regions"]["A"]["yield"] / mass
         if efficiency > 0:
             ax.plot([efficiency], [point["predicted_over_observed"]], c="red",
-                    marker="o" if point["statistically_valid"] else "X", label="Fixed conditional threshold")
+                    marker="o" if point["statistically_valid"] else "X", label=point_label)
     efficiencies = [p["conditional_A_efficiency"] for p in curve if p["conditional_A_efficiency"] > 0]
     ax.set(xscale="log", xlim=(max(min(efficiencies) * .8, 1e-12) if efficiencies else 1e-5, 1), ylim=(0, 1.5))
-    ax.set_xlabel("Selection Efficiency (bkg A/Ntot in tail)", fontsize=FS)
+    ax.set_xlabel(context.get("efficiency_xlabel", "Selection Efficiency (bkg A/Ntot in tail)"), fontsize=FS)
     ax.set_ylabel("Predicted Bkg. / True Bkg.", fontsize=FS)
     ax.tick_params(axis="both", labelsize=TICK_FS)
     ax.legend(fontsize=12)
@@ -217,7 +221,7 @@ def render_suite(data, names, report, grid, reference, output, signal=None, kde_
         decorate_score_axes(ax, point, title, large=False, large_labels=large_labels)
         save(fig, path)
 
-    histogram(ae, md, weights, "AE vs NURD — selected validation backgrounds", output / "hist2d_bkg.png")
+    histogram(ae, md, weights, f"AE vs NURD — {population} backgrounds", output / "hist2d_bkg.png")
     for label, name in names.items():
         mask = labels == label
         histogram(ae[mask], md[mask], weights[mask], f"AE vs NURD — {name}", output / f"hist2d_{name}.png",
@@ -235,7 +239,7 @@ def render_suite(data, names, report, grid, reference, output, signal=None, kde_
         if signal is not None:
             ax.scatter(signal["ae"][signal_rows], signal["md"][signal_rows],
                        s=.5, alpha=.4, color="tab:purple", label="TpTp", rasterized=True)
-        decorate_score_axes(ax, point, "AE vs PCA-MD — selected validation (weighted display)",
+        decorate_score_axes(ax, point, f"AE vs PCA-MD — {population} (weighted display)",
                             large, large_labels=True)
         ax.legend(markerscale=10, fontsize=LEGEND_FS)
         save(fig, output / filename)
@@ -307,7 +311,7 @@ def render_suite(data, names, report, grid, reference, output, signal=None, kde_
             ax.set_ylabel(f"PCA Component {second + 1}", fontsize=FS)
             ax.tick_params(axis="both", labelsize=TICK_FS)
             ax.legend(markerscale=10, fontsize=LEGEND_FS)
-        fig.suptitle("PCA-MD space — selected validation; fit on physics-weighted training QCD", fontsize=FS)
+        fig.suptitle(f"PCA-MD space — {population}; fit on physics-weighted training QCD", fontsize=FS)
         fig.tight_layout()
         save(fig, output / "pca_corner.png")
 
@@ -329,7 +333,7 @@ def render_suite(data, names, report, grid, reference, output, signal=None, kde_
             ax.set_xlim(log_edges(x, 2))
             ax.set_xlabel(xlabel, fontsize=FS)
             ax.set_ylabel(ylabel, fontsize=FS)
-            ax.set_title("Physics-weighted validation profile" + (" by class" if by_class else ""))
+            ax.set_title(f"Physics-weighted {population} profile" + (" by class" if by_class else ""))
             ax.tick_params(axis="both", labelsize=TICK_FS)
             ax.grid(alpha=.3)
             if count:

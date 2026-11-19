@@ -1392,6 +1392,101 @@ extra strength from tail specialization. Historical source-calibration
 exposure and AE epoch selection are documented: this remains exploratory
 previously inspected MC, not a blind test or a signal-sensitivity claim.
 
+### Standard full/top-10% plots and decay8/parent4 views after double-NURD
+
+Use the completed double/single comparison, not another training campaign:
+
+```bash
+cd /home/mb7126/nurd_hlt
+git fetch origin
+git switch double-nurd-experiment
+git pull --ff-only origin double-nurd-experiment
+module load anaconda3/2026.7
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate disco
+export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
+RUN=double_nurd_20261118_185256
+TAG="double_nurd_standard_$(date +%Y%m%d_%H%M%S)"
+bash slurm/launch_double_nurd_standard_eval.sh "$RUN" "$TAG" | tee "/tmp/${TAG}.launch"
+```
+
+The first argument is the original experiment tag, WITHOUT `_double_nurd` or
+`_double_nurd_eval`. The second is a new unique output tag. The launcher checks
+both original final models and completed score caches and archives committed
+code. No original output is overwritten. It submits:
+
+1. One generic-GPU checking inference job: only **one held-out encoder pass per
+   model** to recover latent vectors and eight probabilities. No AE inference,
+   training-manifest inference, MD refit or network updates. Original cached
+   MD must agree with re-inference; archived AE/MD scores remain the axes.
+2. A dependent CPU plotting job using those checksummed predictions, releasing
+   the GPU before KDE/PCA rendering. The GPU request specifies no model or
+   partition; the plotting job uses the CPU partition. Four CPUs and 32 GB
+   host memory; four-hour inference and eight-hour plotting limits (not ETAs).
+
+This uses the **ordinary evaluation threshold policy**, rather than the prior
+pilot's matched-overall-A-efficiency policy: scan the 48 physics-weighted QCD
+percentiles from 0.50 to 0.98 on the appropriate full/top-10% CALIBRATION
+population, pick minimum absolute nonclosure, freeze the numerical AE/MD cuts
+for all models/selections, then apply them on checking. Requirements remain
+A/B/C ESS >=50, D >=100 (`D_MIN_ESS=500` restores the older D requirement).
+Absent valid calibration candidates remain absent, never silently relaxed.
+
+As in the ordinary evaluator, checking-quantile closure maps and diagonal
+curves are descriptive, not a second working-point selection. The frozen
+working point is marked at its ACTUAL checking percentiles, not at a hard-coded
+median. Metadata explicitly distinguishes these checking scan cuts from the
+calibration-selected working point. Raw numbers are never capped, although
+the standard graphics cap color at 100% and ratio axes at 1.5.
+
+**Parent4 is a reporting view of the SAME decay8 models**, summing probabilities
+for Z `[0,6,7]`, QCD `[1]`, ttbar `[2]`, W `[3,4,5]` before parent argmax. It
+is NOT relabeling the eight-class argmax and is NOT a new parent4 model. Other
+parents' summed probabilities can beat QCD even when QCD was the largest single
+decay probability, so QCD parent recall need not equal decay8 QCD recall.
+Raw and physical-weighted confusion matrices/recalls, balanced accuracy,
+physical accuracy and CE are all reported with their distinct definitions.
+
+The same true QCD rows, physical weights, AE cut, MD transform and ABCD cuts
+are retained for both taxonomy views. Therefore **QCD closure is identical
+for decay8 and parent4**; only class grouping, probability decisions, KDEs,
+class histograms/profiles and classification metrics change.
+
+Results under `$BASE/outputs/${TAG}_standard_eval/`:
+
+```text
+standard_threshold_plan.json           # frozen before checking
+standard_evaluation_summary.json        # all models, selections, taxonomies
+classification_and_closure.csv
+{global,double}/{f100,f010}/
+  standard_closure_grid.npz
+  {decay8,parent4}/
+    evaluation_summary.json
+    plots/
+      closure_scan_2d.png
+      cut_and_count_bkg_check.png
+      hist2d_bkg.png
+      hist2d_<class>.png
+      hist2d_pca_md_kde.png
+      hist2d_pca_md_scatter.png
+      hist2d_by_class_combined.png
+      pca_scatter_embeddings.png
+      pca_corner.png
+      profile_*.png
+      confusion_matrix.png
+      confusion_matrix_physics.png
+```
+
+Reusable predictions and `inference_complete.json` are in
+`$BASE/outputs/${TAG}_standard_inference/`. Plotting uses original physical
+weights once; class KDEs show separately normalized shapes, NOT relative
+process rates. Scatter resampling is display-only. The original AE top-10%
+threshold is inherited unchanged (about 9.50% of checking physical yield,
+not 10% of raw MC rows). No signal benchmark is supplied; this is a background
+closure/classification diagnostic, not an optimized signal analysis. The
+standard minimum-nonclosure cut need not have the same QCD acceptance between
+models, so use the original matched-rate comparison to judge that question.
+
 ## Repository map
 
 - `train_ae.py`, `train_hlt.py`: main training entry points; standalone fixed-budget
