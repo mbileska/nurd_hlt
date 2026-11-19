@@ -1487,6 +1487,117 @@ closure/classification diagnostic, not an optimized signal analysis. The
 standard minimum-nonclosure cut need not have the same QCD acceptance between
 models, so use the original matched-rate comparison to judge that question.
 
+### Historical Mequinna golden recipe versus additive double-NURD
+
+`slurm/launch_legacy_double_nurd.sh UNIQUE_TAG` is a separate experiment on the
+original Mequinna parent4 files. It does NOT run the train3M decay8 launcher on
+old data, change the nominal physical AE, or overwrite old checkpoints.
+
+The verified golden artifact is
+`hlt_nurd_engineer_engineer_continuous_supcon030/checkpoint_main.pth.tar`,
+selected epoch 24, training commit `b5b2272`. Its original AE has weighting
+method `generator_weighted_uniform_class`. Its archived validation balanced
+accuracy is 46.6129%, weighted accuracy 60.9339%, CE 0.932471. The old validation
+function did not compute SupCon: its zero `contrastive_loss` is NOT evidence
+that training omitted the configured 0.3 term.
+
+The launcher archives the original `b5b2272` trainer/dataset/models/weighting
+code separately from the current driver. SHA-256 checks pin the six operative
+legacy source files; training runs in isolated Python processes. The original
+recipe is four native parent labels, SupCon=0.3 (temperature .05), main batch
+4096, global lambda=1 from epoch 1, three global critic updates per model
+update, Adam LR 1e-4 / critic LR 1e-3, seed 42, 20 **unclipped weighted-quantile**
+nuisance strata, original split/scaler/nuisance transform and archived effective
+weight factors. It is NOT modern class-only/log-fixed/clipped weighting. The
+old base weights apply generator weights to QCD and unit weights to non-QCD;
+this is not the new sample's all-process cross-section mixture.
+
+Five jobs implement the experiment:
+
+1. Generic-GPU preparation reuses the original AE, verifies input signatures,
+   generator checksum and original AE/classifier split, and reproduces the
+   golden checkpoint's validation CE/accuracy to absolute tolerance 1e-3.
+   Failure prevents dependent training from starting. It snapshots the golden
+   model/AE and saves common fresh encoder/global-critic initialization + RNG.
+2. Fresh **single** training uses the pinned original `train_epoch` unchanged.
+3. Fresh **double** training uses the same full-population CE/SupCon and
+   ORIGINAL all-parent global critic, adding only the separate tail-QCD critic.
+   Both initialization states and the global data/dropout RNG are matched;
+   auxiliary sampling/critic RNG never advances the original stream. The tail
+   critic targets inference-mode latent versus AE loss inside training QCD
+   above the fixed AE-unseen all-background legacy-weighted 90th percentile.
+   Conditional physics sampling enters once; its loss weights are unity.
+4. Generic-GPU scoring evaluates the **frozen golden reference and both new
+   selected models**: full-training-QCD MD references, separate calibration
+   cut selection, then independent held-out-file reporting. One MD transform
+   per model is reused for full and tail. AE/MD definitions are unchanged.
+5. A dependent CPU job renders all SIX standard plot suites, plus classification
+   matrices, paired event bootstraps and a numerical golden-held-out reproduction
+   check at the original archived numeric cuts. A mismatch is flagged, not
+   silently corrected by retuning on checking.
+
+Only steps 2 and 3 are model training. The AE and golden encoder are NEVER
+retrained. Both new arms run a fixed 40 epochs, no CE early stopping. The new
+tail critic trains for five epochs at zero encoder pressure, ramps linearly
+to lambda=1 over epochs 6--15, then has 25 COMPLETE post-ramp epochs 16--40.
+Both arms select best validation CE only from epoch 16 onward. A separate
+`checkpoint_historical_best.pth.tar` records the old all-epoch CE rule up to
+its simulated original patience stop; the actual trainings still finish the
+common budget. `checkpoint_final.pth.tar` and five-epoch snapshots are retained.
+
+The old 40-epoch cosine LR schedule is retained. `LEGACY_EPOCHS=60` can extend
+both arms, holding LR at the old minimum after epoch 40; defaults remain 40.
+Original main batch 4096 is never silently reduced, since SupCon depends on
+batch size. RNG-preserving Transformer activation checkpointing saves GPU
+memory without changing state keys, batch/loss or BN updates, at extra compute
+cost. No specific GPU model or GPU partition is requested; preparation and
+scoring limits are four/eight hours and each separate training has a 20-hour
+limit. These limits are not runtime estimates. Cross-version/hardware bitwise
+reproduction of a historical training trajectory is not promised.
+GPU stages use four CPU cores and 64 GB host memory for the large legacy
+tensors; the cache-only CPU plotting job uses two cores and 16 GB. At most
+the two fresh model trainings run concurrently.
+
+```bash
+cd /home/mb7126/nurd_hlt
+git fetch origin
+git switch double-nurd-experiment
+git pull --ff-only origin double-nurd-experiment
+module load anaconda3/2026.7
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate disco
+export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
+TAG="mequinna_double_$(date +%Y%m%d_%H%M%S)"
+bash slurm/launch_legacy_double_nurd.sh "$TAG" | tee "/tmp/${TAG}.launch"
+```
+
+The launcher uses `MEQUINNA_DIR` explicitly, ignoring any train3M `TRAIN_PT`
+environment left from other campaigns. It also snapshots the old statistically
+valid evaluation summary (override `GOLDEN_SUMMARY` only to an equivalent saved
+report for the same golden model). Original output tags cannot be reused.
+
+Outputs:
+
+- `$BASE/outputs/${TAG}_legacy_double_nurd/`: preparation/reproduction report,
+  frozen source copies, original recipe arrays, matched initialization, and
+  `single/`, `double/` histories/checkpoints/completion reports.
+- `$BASE/outputs/${TAG}_legacy_scores/`: frozen calibration plans, reference
+  transforms, AE scores, latents, predictions and a checksummed cache manifest.
+- `$BASE/outputs/${TAG}_legacy_eval/`: `legacy_comparison.json`,
+  `legacy_comparison.csv`, and `{golden,single,double}/{f100,f010}/plots/` with
+  the ordinary `closure_scan_2d.png`, `cut_and_count_bkg_check.png`, weighted
+  class KDEs/histograms/scatters, PCA/corner, profiles and both raw/weighted
+  confusion matrices. Each suite has its own `evaluation_summary.json`.
+
+Full-sample evaluation restores historical A/B/C ESS >=50, D >=500. Tail
+evaluation explicitly uses A/B/C >=50, D >=100, as in the newer tail studies;
+invalid cells/candidates remain invalid, with no automatic lowering. The fixed
+tail means 10% of the CALIBRATION legacy weighted mixture, not exactly 10% of
+raw held-out rows. Historical files lack composite event IDs: signatures and
+saved disjoint indices cannot certify absence of cross-file duplicate events.
+This is an exploratory legacy-domain debugging benchmark, not a reason to
+replace production physics weighting or claim signal sensitivity from closure.
+
 ## Repository map
 
 - `train_ae.py`, `train_hlt.py`: main training entry points; standalone fixed-budget
