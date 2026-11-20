@@ -133,6 +133,25 @@ def test_pinned_preparation_fresh_pair_and_all_six_standard_suites(legacy_fixtur
         return original_load(path,*a,**kw)
     monkeypatch.setattr(torch,'load',guarded_load)
     evaluation.score(args)
+    full_plan=json.loads((args.output_dir/'frozen_evaluation_plan.json').read_text())
+    assert not full_plan['partial_training_evaluation']
+    # A time-limited run has histories/best checkpoints, but no completion files.
+    # Opt-in must be explicit, and evaluation must not invent completion markers.
+    for arm in ('single','double'):
+        (output/arm/'training_complete.json').rename(output/arm/'saved_completion_for_test.json')
+    args=copy.copy(args); args.output_dir=root/'partial_scores'
+    with pytest.raises(ValueError,match='unfinished'):
+        evaluation.score(args)
+    assert not args.output_dir.exists()
+    args.allow_partial_training=True
+    evaluation.score(args)
+    plan=json.loads((args.output_dir/'frozen_evaluation_plan.json').read_text())
+    assert plan['partial_training_evaluation']
+    for arm in ('single','double'):
+        assert not (output/arm/'training_complete.json').exists()
+        assert plan['training_provenance'][arm]['training_complete'] is False
+        snapshot=args.output_dir/'selected_checkpoints'/f'{arm}.pth.tar'
+        assert file_sha256(snapshot)==file_sha256(output/arm/'checkpoint_main.pth.tar')
     with np.load(args.output_dir/'heldout_common_scores.npz') as common_scores:
         with np.load(args.output_dir/'golden_heldout_predictions.npz') as predictions:
             data={**{k:common_scores[k].copy() for k in common_scores.files},**{k:predictions[k].copy() for k in ('md',)}}
@@ -155,10 +174,12 @@ def test_pinned_preparation_fresh_pair_and_all_six_standard_suites(legacy_fixtur
     assert len(plotted)==6
     result=json.loads((plot_args.output_dir/'legacy_comparison.json').read_text())
     assert set(result['results'])=={'golden','single','double'}
+    assert result['partial_training_evaluation']
     assert result['golden_heldout_reproduction']['agrees_within_0p1_percentage_point']
     for arm in result['results']:
         for fraction in ('f100','f010'):
             assert (plot_args.output_dir/arm/fraction/'plots/confusion_matrix.png').is_file()
+            assert result['results'][arm][fraction]['partial_training_evaluation']
     for name in ('closure_scan_2d.png','hist2d_pca_md_kde.png','pca_corner.png','hist2d_QCD.png'):
         assert (plotted[0]/name).is_file()
 
@@ -171,4 +192,77 @@ def test_launcher_pins_old_recipe_and_never_retrains_ae_or_requests_specific_gpu
     assert '--partition=gpu' not in launch and 'train_ae.py' not in worker
     assert 'afterok:' in launch and 'LEGACY_EPOCHS < 40' in launch
     assert 'run_legacy_double_nurd.py" train' in worker
+    assert worker.index('conda activate disco')<worker.index('set -u')
+
+
+@pytest.fixture
+def partial_checkpoint_fixture(tmp_path):
+    from scripts.run_legacy_double_nurd import PROTOCOL
+    prep={'AE_sha256':'ae', 'initial_sha256':'initial'}
+    golden=tmp_path/'golden_checkpoint.pth.tar'
+    torch.save({'epoch':24,'ae_checkpoint_sha256':'ae'},golden)
+    prep['golden_sha256']=file_sha256(golden)
+    model_paths={'golden':golden}
+    for arm,completed,chosen in (('single',35,33),('double',33,26)):
+        folder=tmp_path/arm; folder.mkdir()
+        history=[{'epoch':i,'validation':{'weighted_ce':1. if i==chosen else 1.5}} for i in range(1,completed+1)]
+        (folder/'training_history.json').write_text(json.dumps(history))
+        path=folder/'checkpoint_main.pth.tar'
+        torch.save({'epoch':chosen,'ae_checkpoint_sha256':'ae','pilot_protocol':PROTOCOL,'arm':arm,
+            'source_golden_sha256':prep['golden_sha256'],'selection_start_epoch':16,
+            'checkpoint_role':'best_validation_ce_after_tail_ramp','actual_maximum_epochs':40,
+            'validation_metrics':{'weighted_ce':1.},'effective_tail_lambda':float(arm=='double')},path)
+        model_paths[arm]=path
+    hashes={arm:file_sha256(path) for arm,path in model_paths.items()}
+    return tmp_path,prep,model_paths,hashes
+
+
+def test_partial_training_provenance_preserves_unequal_budgets_and_needs_opt_in(partial_checkpoint_fixture):
+    from scripts.evaluate_legacy_double_nurd import checkpoint_training_provenance
+    root,prep,paths,hashes=partial_checkpoint_fixture
+    with pytest.raises(ValueError,match='allow-partial-training'):
+        checkpoint_training_provenance(root,prep,paths,hashes)
+    actual=checkpoint_training_provenance(root,prep,paths,hashes,True)
+    assert actual['single']['epochs_trained']==35 and actual['single']['selected_epoch']==33
+    assert actual['double']['epochs_trained']==33 and actual['double']['selected_epoch']==26
+    for arm in ('single','double'):
+        assert actual[arm]['planned_epochs']==40 and actual[arm]['training_complete'] is False
+        assert not (root/arm/'training_complete.json').exists()
+        assert file_sha256(paths[arm])==hashes[arm]
+
+
+def test_partial_training_does_not_bypass_bad_completion(partial_checkpoint_fixture):
+    from scripts.evaluate_legacy_double_nurd import checkpoint_training_provenance
+    root,prep,paths,hashes=partial_checkpoint_fixture
+    (root/'single/training_complete.json').write_text(json.dumps({'checkpoint_sha256':'wrong','initial_sha256':'initial'}))
+    with pytest.raises(ValueError,match='matched completed'):
+        checkpoint_training_provenance(root,prep,paths,hashes,True)
+
+
+@pytest.mark.parametrize('corruption',['role','arm','selection','budget','history'])
+def test_partial_training_rejects_wrong_or_unselected_checkpoints(partial_checkpoint_fixture,corruption):
+    from scripts.evaluate_legacy_double_nurd import checkpoint_training_provenance
+    root,prep,paths,hashes=partial_checkpoint_fixture
+    payload=torch.load(paths['single'],map_location='cpu',weights_only=False)
+    if corruption=='role': payload['checkpoint_role']='periodic_no_selection'
+    if corruption=='arm': payload['arm']='double'
+    if corruption=='selection': payload['epoch']=16
+    if corruption=='budget': payload['actual_maximum_epochs']=30
+    if corruption=='history':
+        path=root/'single/training_history.json';rows=json.loads(path.read_text())
+        rows[20]['validation']['weighted_ce']=.5;path.write_text(json.dumps(rows))
+    torch.save(payload,paths['single']);hashes['single']=file_sha256(paths['single'])
+    with pytest.raises(ValueError):
+        checkpoint_training_provenance(root,prep,paths,hashes,True)
+
+
+def test_partial_launcher_is_evaluation_only_with_new_outputs_and_generic_gpu():
+    launch=(ROOT/'slurm/launch_legacy_partial_eval.sh').read_text()
+    worker=(ROOT/'slurm/submit_legacy_partial_eval.sbatch').read_text()
+    assert '--allow-partial-training' in worker
+    assert 'run_legacy_double_nurd.py' not in worker
+    assert 'training_complete.json' not in launch
+    assert '${TAG}_legacy_partial_scores' in launch and '${TAG}_legacy_partial_eval' in launch
+    assert 'git archive HEAD' in launch and 'afterok:' in launch
+    assert '--gres=gpu:1' in launch and '--partition=gpu' not in launch and 'a100' not in launch.lower()
     assert worker.index('conda activate disco')<worker.index('set -u')

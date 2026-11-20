@@ -1598,6 +1598,51 @@ saved disjoint indices cannot certify absence of cross-file duplicate events.
 This is an exploratory legacy-domain debugging benchmark, not a reason to
 replace production physics weighting or claim signal sensitivity from closure.
 
+### Evaluate interrupted Mequinna trainings without resuming
+
+If a legacy training hits its wall-time limit, keep the original checkpoints
+and histories. The normal evaluator still requires completed training. The
+separate evaluation-only launcher explicitly permits the existing
+`checkpoint_main.pth.tar` best post-ramp validation-CE checkpoints:
+
+```bash
+cd /home/mb7126/nurd_hlt
+git pull --ff-only origin double-nurd-experiment
+module load anaconda3/2026.7
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate disco
+export BASE=/scratch/gpfs/IOJALVO/mb7126/nurd_hlt
+RUN=mequinna_double_20261119_122050
+EVAL_TAG="${RUN}_best_so_far_$(date +%Y%m%d_%H%M%S)"
+bash slurm/launch_legacy_partial_eval.sh "$RUN" "$EVAL_TAG"
+```
+
+This submits only one generic-GPU scoring job and one dependent CPU plotting
+job, with no dependency on the timed-out training jobs and no GPU-model or GPU
+partition constraint. It never trains, resumes, alters training files, or
+manufactures completion markers. The saved main checkpoint must agree with
+the best eligible validation CE in its recorded history. A corrupt completion
+marker is still an error, not something partial mode bypasses. The original
+preparation's train/weight paths and archived golden evaluation are reused.
+
+Results: `$BASE/outputs/${EVAL_TAG}_legacy_partial_scores/` (including frozen
+selected checkpoint copies and provenance) and
+`$BASE/outputs/${EVAL_TAG}_legacy_partial_eval/`. The latter contains
+`legacy_comparison.csv`, `legacy_comparison.json`, and all SIX ordinary
+parent4 suites at `{golden,single,double}/{f100,f010}/plots/`: weighted KDEs,
+ABCD grids/curves, PCA/corner, profiles and confusion matrices. The evaluator
+keeps the original AE and legacy weights, fits MD on training QCD, and freezes
+calibration cuts before checking; this is the standard threshold policy, NOT
+the newer pilot's matched-1%-acceptance policy.
+
+Reports label partial training and distinguish selected checkpoint epoch from
+last completed epoch (e.g. single 35 versus double 33 completed of planned 40).
+This is preliminary: the training budgets are not equal, neither arm has the
+full planned post-ramp budget, and held-out MC has been inspected previously.
+No held-out result is used to reselect the evaluated checkpoint. Original
+stuck scoring/plot jobs can be cancelled separately; cancellation is never
+automatic in this launcher.
+
 ## Repository map
 
 - `train_ae.py`, `train_hlt.py`: main training entry points; standalone fixed-budget

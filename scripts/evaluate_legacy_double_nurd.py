@@ -8,6 +8,7 @@ import csv
 import gc
 import json
 from pathlib import Path
+import shutil
 
 import numpy as np
 import torch
@@ -52,6 +53,61 @@ def numpy_data(scores, md, physics, labels, rows):
             "label": labels[rows].numpy(), "row_index": rows.numpy()}
 
 
+def checkpoint_training_provenance(root, prep, model_paths, hashes, allow_partial=False):
+    """Validate actual checkpoints; never manufacture training completion.
+
+    In partial mode the existing post-ramp validation-CE selection is retained.
+    History reports work completed, not necessarily a recoverable final state.
+    """
+    provenance = {}
+    for arm, path in model_paths.items():
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if payload["ae_checkpoint_sha256"] != prep["AE_sha256"]:
+            raise ValueError("Models use different AE axes")
+        entry = {"selected_epoch": int(payload["epoch"]),
+                 "checkpoint_role": payload.get("checkpoint_role", "original_best_weighted_validation_ce")}
+        if arm == "golden":
+            if hashes[arm] != prep["golden_sha256"]:
+                raise ValueError("Golden reference changed")
+            provenance[arm] = {**entry, "epochs_trained": None, "training_complete": None}
+            continue
+        if (payload.get("pilot_protocol") != PROTOCOL or payload.get("arm") != arm
+                or payload.get("source_golden_sha256") != prep["golden_sha256"]):
+            raise ValueError(f"Wrong matched training checkpoint for {arm}")
+        completion_path = root/arm/"training_complete.json"
+        if completion_path.is_file():
+            completion = json.loads(completion_path.read_text())
+            if (completion["checkpoint_sha256"] != hashes[arm]
+                    or completion["initial_sha256"] != prep["initial_sha256"]):
+                raise ValueError("Models are not the matched completed trainings")
+            provenance[arm] = {**entry, "epochs_trained": completion["epochs_trained"],
+                               "training_complete": True}
+            continue
+        if not allow_partial:
+            raise ValueError(f"{arm} training is unfinished; use --allow-partial-training explicitly for a partial evaluation")
+        history = json.loads((root/arm/"training_history.json").read_text())
+        if not history or [r["epoch"] for r in history] != list(range(1, len(history)+1)):
+            raise ValueError(f"Invalid/incomplete epoch history for {arm}")
+        start = int(payload["selection_start_epoch"])
+        chosen_epoch = entry["selected_epoch"]
+        if (entry["checkpoint_role"] != "best_validation_ce_after_tail_ramp"
+                or not 1 <= start <= chosen_epoch <= history[-1]["epoch"] <= payload["actual_maximum_epochs"]):
+            raise ValueError(f"{arm} must use the existing post-ramp validation-selected checkpoint")
+        chosen_ce = float(payload["validation_metrics"]["weighted_ce"])
+        eligible = [float(r["validation"]["weighted_ce"]) for r in history if r["epoch"] >= start]
+        history_ce = float(history[chosen_epoch-1]["validation"]["weighted_ce"])
+        if (not np.isfinite(eligible).all() or not np.isfinite(chosen_ce)
+                or not np.isclose(chosen_ce, history_ce, rtol=1e-9, atol=1e-10)
+                or not np.isclose(chosen_ce, min(eligible), rtol=1e-9, atol=1e-10)):
+            raise ValueError(f"{arm} selected checkpoint does not match recorded best validation CE")
+        provenance[arm] = {**entry, "epochs_trained": history[-1]["epoch"],
+            "planned_epochs": payload["actual_maximum_epochs"], "training_complete": False,
+            "selection_start_epoch": start, "selected_validation_ce": chosen_ce,
+            "effective_tail_lambda": payload["effective_tail_lambda"],
+            "warning": "Interrupted training: best validation checkpoint so far, not the completed fixed-budget experiment."}
+    return provenance
+
+
 def score(args):
     if args.output_dir.exists(): raise FileExistsError(args.output_dir)
     prep_path = args.experiment_dir/"preparation_complete.json"
@@ -62,11 +118,12 @@ def score(args):
     prepared = torch.load(args.experiment_dir/"prepared_recipe.pth.tar", map_location="cpu", weights_only=False)
     model_paths = paths(args.experiment_dir)
     hashes = {k: file_sha256(v) for k,v in model_paths.items()}
-    for arm in ("single", "double"):
-        completion = json.loads((args.experiment_dir/arm/"training_complete.json").read_text())
-        if completion["checkpoint_sha256"] != hashes[arm] or completion["initial_sha256"] != prep["initial_sha256"]:
-            raise ValueError("Models are not the matched completed trainings")
-    if hashes["golden"] != prep["golden_sha256"]: raise ValueError("Golden reference changed")
+    training_provenance = checkpoint_training_provenance(args.experiment_dir, prep, model_paths, hashes,
+                                                        getattr(args, "allow_partial_training", False))
+    partial = any(entry["training_complete"] is False for entry in training_provenance.values())
+    if partial:
+        print("PARTIAL TRAINING EVALUATION: use existing validation-selected checkpoints; no training or completion markers added.", flush=True)
+    print(json.dumps(training_provenance, indent=2), flush=True)
     raw = torch.load(args.sample, map_location="cpu", weights_only=False)
     if sample_signature(raw) != prepared["data_signature"]: raise ValueError("Mequinna training manifest changed")
     labels, physics = raw["label"].long().reshape(-1), prepared["physics"]
@@ -79,6 +136,14 @@ def score(args):
     cuts = {"f100": None, "f010": prepared["ae_threshold"]}
     minimums = {"f100": [50,50,50,args.full_d_min], "f010": [50,50,50,args.tail_d_min]}
     args.output_dir.mkdir(parents=True)
+    # Freeze selected model files so later recovery cannot change plotting inputs.
+    snapshot_dir = args.output_dir/"selected_checkpoints"
+    snapshot_dir.mkdir()
+    for arm, path in model_paths.items():
+        snapshot = snapshot_dir/f"{arm}.pth.tar"
+        shutil.copy2(path, snapshot)
+        if file_sha256(snapshot) != hashes[arm]: raise ValueError("Checkpoint changed while snapshotting")
+    model_paths = {arm: snapshot_dir/f"{arm}.pth.tar" for arm in model_paths}
     ae_path = args.experiment_dir/"original_checkpoint_ae.pth"
     if file_sha256(ae_path) != prep["AE_sha256"]: raise ValueError("Original AE changed")
     ae = torch.load(ae_path, map_location="cpu", weights_only=False)
@@ -86,14 +151,11 @@ def score(args):
     # Ordinary evaluation arithmetic (including its 1e-8 scaler epsilon),
     # separately from the exact original training-nuisance arithmetic.
     cal_ae = infer_ae_scores(ae_model, prepared["ae_scaler"], raw, cal, args.device, 4096)
-    plans = {}; references = {}; training_provenance = {}
+    plans = {}; references = {}
     for arm, path in model_paths.items():
         print(f"{arm}: fixed training-QCD reference {len(fit):,}; calibration QCD {len(cal):,}", flush=True)
         model, payload = load_model(path, args.device)
         if payload["ae_checkpoint_sha256"] != prep["AE_sha256"]: raise ValueError("Models use different AE axes")
-        training_provenance[arm] = {"selected_epoch":payload["epoch"],
-            "checkpoint_role":payload.get("checkpoint_role","original_best_weighted_validation_ce"),
-            "epochs_trained":None if arm=="golden" else json.loads((args.experiment_dir/arm/"training_complete.json").read_text())["epochs_trained"]}
         reference = infer_latents(model, raw, fit, args.device, args.batch_size)
         w = physics[fit].numpy(); w = w/w.sum()
         mean = (reference*w[:,None]).sum(0); centered = reference-mean
@@ -110,6 +172,8 @@ def score(args):
     frozen = {"protocol": PROTOCOL, "checkpoint_sha256": hashes, "AE_sha256": prep["AE_sha256"],
         "AE_thresholds": cuts, "minimums": minimums, "references": references, "plans": plans,
         "training_provenance": training_provenance,
+        "partial_training_evaluation": partial,
+        "training_budget_warning": "Interrupted training: preliminary, not a completed matched-budget comparison; see per-arm completed epochs." if partial else None,
         "networks_retrained_in_evaluation": False, "checking_used_for_cut_selection": False,
         "selection_policy": "Usual calibration-QCD 50--98% percentile scan, minimum |1/R-1|, then fixed held-out cuts",
         "tail_policy": "Original AE-unseen all-background LEGACY weighted 90th percentile; frozen before new training",
@@ -144,9 +208,9 @@ def score(args):
         if args.device == "cuda": torch.cuda.empty_cache()
     if file_sha256(frozen_path) != frozen_hash: raise ValueError("Frozen plan changed")
     if {k:file_sha256(v) for k,v in model_paths.items()} != hashes: raise ValueError("Models changed during evaluation")
-    files = [args.output_dir/"heldout_common_scores.npz", frozen_path,
+    files = [args.output_dir/"heldout_common_scores.npz", frozen_path, *model_paths.values(),
              *[args.output_dir/f"{arm}_{suffix}.npz" for arm in ARMS for suffix in ("calibration_QCD", "heldout_predictions")]]
-    manifest = {"protocol": PROTOCOL, "files": {p.name:file_sha256(p) for p in files},
+    manifest = {"protocol": PROTOCOL, "files": {str(p.relative_to(args.output_dir)):file_sha256(p) for p in files},
         "checkpoint_sha256": hashes, "heldout_signature": sample_signature(check), "weights": weight_meta,
         "legacy_limitations": prep["caveats"]}
     (args.output_dir/"inference_complete.json").write_text(report_json(finite_report(manifest)))
@@ -180,7 +244,8 @@ def plots(args):
             metrics = class_metrics(selected_data["label"], probabilities[mask], selected_data["weight"], 4)
             folder = args.output_dir/arm/key; folder.mkdir(parents=True)
             report = {"scans":{"tail":closure}, "plot_context": {
-                "population": f"{arm}, {'full' if cut is None else 'top-10%'} Mequinna held-out (legacy weights)",
+                "population": f"{arm}, {'full' if cut is None else 'top-10%'} Mequinna held-out (legacy weights)"
+                              + (" [partial training]" if frozen["training_provenance"][arm].get("training_complete") is False else ""),
                 "point_label":"Calibration-selected fixed cuts", "scan_point_label":"Calibration-selected fixed cuts",
                 "scan_title":"Standard ABCD scan — held-out (descriptive)",
                 "scan_xlabel":"Held-out QCD AE percentile", "scan_ylabel":"Held-out QCD MD percentile",
@@ -191,11 +256,15 @@ def plots(args):
             point = closure["working_point"]
             np.savez_compressed(folder/"closure_grid.npz", **grid)
             value = {"classification":metrics, "closure":closure, "minimums":frozen["minimums"][key], **style,
+                "training_provenance": frozen["training_provenance"][arm],
+                "partial_training_evaluation": frozen.get("partial_training_evaluation", False),
                 "retained_legacy_weight_fraction":float(selected_data["weight"].sum()/common["weight"].sum()),
                 "retained_raw_fraction":float(mask.mean())}
             (folder/"evaluation_summary.json").write_text(report_json(finite_report(value)))
             results[arm][key] = value
             table.append({"model":arm,"selection":key,"selected_epoch":frozen["training_provenance"][arm]["selected_epoch"],
+                "epochs_trained": frozen["training_provenance"][arm]["epochs_trained"],
+                "training_complete": frozen["training_provenance"][arm]["training_complete"],
                 "balanced_accuracy":metrics["balanced_accuracy"],"physics_accuracy":metrics["physics_weighted_accuracy"],
                 "ratio":None if point is None else point["predicted_over_observed"],
                 "absolute_nonclosure":None if point is None else point["absolute_nonclosure"],
@@ -245,6 +314,8 @@ def main():
     parser.add_argument("--kde-grid",type=int,default=64)
     parser.add_argument("--threads",type=int,default=4)
     parser.add_argument("--code-commit",default="")
+    parser.add_argument("--allow-partial-training", action="store_true",
+                        help="Explicitly evaluate existing post-ramp best checkpoints of unfinished trainings; never marks them complete")
     args=parser.parse_args()
     if min(args.batch_size,args.full_d_min,args.tail_d_min,args.threads)<1 or args.kde_grid<8: parser.error("Invalid evaluation resources/statistics")
     if args.phase=="score" and any(getattr(args,k) is None for k in ("sample","weights","heldout","heldout_weights")): parser.error("Scoring needs train/test data and weights")
